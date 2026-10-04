@@ -1,0 +1,10 @@
+.deps/
+data/
+models/
+bench/judge/
+*.exe
+*.dll
+*.obj
+*.exp
+*.lib
+__pycache__/

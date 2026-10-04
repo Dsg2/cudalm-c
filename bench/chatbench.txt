@@ -1,0 +1,159 @@
+# chatbench v1 — coherence / sensibility benchmark for small chat LMs
+# M|category|prompt|CORRECT|wrong|wrong...   (correct is ALWAYS first; scorer knows)
+# G|category|prompt|kw1,kw2,...              (open generation; any keyword hit = on-topic)
+#
+# ---- fact: basic world knowledge, answer phrased as a chat reply
+M|fact|What is the capital of France?|The capital of France is Paris.|The capital of France is Berlin.|The capital of France is Madrid.|The capital of France is Rome.
+M|fact|What is the capital of Japan?|The capital of Japan is Tokyo.|The capital of Japan is Beijing.|The capital of Japan is Seoul.|The capital of Japan is Bangkok.
+M|fact|What is the capital of Italy?|The capital of Italy is Rome.|The capital of Italy is Paris.|The capital of Italy is Vienna.|The capital of Italy is Lisbon.
+M|fact|What is the largest planet in our solar system?|Jupiter is the largest planet in our solar system.|Mercury is the largest planet in our solar system.|Mars is the largest planet in our solar system.|The Moon is the largest planet in our solar system.
+M|fact|Which planet is closest to the Sun?|Mercury is the planet closest to the Sun.|Neptune is the planet closest to the Sun.|Jupiter is the planet closest to the Sun.|Saturn is the planet closest to the Sun.
+M|fact|What is the chemical symbol for water?|The chemical formula for water is H2O.|The chemical formula for water is CO2.|The chemical formula for water is NaCl.|The chemical formula for water is O3.
+M|fact|At what temperature does water boil at sea level in Celsius?|Water boils at 100 degrees Celsius at sea level.|Water boils at 10 degrees Celsius at sea level.|Water boils at 500 degrees Celsius at sea level.|Water boils at 0 degrees Celsius at sea level.
+M|fact|At what temperature does water freeze in Celsius?|Water freezes at 0 degrees Celsius.|Water freezes at 100 degrees Celsius.|Water freezes at 50 degrees Celsius.|Water freezes at 37 degrees Celsius.
+M|fact|How many days are in a week?|There are seven days in a week.|There are twelve days in a week.|There are three days in a week.|There are thirty days in a week.
+M|fact|How many months are in a year?|There are twelve months in a year.|There are seven months in a year.|There are thirty months in a year.|There are four months in a year.
+M|fact|How many legs does a spider have?|A spider has eight legs.|A spider has two legs.|A spider has six legs.|A spider has twenty legs.
+M|fact|How many legs does a dog have?|A dog has four legs.|A dog has eight legs.|A dog has two legs.|A dog has ten legs.
+M|fact|Who wrote Romeo and Juliet?|Romeo and Juliet was written by William Shakespeare.|Romeo and Juliet was written by Isaac Newton.|Romeo and Juliet was written by Albert Einstein.|Romeo and Juliet was written by Charles Darwin.
+M|fact|What gas do plants absorb from the air for photosynthesis?|Plants absorb carbon dioxide for photosynthesis.|Plants absorb helium for photosynthesis.|Plants absorb neon for photosynthesis.|Plants absorb hydrogen for photosynthesis.
+M|fact|What is the largest ocean on Earth?|The Pacific Ocean is the largest ocean on Earth.|The Arctic Ocean is the largest ocean on Earth.|Lake Michigan is the largest ocean on Earth.|The Red Sea is the largest ocean on Earth.
+M|fact|What is the tallest mountain in the world?|Mount Everest is the tallest mountain in the world.|Mount Fuji is the tallest mountain in the world.|Ben Nevis is the tallest mountain in the world.|Table Mountain is the tallest mountain in the world.
+M|fact|What language is mainly spoken in Brazil?|The main language spoken in Brazil is Portuguese.|The main language spoken in Brazil is Japanese.|The main language spoken in Brazil is Russian.|The main language spoken in Brazil is German.
+M|fact|What is the main organ that pumps blood through the body?|The heart pumps blood through the body.|The lungs pump blood through the body.|The stomach pumps blood through the body.|The skin pumps blood through the body.
+M|fact|What do bees make?|Bees make honey.|Bees make milk.|Bees make silk.|Bees make glass.
+M|fact|What is the opposite of hot?|The opposite of hot is cold.|The opposite of hot is loud.|The opposite of hot is tall.|The opposite of hot is fast.
+M|fact|What color is the sky on a clear day?|On a clear day the sky is blue.|On a clear day the sky is green.|On a clear day the sky is purple.|On a clear day the sky is black.
+M|fact|What is the square root of 81?|The square root of 81 is 9.|The square root of 81 is 7.|The square root of 81 is 40.|The square root of 81 is 18.
+M|fact|Which animal is known as the king of the jungle?|The lion is known as the king of the jungle.|The rabbit is known as the king of the jungle.|The goldfish is known as the king of the jungle.|The sheep is known as the king of the jungle.
+M|fact|What is the currency of the United States?|The currency of the United States is the dollar.|The currency of the United States is the yen.|The currency of the United States is the rupee.|The currency of the United States is the peso.
+M|fact|What is H2O commonly called?|H2O is commonly called water.|H2O is commonly called salt.|H2O is commonly called sugar.|H2O is commonly called iron.
+#
+# ---- commonsense: everyday physical / social reasoning
+M|commonsense|If I drop a glass on a hard floor, what will probably happen?|It will probably break.|It will probably float up to the ceiling.|It will probably turn into water.|It will probably start singing.
+M|commonsense|I left ice cream in the sun for an hour. What happened to it?|It melted.|It froze solid.|It turned into bread.|It grew bigger.
+M|commonsense|Why do people carry umbrellas?|To stay dry when it rains.|To make their food taste better.|To help them run faster.|To keep their phones charged.
+M|commonsense|What should you do if you are thirsty?|Drink some water.|Go to sleep in the snow.|Eat a handful of sand.|Run a marathon.
+M|commonsense|It is very dark in my room. What can I do to see better?|Turn on a light.|Close your eyes.|Put on sunglasses.|Open the fridge door.
+M|commonsense|What do you usually use to cut paper?|Scissors.|A spoon.|A pillow.|A sponge.
+M|commonsense|Where do fish live?|Fish live in water.|Fish live in trees.|Fish live in the desert sand.|Fish live in the clouds.
+M|commonsense|My plant is wilting and the soil is dry. What does it need?|It needs water.|It needs a haircut.|It needs a new phone.|It needs less light and more salt.
+M|commonsense|Which is heavier, a car or a feather?|A car is heavier than a feather.|A feather is heavier than a car.|They weigh exactly the same.|A feather weighs about a ton.
+M|commonsense|What do people usually do at night?|Most people sleep at night.|Most people swim in lava at night.|Most people fly to the moon at night.|Most people eat rocks at night.
+M|commonsense|My friend just got a new job. What is a kind thing to say?|Congratulations on your new job!|I hope you get fired soon.|Jobs are a waste of time.|Nobody cares about your job.
+M|commonsense|What happens if you put water in the freezer overnight?|It turns into ice.|It turns into steam.|It turns into gold.|It disappears completely.
+M|commonsense|Why do we wear coats in winter?|To keep warm in the cold weather.|To cool down in the hot sun.|To help us swim faster.|To make the snow melt.
+M|commonsense|I am going to the beach. What should I bring?|Sunscreen, a towel and some water.|A snow shovel and ice skates.|A winter coat and a heater.|A fishing license for the desert.
+M|commonsense|What do you use a key for?|To open a lock.|To stir soup.|To brush your teeth.|To water the plants.
+M|commonsense|Why do cars need fuel or electricity?|They need energy to run their engines or motors.|They need it to change their color.|They need it to grow new tires.|They need it to play music only.
+M|commonsense|What is a good way to stay healthy?|Eat balanced meals, exercise and sleep well.|Eat only candy and never sleep.|Stay awake for a week straight.|Avoid water and drink only soda.
+M|commonsense|Someone is crying after losing their pet. How might they feel?|They probably feel sad.|They probably feel very hungry.|They probably feel thrilled.|They probably feel sleepy and bored.
+M|commonsense|What happens to the sky when the sun sets?|It gets darker.|It turns bright green.|It gets brighter and hotter.|It fills with snow.
+M|commonsense|If a store is closed, can you buy things there?|No, you have to wait until it opens.|Yes, closed stores sell everything cheaper.|Yes, but only on the roof.|No, because stores never sell things.
+#
+# ---- instruct: does the reply follow the form of the instruction
+M|instruct|Say hello.|Hello!|The capital of Peru is Lima.|Seven times eight is fifty-six.|Photosynthesis happens in leaves.
+M|instruct|Answer with just yes or no: is the sun hot?|Yes.|Purple.|Bananas are yellow.|Seventeen.
+M|instruct|Name one color.|Blue.|Tuesday.|Elephant.|Seventeen.
+M|instruct|Name a fruit.|An apple.|A hammer.|A bicycle.|A mountain.
+M|instruct|Give me a synonym for happy.|Joyful.|Angry.|Heavy.|Slowly.
+M|instruct|Give me an antonym for big.|Small.|Large.|Huge.|Giant.
+M|instruct|Translate "thank you" into Spanish.|Gracias.|Bonjour.|Danke.|Arigato.
+M|instruct|Translate "hello" into French.|Bonjour.|Hola.|Ciao.|Hallo.
+M|instruct|Count from one to five.|1, 2, 3, 4, 5.|5, 9, 2, 7, 1.|A, B, C, D, E.|Monday, Tuesday, Wednesday.
+M|instruct|Write the word "cat" backwards.|tac|cat|act|dog
+M|instruct|Spell the word "dog" in capital letters.|DOG|dog|Dog|CAT
+M|instruct|List three animals.|Dog, cat and horse.|Red, blue and green.|Paris, London and Rome.|Monday, Tuesday and Friday.
+M|instruct|List three colors.|Red, green and blue.|Dog, cat and cow.|One, two and three.|Apple, pear and knife.
+M|instruct|Complete the sentence: The early bird catches the ...|worm.|piano.|airplane.|refrigerator.
+M|instruct|Reply with a single number: how many wheels does a bicycle have?|2|The bicycle is red.|Wheels are round.|I like cycling.
+M|instruct|Summarize in one word how you feel on a sunny holiday.|Happy.|Refrigerator.|Carburetor.|Seventeen.
+M|instruct|Write a greeting for a birthday card.|Happy birthday! Wishing you a wonderful year ahead.|Your tax return is due next Monday.|Please return the library books by Friday.|The meeting has been moved to room 204.
+M|instruct|Tell me a word that rhymes with cat.|Hat.|Dog.|Tree.|Window.
+M|instruct|Please respond politely: can you help me?|Of course, I would be happy to help. What do you need?|No. Go away and stop bothering me.|Purple elephants dance on Tuesdays.|The mitochondria is the powerhouse.
+M|instruct|What is the first letter of the English alphabet?|A.|Z.|M.|Q.
+#
+# ---- relevance: which reply belongs to this question (all replies fluent)
+M|relevance|How do I boil an egg?|Place the egg in boiling water for about eight to ten minutes, then cool it in cold water.|The Eiffel Tower was completed in 1889 and is located in Paris.|To change a flat tire, loosen the lug nuts and lift the car with a jack.|Python lists can be sorted with the sorted function or the sort method.
+M|relevance|What is a good name for a pet cat?|Whiskers or Luna would be a lovely name for a cat.|Preheat the oven to 180 degrees before baking the cake.|The French Revolution began in 1789.|Use a hammer to drive the nail into the wood.
+M|relevance|How can I improve my sleep?|Keep a regular schedule, avoid screens before bed and keep your room dark and cool.|The stock market closed higher today led by technology shares.|Add two cups of flour and one egg to the mixing bowl.|The Amazon river flows through Brazil and Peru.
+M|relevance|Can you recommend a book for a beginner programmer?|Automate the Boring Stuff with Python is a friendly book for beginners.|The best time to plant tulips is in the autumn.|Mix blue and yellow paint to get green.|Elephants are the largest land animals.
+M|relevance|How do I make a cup of tea?|Boil water, pour it over a tea bag, let it steep for a few minutes, then remove the bag.|Jupiter has dozens of moons, including Europa and Ganymede.|To reset your password, click the forgot password link.|The piano has eighty-eight keys.
+M|relevance|What should I pack for a camping trip?|Bring a tent, a sleeping bag, water, food, a flashlight and warm clothes.|The quadratic formula solves equations of the form ax squared plus bx plus c.|Shakespeare wrote many plays including Hamlet.|Remember to rinse the rice before cooking it.
+M|relevance|Why is exercise important?|Exercise strengthens your heart and muscles and improves your mood and sleep.|The capital of Australia is Canberra.|To install the package, run pip install requests.|Autumn leaves turn red and orange.
+M|relevance|How do I water a cactus?|Water a cactus deeply but rarely, and let the soil dry out completely between waterings.|The train to London leaves at half past nine.|Chess is played on a board with sixty-four squares.|Use a comma to separate items in a list.
+M|relevance|What is the weather usually like in winter?|Winter is usually cold, and in many places it brings snow and short days.|A triangle has three sides and three angles.|You can pay the bill online or by phone.|Dolphins are highly intelligent marine mammals.
+M|relevance|How can I save money?|Make a budget, track your spending and cut back on things you do not need.|The heart has four chambers.|Mount Kilimanjaro is in Tanzania.|Stir the sauce until it thickens.
+M|relevance|What is a healthy breakfast?|Oatmeal with fruit, or eggs with whole-grain toast, make a healthy breakfast.|The Great Wall of China is thousands of kilometers long.|Remember to back up your files regularly.|The violin is a string instrument.
+M|relevance|How do I learn to swim?|Start in shallow water with an instructor, practice floating, then learn to kick and breathe.|The printer is out of paper and needs a refill.|Mars is often called the Red Planet.|Divide both sides of the equation by two.
+M|relevance|What is your favorite season and why?|I like autumn because the air is cool and the leaves turn beautiful colors.|To compile the program, run make in the terminal.|The Nile is one of the longest rivers in the world.|Please sign the form and return it by Friday.
+M|relevance|How do I write a thank-you note?|Thank the person for the specific gift or help, say how it made you feel, and sign your name.|Carbon has an atomic number of six.|The bus stop is on the corner of Main Street.|Stir-fry the vegetables on high heat.
+M|relevance|What can I do when I feel bored?|You could read a book, go for a walk, learn a new skill or call a friend.|The boiling point of iron is very high.|Enter your username and password to log in.|Cows are raised for milk and meat.
+M|relevance|How do I tie my shoes?|Cross the laces, pull one under, make a loop with each lace and pull the loops tight.|Saturn has beautiful rings made of ice and rock.|The recipe calls for two teaspoons of salt.|Voting usually takes place in November.
+M|relevance|What is the best way to study for an exam?|Study a little every day, test yourself with practice questions and get enough sleep.|Penguins live mostly in the Southern Hemisphere.|Turn left at the traffic lights.|Oil the pan before frying the eggs.
+M|relevance|How do I clean a window?|Spray glass cleaner on the window and wipe it with a clean, lint-free cloth.|The Roman Empire fell in the fifth century.|Multiply the numerator by the denominator.|The concert starts at eight o'clock.
+M|relevance|Tell me something about dogs.|Dogs are loyal pets that were domesticated from wolves thousands of years ago.|Volcanoes erupt when magma rises to the surface.|Keep your receipt in case you need a refund.|Tomatoes grow best in warm, sunny weather.
+M|relevance|How does a rainbow form?|A rainbow forms when sunlight is bent and reflected inside raindrops, splitting into colors.|Please remember to lock the front door.|Basketball teams have five players on the court.|The library closes at six in the evening.
+#
+# ---- consistency: reply must not contradict the context given in the prompt
+M|consistency|My name is Sarah. What is my name?|Your name is Sarah.|Your name is John.|Your name is Michael.|Your name is Peter.
+M|consistency|I have two brothers and no sisters. How many sisters do I have?|You have no sisters.|You have three sisters.|You have two sisters.|You have five sisters.
+M|consistency|I live in Canada. Which country do I live in?|You live in Canada.|You live in Brazil.|You live in Egypt.|You live in India.
+M|consistency|My favorite color is green. What is my favorite color?|Your favorite color is green.|Your favorite color is red.|Your favorite color is orange.|Your favorite color is pink.
+M|consistency|I am allergic to peanuts. Should I eat peanut butter?|No, you should avoid peanut butter because you are allergic to peanuts.|Yes, peanut butter is perfect for someone allergic to peanuts.|Yes, eat as much peanut butter as you like.|Yes, peanuts will cure your allergy.
+M|consistency|The meeting is at 3 pm. It is now 2 pm. Is the meeting over?|No, the meeting has not started yet; it begins in an hour.|Yes, the meeting ended three hours ago.|Yes, it finished yesterday.|Yes, the meeting is already over.
+M|consistency|I have a cat named Max. What kind of animal is Max?|Max is a cat.|Max is a horse.|Max is a parrot.|Max is a goldfish.
+M|consistency|I am 10 years old. Am I an adult?|No, at 10 years old you are a child.|Yes, 10-year-olds are elderly adults.|Yes, you are old enough to retire.|Yes, you are over 60.
+M|consistency|It is raining heavily outside. Is the ground dry?|No, the ground is probably wet.|Yes, the ground is completely dry.|Yes, rain makes the ground dusty.|Yes, it is too dry to walk on.
+M|consistency|I bought three apples and ate one. How many apples do I have left?|You have two apples left.|You have five apples left.|You have ten apples left.|You have zero apples left.
+M|consistency|I only speak English. Can I read a book written in English?|Yes, you can read a book written in English.|No, English books are impossible for English speakers.|No, you need to learn Chinese first.|No, only French speakers can read English.
+M|consistency|The door is locked and I do not have the key. Can I open it with the key?|No, you cannot open it with the key because you do not have it.|Yes, simply use the key you have.|Yes, your key opens every door.|Yes, the key is already in your hand.
+M|consistency|I am vegetarian. Would I like a beef burger?|Probably not, since vegetarians do not eat meat. A veggie burger would suit you better.|Yes, beef burgers are the classic vegetarian meal.|Yes, vegetarians only eat beef.|Yes, beef is a vegetable.
+M|consistency|My car is red. What color is my car?|Your car is red.|Your car is blue.|Your car is yellow.|Your car is white.
+M|consistency|I was born in 2000. It is now 2020. How old am I?|You are 20 years old.|You are 50 years old.|You are 3 years old.|You are 100 years old.
+M|consistency|The shop sells only shoes. Can I buy bread there?|No, that shop only sells shoes, so you cannot buy bread there.|Yes, the shoe shop is famous for its bread.|Yes, all shoe shops sell fresh bread.|Yes, bread is a type of shoe.
+M|consistency|My sister is older than me. Am I older than my sister?|No, your sister is older than you.|Yes, you are much older than her.|Yes, you are her grandmother.|Yes, you were born first.
+M|consistency|I just ate a big dinner. Am I likely to be very hungry right now?|No, you are probably full after a big dinner.|Yes, big dinners make people starving.|Yes, you have not eaten for days.|Yes, you need three more dinners.
+#
+# ---- arithmetic: very easy math in reply form
+M|arithmetic|What is 2 plus 2?|2 plus 2 is 4.|2 plus 2 is 5.|2 plus 2 is 22.|2 plus 2 is 7.
+M|arithmetic|What is 5 plus 3?|5 plus 3 is 8.|5 plus 3 is 9.|5 plus 3 is 53.|5 plus 3 is 2.
+M|arithmetic|What is 10 minus 4?|10 minus 4 is 6.|10 minus 4 is 14.|10 minus 4 is 3.|10 minus 4 is 40.
+M|arithmetic|What is 3 times 4?|3 times 4 is 12.|3 times 4 is 7.|3 times 4 is 34.|3 times 4 is 10.
+M|arithmetic|What is 9 minus 9?|9 minus 9 is 0.|9 minus 9 is 18.|9 minus 9 is 99.|9 minus 9 is 1.
+M|arithmetic|What is 6 times 7?|6 times 7 is 42.|6 times 7 is 13.|6 times 7 is 67.|6 times 7 is 36.
+M|arithmetic|What is 100 divided by 10?|100 divided by 10 is 10.|100 divided by 10 is 1000.|100 divided by 10 is 110.|100 divided by 10 is 90.
+M|arithmetic|What is 7 plus 6?|7 plus 6 is 13.|7 plus 6 is 76.|7 plus 6 is 1.|7 plus 6 is 42.
+M|arithmetic|What is half of 20?|Half of 20 is 10.|Half of 20 is 40.|Half of 20 is 2.|Half of 20 is 15.
+M|arithmetic|What is 15 plus 5?|15 plus 5 is 20.|15 plus 5 is 10.|15 plus 5 is 155.|15 plus 5 is 25.
+M|arithmetic|What is 8 divided by 2?|8 divided by 2 is 4.|8 divided by 2 is 16.|8 divided by 2 is 6.|8 divided by 2 is 10.
+M|arithmetic|What is 1 plus 1?|1 plus 1 is 2.|1 plus 1 is 11.|1 plus 1 is 3.|1 plus 1 is 0.
+M|arithmetic|If I have 4 cookies and get 3 more, how many cookies do I have?|You have 7 cookies.|You have 1 cookie.|You have 12 cookies.|You have 43 cookies.
+M|arithmetic|What is 20 minus 7?|20 minus 7 is 13.|20 minus 7 is 27.|20 minus 7 is 3.|20 minus 7 is 207.
+M|arithmetic|What is 5 times 5?|5 times 5 is 25.|5 times 5 is 10.|5 times 5 is 55.|5 times 5 is 0.
+#
+# ---- open generation: judged on termination, repetition, keyword relevance, prompt-relevance
+G|greet|Hi! How are you today?|good,well,great,fine,thank,help,doing
+G|greet|Hello, can you introduce yourself?|assistant,help,i am,i'm,ai,language model
+G|explain|Explain what photosynthesis is in simple terms.|light,sun,plant,energy,sugar,oxygen,carbon
+G|explain|Why is the sky blue?|light,scatter,sun,wavelength,atmosphere,blue
+G|explain|What is gravity?|force,mass,pull,earth,object,attract
+G|explain|How does a computer work?|processor,cpu,memory,data,program,instruction,input
+G|advice|How can I get better at sleeping?|sleep,bed,schedule,screen,caffeine,routine,dark
+G|advice|I feel stressed about my exams. Any advice?|study,break,sleep,breath,plan,stress,relax
+G|advice|What are some tips for learning a new language?|practice,speak,vocabulary,native,app,listen,daily
+G|advice|How do I start running as a beginner?|run,walk,slow,shoe,distance,pace,week
+G|creative|Write a short poem about the ocean.|sea,ocean,wave,blue,tide,shore,water
+G|creative|Write a two-sentence story about a dragon.|dragon,fire,wing,cave,knight,flew
+G|creative|Describe a sunset in a few sentences.|sun,sky,orange,red,gold,horizon,light
+G|creative|Write a haiku about autumn.|leaf,leaves,fall,autumn,wind,red,cool
+G|list|List five fruits.|apple,banana,orange,grape,mango,pear,strawberr
+G|list|Give me three ideas for a birthday party.|cake,game,theme,music,party,decorat,friend
+G|list|What are the planets in our solar system?|mercury,venus,earth,mars,jupiter,saturn
+G|list|Name some common pets.|dog,cat,fish,bird,rabbit,hamster
+G|howto|How do I make scrambled eggs?|egg,pan,whisk,butter,heat,stir,salt
+G|howto|How do I plant a tree?|hole,soil,water,root,dig,sun
+G|howto|How do I write a good email?|subject,greeting,clear,concise,sign,recipient
+G|opinion|Is it better to read books or watch movies?|book,movie,film,read,imagination,both
+G|opinion|What makes a good friend?|trust,listen,honest,support,kind,loyal
+G|math|What is 12 plus 15? Explain your answer.|27

@@ -1,0 +1,3 @@
+pyarrow      # prep/fetch.py: parquet datasets
+numpy        # export/bin2gguf.py, prep/legacy
+tokenizers   # prep/legacy only
