@@ -648,30 +648,55 @@ static char   g_maxwhat[96]="(none)";
  * whatever the FLOP count suggests -- these kernels are memory-bound and the
  * two disagree badly. */
 #define PROF_MAX 48
-typedef struct { char name[40]; double ms; int n; } ProfEnt;   /* named: nvcc is C++ */
+typedef struct { char name[40]; double ms; int n, drain; } ProfEnt;   /* named: nvcc is C++ */
 static int g_prof=0, g_prof_n=0;
 static ProfEnt g_prof_tab[PROF_MAX];
-static void prof_add(const char*what,double ms){
-    for(int i=0;i<g_prof_n;i++) if(!strcmp(g_prof_tab[i].name,what)){
-        g_prof_tab[i].ms+=ms; g_prof_tab[i].n++; return; }
-    if(g_prof_n<PROF_MAX){ snprintf(g_prof_tab[g_prof_n].name,40,"%s",what);
-        g_prof_tab[g_prof_n].ms=ms; g_prof_tab[g_prof_n].n=1; g_prof_n++; }
+static int prof_idx(const char*what){
+    for(int i=0;i<g_prof_n;i++) if(!strcmp(g_prof_tab[i].name,what)) return i;
+    if(g_prof_n>=PROF_MAX) return PROF_MAX-1;
+    memset(&g_prof_tab[g_prof_n],0,sizeof(ProfEnt)); snprintf(g_prof_tab[g_prof_n].name,40,"%s",what);
+    return g_prof_n++;
+}
+static void prof_add(const char*what,double ms){ ProfEnt*e=&g_prof_tab[prof_idx(what)]; e->ms+=ms; e->n++; }
+/* CUDALM_PROF>=3: no sync. Each label gets the GPU time since the previous label's
+ * event; "drained" counts labels where the GPU had already finished all queued work
+ * when the host got there, i.e. the host was the bottleneck at that point. */
+#define PEV_MAX 4096
+static cudaEvent_t g_pev[PEV_MAX]; static short g_pev_lab[PEV_MAX]; static int g_pev_n=0;
+static void prof_flush(void){
+    if(g_pev_n<2) return;
+    cudaEventSynchronize(g_pev[g_pev_n-1]);
+    for(int i=1;i<g_pev_n;i++){ float ms=0; cudaEventElapsedTime(&ms,g_pev[i-1],g_pev[i]);
+        g_prof_tab[g_pev_lab[i]].ms+=ms; g_prof_tab[g_pev_lab[i]].n++; }
+    cudaEvent_t t=g_pev[0]; g_pev[0]=g_pev[g_pev_n-1]; g_pev[g_pev_n-1]=t; g_pev_n=1;
+}
+static void prof_ev(const char*what){
+    static int init=0;
+    if(!init){ for(int i=0;i<PEV_MAX;i++) cudaEventCreate(&g_pev[i]); init=1; }
+    int k=prof_idx(what);
+    if(g_pev_n && cudaEventQuery(g_pev[g_pev_n-1])==cudaSuccess) g_prof_tab[k].drain++;
+    cudaEventRecord(g_pev[g_pev_n],0); g_pev_lab[g_pev_n++]=(short)k;
+    if(g_pev_n==PEV_MAX) prof_flush();
 }
 static void prof_report(void){
+    if(g_prof>=3) prof_flush();
     if(!g_prof||!g_prof_n) return;
     double tot=0; for(int i=0;i<g_prof_n;i++) tot+=g_prof_tab[i].ms;
     for(int i=0;i<g_prof_n;i++) for(int j=i+1;j<g_prof_n;j++)
         if(g_prof_tab[j].ms>g_prof_tab[i].ms){
             ProfEnt t=g_prof_tab[i]; g_prof_tab[i]=g_prof_tab[j]; g_prof_tab[j]=t; }
-    printf("\n[prof] per-kernel totals over the run (%.0f ms tracked)\n",tot);
-    for(int i=0;i<g_prof_n;i++)
-        printf("  %-22s %9.1f ms  %5.1f%%   x%d\n", g_prof_tab[i].name,
+    printf("\n[prof] per-kernel totals over the run (%.0f ms tracked%s)\n",tot,g_prof>=3?", async GPU time":"");
+    for(int i=0;i<g_prof_n;i++){
+        printf("  %-22s %9.1f ms  %5.1f%%   x%d", g_prof_tab[i].name,
                g_prof_tab[i].ms, 100.0*g_prof_tab[i].ms/tot, g_prof_tab[i].n);
+        if(g_prof>=3) printf("   drained %d",g_prof_tab[i].drain);
+        printf("\n"); }
     fflush(stdout);
 }
 
 static void kchk(const char*what,int l){
     if(!g_debug && !g_prof) return;
+    if(g_prof>=3 && !g_debug){ prof_ev(what); return; }
     cudaError_t e=cudaDeviceSynchronize();
     if(e==cudaSuccess) e=cudaGetLastError();
     if(e!=cudaSuccess){ fprintf(stderr,"\n[FAULT] after %s (layer %d): %s\n",what,l,cudaGetErrorString(e)); exit(1); }
@@ -1061,6 +1086,16 @@ __global__ void k_attn_bwd_dkv(const float*Q,const float*K,const float*V,const f
 __global__ void k_f2h(const float*src,__half*dst,size_t n,float s){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n) dst[i]=__float2half(src[i]*s);
+}
+/* forward RoPE straight into the fp16 attention copy; wb: also write the fp32 back */
+__global__ void k_rope_h(float*buf,__half*dst,const float*cosb,const float*sinb,int N,int nh,int hd,int hf,int T,int wb){
+    size_t gid=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(gid>=(size_t)N*nh*hf) return;
+    int i=(int)(gid%hf); size_t r=gid/hf; int h=(int)(r%nh); int n=(int)(r/nh); int t=n%T;
+    size_t o=(size_t)n*nh*hd+(size_t)h*hd;
+    float c=cosb[t*hf+i],s=sinb[t*hf+i],a=buf[o+i],b=buf[o+i+hf], x=a*c-b*s, y=b*c+a*s;
+    dst[o+i]=__float2half(x); dst[o+i+hf]=__float2half(y);
+    if(wb){ buf[o+i]=x; buf[o+i+hf]=y; }
 }
 /* lane owns dims (2*lane, 2*lane+1). hd is even and the row offsets are
  * multiples of hd, so every __half2 access is 4-byte aligned. */
@@ -1725,6 +1760,308 @@ static int attn_fwd_tc(const __half*Q,const __half*K,const __half*V,float*O,floa
     #undef TC_F
 }
 
+/* ---- FA2-style attention on raw mma.sync m16n8k16 (CUDALM_FA, default 1) ----
+ * Same contracts as the wmma TC kernels above (fp16 Q/K/V/dA, fp32 O/lse/dQ/dK/dV,
+ * dA and Drow scaled by DSCALE, outputs +=), but S/P/dS never leave registers: the
+ * fp32 accumulator of S = Q.K^T is, two 16x8 tiles at a time, exactly the A-operand
+ * layout of P for P.V. 64x64 tiles, 4 warps x 16 rows, K/V (or Q/dA) tiles in smem
+ * padded to HD+8 halves so ldmatrix rows are conflict-free. Softmax in the exp2
+ * domain. */
+#define FA_B 64
+__device__ __forceinline__ void fa_mma(float*c,const unsigned*a,const unsigned*b){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]));
+}
+__device__ __forceinline__ void fa_ld4(unsigned*r,const __half*p){
+    unsigned s=(unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n":"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(s));
+}
+__device__ __forceinline__ void fa_ld4t(unsigned*r,const __half*p){
+    unsigned s=(unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3},[%4];\n":"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(s));
+}
+__device__ __forceinline__ unsigned fa_pk(float a,float b){ __half2 h=__floats2half2_rn(a,b); return *(unsigned*)&h; }
+/* rows r0.. of a [*,ld] fp16 matrix (columns c0..c0+HD) -> smem [FA_B][HD+8], zero past T */
+template<int HD>
+__device__ __forceinline__ void fa_tile(__half*s,const __half*g,int r0,int T,int bT,int ld,int c0){
+    for(int i=threadIdx.x;i<FA_B*HD/8;i+=128){
+        int r=i/(HD/8), c=(i-r*(HD/8))*8;
+        uint4 v=make_uint4(0,0,0,0);
+        if(r0+r<T) v=*(const uint4*)(g+(size_t)(bT+r0+r)*ld+c0+c);
+        *(uint4*)(s+r*(HD+8)+c)=v;
+    }
+}
+/* B operand from an smem tile whose rows are the mma N index (keys for Q.K^T):
+ * x4 = n-tiles 2p,2p+1 at k-step kk */
+#define FA_BN(sm,p,kk) ((sm)+(16*(p)+(ln&7)+8*(ln>>4))*LDS+16*(kk)+8*((ln>>3)&1))
+/* B operand from an smem tile whose rows are the mma K index (keys for P.V), .trans:
+ * x4 = n-tiles 2p,2p+1 (columns 16p..) at k-step j */
+#define FA_BK(sm,j,p) ((sm)+(16*(j)+(ln&7)+8*((ln>>3)&1))*LDS+16*(p)+8*(ln>>4))
+/* A fragments of a 16 x HD row block straight from global (rows ra, rb) */
+#define FA_AG(fr,base,ra,rb,ld,col0,okA,okB) \
+    _Pragma("unroll") for(int kk=0;kk<HD/16;kk++){ \
+        const __half*pa=(base)+(size_t)(ra)*(ld)+(col0)+16*kk+2*tq, *pb=(base)+(size_t)(rb)*(ld)+(col0)+16*kk+2*tq; \
+        fr[kk][0]=(okA)?*(const unsigned*)pa:0u;     fr[kk][1]=(okB)?*(const unsigned*)pb:0u; \
+        fr[kk][2]=(okA)?*(const unsigned*)(pa+8):0u; fr[kk][3]=(okB)?*(const unsigned*)(pb+8):0u; }
+
+template<int HD>
+__global__ __launch_bounds__(128)
+void k_attn_fwd_fa(const __half*Q,const __half*K,const __half*V,float*O,float*lse,
+                   int win,int B,int T,int H,int KV,int D,int KD){
+    constexpr int LDS=HD+8, NK=HD/16, ND=HD/8;
+    __shared__ __align__(16) __half sK[FA_B*LDS], sV[FA_B*LDS];
+    __shared__ int sMin;
+    int w=threadIdx.x>>5, ln=threadIdx.x&31, g=ln>>2, tq=ln&3;
+    int bh=blockIdx.y, h=bh%H, b=bh/H, kvh=h/(H/KV);
+    int qb=(gridDim.x-1-blockIdx.x)*FA_B, q0=qb+16*w, tA=q0+g, tB=tA+8;
+    int dA=0,dB=0;
+    if(d_dstart){ if(tA<T) dA=d_dstart[b*T+tA]; if(tB<T) dB=d_dstart[b*T+tB]; }
+    unsigned qf[NK][4];
+    FA_AG(qf,Q,b*T+tA,b*T+tB,D,h*HD,tA<T,tB<T)
+    float o[ND][4];
+    #pragma unroll
+    for(int n=0;n<ND;n++) o[n][0]=o[n][1]=o[n][2]=o[n][3]=0.f;
+    float mA=-1e30f,mB=-1e30f,lA=0.f,lB=0.f;
+    const float sl2=rsqrtf((float)HD)*1.4426950409f;
+    int hi=qb+FA_B-1; if(hi>T-1) hi=T-1;
+    int lo=win>0?qb-win+1:0; if(lo<0) lo=0;
+    if(d_dstart){                       /* skip key tiles before every row's document start */
+        if(threadIdx.x==0) sMin=T; __syncthreads();
+        atomicMin(&sMin,min(tA<T?dA:T,tB<T?dB:T)); __syncthreads();
+        if(sMin>lo) lo=sMin; }
+    for(int s0=lo/FA_B*FA_B;s0<=hi;s0+=FA_B){
+        __syncthreads();
+        fa_tile<HD>(sK,K,s0,T,b*T,KD,kvh*HD); fa_tile<HD>(sV,V,s0,T,b*T,KD,kvh*HD);
+        __syncthreads();
+        if(q0>=T || s0>q0+15 || (win>0 && s0+FA_B-1<=q0-win)) continue;
+        float s[8][4];
+        #pragma unroll
+        for(int n=0;n<8;n++) s[n][0]=s[n][1]=s[n][2]=s[n][3]=0.f;
+        #pragma unroll
+        for(int kk=0;kk<NK;kk++)
+            #pragma unroll
+            for(int p=0;p<4;p++){ unsigned bk[4]; fa_ld4(bk,FA_BN(sK,p,kk));
+                fa_mma(s[2*p],qf[kk],bk); fa_mma(s[2*p+1],qf[kk],bk+2); }
+        float xA=-INFINITY,xB=-INFINITY;
+        #pragma unroll
+        for(int n=0;n<8;n++)
+            #pragma unroll
+            for(int e=0;e<4;e++){ int key=s0+8*n+2*tq+(e&1), t=e<2?tA:tB, ds=e<2?dA:dB;
+                bool ok=t<T && key<=t && key>=ds && (win<=0 || key>t-win);
+                float v=ok?s[n][e]*sl2:-INFINITY; s[n][e]=v;
+                if(e<2) xA=fmaxf(xA,v); else xB=fmaxf(xB,v); }
+        xA=fmaxf(xA,__shfl_xor_sync(0xffffffffu,xA,1)); xA=fmaxf(xA,__shfl_xor_sync(0xffffffffu,xA,2));
+        xB=fmaxf(xB,__shfl_xor_sync(0xffffffffu,xB,1)); xB=fmaxf(xB,__shfl_xor_sync(0xffffffffu,xB,2));
+        float nA=fmaxf(mA,xA), nB=fmaxf(mB,xB), cA=exp2f(mA-nA), cB=exp2f(mB-nB);
+        mA=nA; mB=nB; lA*=cA; lB*=cB;
+        #pragma unroll
+        for(int n=0;n<8;n++){ s[n][0]=exp2f(s[n][0]-nA); s[n][1]=exp2f(s[n][1]-nA);
+            s[n][2]=exp2f(s[n][2]-nB); s[n][3]=exp2f(s[n][3]-nB);
+            lA+=s[n][0]+s[n][1]; lB+=s[n][2]+s[n][3]; }
+        #pragma unroll
+        for(int n=0;n<ND;n++){ o[n][0]*=cA; o[n][1]*=cA; o[n][2]*=cB; o[n][3]*=cB; }
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            unsigned pa[4]={fa_pk(s[2*j][0],s[2*j][1]),fa_pk(s[2*j][2],s[2*j][3]),
+                            fa_pk(s[2*j+1][0],s[2*j+1][1]),fa_pk(s[2*j+1][2],s[2*j+1][3])};
+            #pragma unroll
+            for(int p=0;p<NK;p++){ unsigned bv[4]; fa_ld4t(bv,FA_BK(sV,j,p));
+                fa_mma(o[2*p],pa,bv); fa_mma(o[2*p+1],pa,bv+2); }
+        }
+    }
+    lA+=__shfl_xor_sync(0xffffffffu,lA,1); lA+=__shfl_xor_sync(0xffffffffu,lA,2);
+    lB+=__shfl_xor_sync(0xffffffffu,lB,1); lB+=__shfl_xor_sync(0xffffffffu,lB,2);
+    const float LN2=0.6931471806f;
+    if(tA<T){ float iv=1.f/lA; float*op=O+(size_t)(b*T+tA)*D+h*HD+2*tq;
+        #pragma unroll
+        for(int n=0;n<ND;n++) *(float2*)(op+8*n)=make_float2(o[n][0]*iv,o[n][1]*iv);
+        if(!tq) lse[(size_t)(b*H+h)*T+tA]=mA*LN2+logf(lA); }
+    if(tB<T){ float iv=1.f/lB; float*op=O+(size_t)(b*T+tB)*D+h*HD+2*tq;
+        #pragma unroll
+        for(int n=0;n<ND;n++) *(float2*)(op+8*n)=make_float2(o[n][2]*iv,o[n][3]*iv);
+        if(!tq) lse[(size_t)(b*H+h)*T+tB]=mB*LN2+logf(lB); }
+}
+
+/* dQ: rows = 16 queries per warp. S=Q.K^T, dP=dA.V^T, dS=P(dP-Drow)*scale*TC_DSS,
+ * dQ += dS.K */
+template<int HD>
+__global__ __launch_bounds__(128)
+void k_attn_bwd_dq_fa(const __half*Q,const __half*K,const __half*V,const __half*dA,
+                      const float*lse,const float*Drow,float*dQ,int win,
+                      int B,int T,int H,int KV,int D,int KD){
+    constexpr int LDS=HD+8, NK=HD/16, ND=HD/8;
+    __shared__ __align__(16) __half sK[FA_B*LDS], sV[FA_B*LDS];
+    __shared__ int sMin;
+    int w=threadIdx.x>>5, ln=threadIdx.x&31, g=ln>>2, tq=ln&3;
+    int bh=blockIdx.y, h=bh%H, b=bh/H, kvh=h/(H/KV);
+    int qb=(gridDim.x-1-blockIdx.x)*FA_B, q0=qb+16*w, tA=q0+g, tB=tA+8;
+    int dsA=0,dsB=0;
+    if(d_dstart){ if(tA<T) dsA=d_dstart[b*T+tA]; if(tB<T) dsB=d_dstart[b*T+tB]; }
+    unsigned qf[NK][4], gf[NK][4];
+    FA_AG(qf,Q,b*T+tA,b*T+tB,D,h*HD,tA<T,tB<T)
+    FA_AG(gf,dA,b*T+tA,b*T+tB,D,h*HD,tA<T,tB<T)
+    const float L2E=1.4426950409f, sl2=rsqrtf((float)HD)*L2E, dsc=rsqrtf((float)HD)*TC_DSS;
+    const float*Lh=lse+(size_t)(b*H+h)*T, *Dh=Drow+(size_t)(b*H+h)*T;
+    float LA=tA<T?Lh[tA]*L2E:0.f, LB=tB<T?Lh[tB]*L2E:0.f, RA=tA<T?Dh[tA]:0.f, RB=tB<T?Dh[tB]:0.f;
+    float dq[ND][4];
+    #pragma unroll
+    for(int n=0;n<ND;n++) dq[n][0]=dq[n][1]=dq[n][2]=dq[n][3]=0.f;
+    int hi=qb+FA_B-1; if(hi>T-1) hi=T-1;
+    int lo=win>0?qb-win+1:0; if(lo<0) lo=0;
+    if(d_dstart){
+        if(threadIdx.x==0) sMin=T; __syncthreads();
+        atomicMin(&sMin,min(tA<T?dsA:T,tB<T?dsB:T)); __syncthreads();
+        if(sMin>lo) lo=sMin; }
+    for(int s0=lo/FA_B*FA_B;s0<=hi;s0+=FA_B){
+        __syncthreads();
+        fa_tile<HD>(sK,K,s0,T,b*T,KD,kvh*HD); fa_tile<HD>(sV,V,s0,T,b*T,KD,kvh*HD);
+        __syncthreads();
+        if(q0>=T || s0>q0+15 || (win>0 && s0+FA_B-1<=q0-win)) continue;
+        float s[8][4], dp[8][4];
+        #pragma unroll
+        for(int n=0;n<8;n++){ s[n][0]=s[n][1]=s[n][2]=s[n][3]=0.f; dp[n][0]=dp[n][1]=dp[n][2]=dp[n][3]=0.f; }
+        #pragma unroll
+        for(int kk=0;kk<NK;kk++)
+            #pragma unroll
+            for(int p=0;p<4;p++){ unsigned bk[4],bv[4]; fa_ld4(bk,FA_BN(sK,p,kk)); fa_ld4(bv,FA_BN(sV,p,kk));
+                fa_mma(s[2*p],qf[kk],bk); fa_mma(s[2*p+1],qf[kk],bk+2);
+                fa_mma(dp[2*p],gf[kk],bv); fa_mma(dp[2*p+1],gf[kk],bv+2); }
+        #pragma unroll
+        for(int n=0;n<8;n++)
+            #pragma unroll
+            for(int e=0;e<4;e++){ int key=s0+8*n+2*tq+(e&1), t=e<2?tA:tB, ds=e<2?dsA:dsB;
+                bool ok=t<T && key<=t && key>=ds && (win<=0 || key>t-win);
+                float pr=ok?exp2f(s[n][e]*sl2-(e<2?LA:LB)):0.f;
+                s[n][e]=pr*(dp[n][e]-(e<2?RA:RB))*dsc; }
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            unsigned xa[4]={fa_pk(s[2*j][0],s[2*j][1]),fa_pk(s[2*j][2],s[2*j][3]),
+                            fa_pk(s[2*j+1][0],s[2*j+1][1]),fa_pk(s[2*j+1][2],s[2*j+1][3])};
+            #pragma unroll
+            for(int p=0;p<NK;p++){ unsigned bk[4]; fa_ld4t(bk,FA_BK(sK,j,p));
+                fa_mma(dq[2*p],xa,bk); fa_mma(dq[2*p+1],xa,bk+2); }
+        }
+    }
+    const float os=DSCALE_INV/TC_DSS;
+    if(tA<T){ float*op=dQ+(size_t)(b*T+tA)*D+h*HD+2*tq;
+        #pragma unroll
+        for(int n=0;n<ND;n++){ float2 v=*(float2*)(op+8*n); v.x+=dq[n][0]*os; v.y+=dq[n][1]*os; *(float2*)(op+8*n)=v; } }
+    if(tB<T){ float*op=dQ+(size_t)(b*T+tB)*D+h*HD+2*tq;
+        #pragma unroll
+        for(int n=0;n<ND;n++){ float2 v=*(float2*)(op+8*n); v.x+=dq[n][2]*os; v.y+=dq[n][3]*os; *(float2*)(op+8*n)=v; } }
+}
+
+/* dK/dV: rows = 16 keys per warp, looping over the H/KV query heads that share this
+ * kv head and over 64-query tiles. S^T=K.Q^T, dP^T=V.dA^T, P^T=exp(S^T-lse[q]),
+ * dV += P^T.dA, dS^T=P^T(dP^T-Drow[q]), dK += dS^T.Q */
+template<int HD>
+__global__ __launch_bounds__(128)
+void k_attn_bwd_dkv_fa(const __half*Q,const __half*K,const __half*V,const __half*dA,
+                       const float*lse,const float*Drow,float*dK,float*dV,int win,
+                       int B,int T,int H,int KV,int D,int KD){
+    constexpr int LDS=HD+8, NK=HD/16, ND=HD/8;
+    __shared__ __align__(16) __half sQ[FA_B*LDS], sG[FA_B*LDS];
+    __shared__ float sL[FA_B], sR[FA_B]; __shared__ int sD[FA_B];
+    int w=threadIdx.x>>5, ln=threadIdx.x&31, g=ln>>2, tq=ln&3;
+    int bkv=blockIdx.y, kvh=bkv%KV, b=bkv/KV, grp=H/KV;
+    int kb=blockIdx.x*FA_B, k0=kb+16*w, kA=k0+g, kB=kA+8;
+    unsigned kf[NK][4], vf[NK][4];
+    FA_AG(kf,K,b*T+kA,b*T+kB,KD,kvh*HD,kA<T,kB<T)
+    FA_AG(vf,V,b*T+kA,b*T+kB,KD,kvh*HD,kA<T,kB<T)
+    const float L2E=1.4426950409f, sl2=rsqrtf((float)HD)*L2E, dsc=rsqrtf((float)HD)*TC_DSS;
+    float dk[ND][4], dv[ND][4];
+    #pragma unroll
+    for(int n=0;n<ND;n++){ dk[n][0]=dk[n][1]=dk[n][2]=dk[n][3]=0.f; dv[n][0]=dv[n][1]=dv[n][2]=dv[n][3]=0.f; }
+    int hiT=kb+FA_B-1+(win>0?win-1:T); if(hiT>T-1) hiT=T-1;
+    for(int hh=0;hh<grp;hh++){ int h=kvh*grp+hh;
+      const float*Lh=lse+(size_t)(b*H+h)*T, *Dh=Drow+(size_t)(b*H+h)*T;
+      for(int t0=kb;t0<=hiT;t0+=FA_B){
+        __syncthreads();
+        fa_tile<HD>(sQ,Q,t0,T,b*T,D,h*HD); fa_tile<HD>(sG,dA,t0,T,b*T,D,h*HD);
+        if(threadIdx.x<FA_B){ int t=t0+threadIdx.x; bool ok=t<T;
+            sL[threadIdx.x]=ok?Lh[t]*L2E:0.f; sR[threadIdx.x]=ok?Dh[t]:0.f;
+            sD[threadIdx.x]=ok?(d_dstart?d_dstart[b*T+t]:0):T; }
+        __syncthreads();
+        if(k0>=T || t0+FA_B-1<k0 || (win>0 && t0>k0+15+win-1)) continue;
+        float s[8][4];
+        #pragma unroll
+        for(int n=0;n<8;n++) s[n][0]=s[n][1]=s[n][2]=s[n][3]=0.f;
+        #pragma unroll
+        for(int kk=0;kk<NK;kk++)
+            #pragma unroll
+            for(int p=0;p<4;p++){ unsigned bq[4]; fa_ld4(bq,FA_BN(sQ,p,kk));
+                fa_mma(s[2*p],kf[kk],bq); fa_mma(s[2*p+1],kf[kk],bq+2); }
+        unsigned ph[8][2];              /* P^T as packed fp16 pairs: rows kA (0), kB (1) */
+        #pragma unroll
+        for(int n=0;n<8;n++){
+            float pr[4];
+            #pragma unroll
+            for(int e=0;e<4;e++){ int c=8*n+2*tq+(e&1), t=t0+c, key=e<2?kA:kB;
+                bool ok=key<T && t<T && t>=key && key>=sD[c] && (win<=0 || t<=key+win-1);
+                pr[e]=ok?exp2f(s[n][e]*sl2-sL[c]):0.f; }
+            ph[n][0]=fa_pk(pr[0],pr[1]); ph[n][1]=fa_pk(pr[2],pr[3]); }
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            unsigned pa[4]={ph[2*j][0],ph[2*j][1],ph[2*j+1][0],ph[2*j+1][1]};
+            #pragma unroll
+            for(int p=0;p<NK;p++){ unsigned bg[4]; fa_ld4t(bg,FA_BK(sG,j,p));
+                fa_mma(dv[2*p],pa,bg); fa_mma(dv[2*p+1],pa,bg+2); }
+        }
+        #pragma unroll
+        for(int n=0;n<8;n++) s[n][0]=s[n][1]=s[n][2]=s[n][3]=0.f;
+        #pragma unroll
+        for(int kk=0;kk<NK;kk++)
+            #pragma unroll
+            for(int p=0;p<4;p++){ unsigned bg[4]; fa_ld4(bg,FA_BN(sG,p,kk));
+                fa_mma(s[2*p],vf[kk],bg); fa_mma(s[2*p+1],vf[kk],bg+2); }
+        #pragma unroll
+        for(int n=0;n<8;n++){
+            float2 pA=__half22float2(*(__half2*)&ph[n][0]), pB=__half22float2(*(__half2*)&ph[n][1]);
+            int c=8*n+2*tq; float r0=sR[c], r1=sR[c+1];
+            ph[n][0]=fa_pk(pA.x*(s[n][0]-r0)*dsc,pA.y*(s[n][1]-r1)*dsc);
+            ph[n][1]=fa_pk(pB.x*(s[n][2]-r0)*dsc,pB.y*(s[n][3]-r1)*dsc); }
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            unsigned xa[4]={ph[2*j][0],ph[2*j][1],ph[2*j+1][0],ph[2*j+1][1]};
+            #pragma unroll
+            for(int p=0;p<NK;p++){ unsigned bq[4]; fa_ld4t(bq,FA_BK(sQ,j,p));
+                fa_mma(dk[2*p],xa,bq); fa_mma(dk[2*p+1],xa,bq+2); }
+        }
+      } }
+    const float ok_=DSCALE_INV/TC_DSS, ov=DSCALE_INV;
+    #pragma unroll
+    for(int r=0;r<2;r++){ int key=r?kB:kA; if(key>=T) continue;
+        float*pk=dK+(size_t)(b*T+key)*KD+kvh*HD+2*tq, *pv=dV+(size_t)(b*T+key)*KD+kvh*HD+2*tq;
+        #pragma unroll
+        for(int n=0;n<ND;n++){ float2 a=*(float2*)(pk+8*n), c=*(float2*)(pv+8*n);
+            a.x+=dk[n][2*r]*ok_; a.y+=dk[n][2*r+1]*ok_; c.x+=dv[n][2*r]*ov; c.y+=dv[n][2*r+1]*ov;
+            *(float2*)(pk+8*n)=a; *(float2*)(pv+8*n)=c; } }
+}
+#undef FA_BN
+#undef FA_BK
+#undef FA_AG
+static int g_fa=1;      /* CUDALM_FA=0: wmma TC kernels */
+static int attn_fwd_fa(const __half*Q,const __half*K,const __half*V,float*O,float*lse,
+                       int win,int B,int T,int H,int KV,int hd,int D,int KD){
+    if(!g_fa || hd!=64 || D%8 || KD%8) return 0;
+    dim3 gr((unsigned)nblk((size_t)T,FA_B),(unsigned)(B*H));
+    k_attn_fwd_fa<64><<<gr,128>>>(Q,K,V,O,lse,win,B,T,H,KV,D,KD); return 1;
+}
+static int attn_bwd_dq_fa(const __half*Q,const __half*K,const __half*V,const __half*dA,
+                          const float*lse,const float*Drow,float*dQ,int win,
+                          int B,int T,int H,int KV,int hd,int D,int KD){
+    if(!g_fa || hd!=64 || D%8 || KD%8) return 0;
+    dim3 gr((unsigned)nblk((size_t)T,FA_B),(unsigned)(B*H));
+    k_attn_bwd_dq_fa<64><<<gr,128>>>(Q,K,V,dA,lse,Drow,dQ,win,B,T,H,KV,D,KD); return 1;
+}
+static int attn_bwd_dkv_fa(const __half*Q,const __half*K,const __half*V,const __half*dA,
+                           const float*lse,const float*Drow,float*dK,float*dV,int win,
+                           int B,int T,int H,int KV,int hd,int D,int KD){
+    if(!g_fa || hd!=64 || D%8 || KD%8) return 0;
+    dim3 gr((unsigned)nblk((size_t)T,FA_B),(unsigned)(B*KV));
+    k_attn_bwd_dkv_fa<64><<<gr,128>>>(Q,K,V,dA,lse,Drow,dK,dV,win,B,T,H,KV,D,KD); return 1;
+}
+
 /* Sub-lane dKV: SPL threads cooperate on ONE key, each owning HD/SPL dims.
  *
  * The one-thread-per-key form above holds four HD-sized arrays (k, v and the two
@@ -2328,22 +2665,98 @@ __global__ void k_qtr_e4m3(const float* src,__nv_fp8_e4m3* dst,int rows,int cols
 #define CPUK_PART 4
 #include "cpu_kern.h"
 #endif
+/* ---- S6: delayed FP8 scaling (CUDALM_F8_DELAY) ----
+ * In training steps each fp8_prep call site quantizes with the amax its previous
+ * step measured (satfinite clamps any growth) and records this step's amax inside
+ * the quant kernel, removing the separate absmax read pass. A site is keyed by
+ * (src, n, tr, occurrence within the step); unseen sites use the exact path. */
+static int g_dscale=0, g_ds_on=0; static long g_ds_step=0;
+#ifndef CUDALM_CPU
+#define DS_MAX 4096
+typedef struct { const float*p; size_t n; int tr,occ; long st; } DSk;
+static DSk g_dsk[DS_MAX]; static int g_dsn=0; static float*g_dsh=0;
+__global__ void k_dsc(float*prev,float*cur,float*sc){ float a=*prev; sc[0]=a; sc[1]=a>0.f?a/448.f:1.f; sc[2]=a>0.f?448.f/a:1.f; *cur=0.f; }
+__global__ void k_cp1(const float*s,float*d){ *d=*s; }
+__device__ inline void blk_amax(float m,float*am){
+    __shared__ float sh[32];
+    for(int o=16;o>0;o>>=1) m=fmaxf(m,__shfl_down_sync(0xffffffffu,m,o));
+    int t=threadIdx.x+threadIdx.y*blockDim.x, nt=blockDim.x*blockDim.y;
+    if((t&31)==0) sh[t>>5]=m;
+    __syncthreads();
+    if(t==0){ for(int i=1;i<(nt>>5);i++) m=fmaxf(m,sh[i]); atomicMax((int*)am,__float_as_int(m)); } }
+__global__ void k_quant_am(const float* x,__nv_fp8_e4m3* q,size_t n,const float* inv,float*am){
+    float f=*inv, m=0.f;
+    for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n; i+=(size_t)gridDim.x*blockDim.x){
+        float v=x[i]; m=fmaxf(m,fabsf(v)); q[i]=__nv_fp8_e4m3(v*f); }
+    blk_amax(m,am); }
+__global__ void k_qtr_am(const float* src,__nv_fp8_e4m3* dst,int rows,int cols,const float* inv,float*am){
+    __shared__ float t[32][33];
+    int x=blockIdx.x*32+threadIdx.x, y=blockIdx.y*32+threadIdx.y; float v=0.f;
+    if(x<cols&&y<rows) v=src[(size_t)y*cols+x];
+    t[threadIdx.y][threadIdx.x]=v;
+    __syncthreads();
+    float f=*inv;
+    int r=blockIdx.y*32+threadIdx.x, c=blockIdx.x*32+threadIdx.y;
+    if(c<cols&&r<rows) dst[(size_t)c*rows+r]=__nv_fp8_e4m3(t[threadIdx.x][threadIdx.y]*f);
+    blk_amax(fabsf(v),am); }
+/* returns 1 when the delayed path quantized; 0 = caller runs the exact path (then cp1 records amax) */
+static int ds_prep(const float*src,__nv_fp8_e4m3*dst,int tr,int rows,int cols,float*sc,float**rec){
+    size_t n=(size_t)rows*cols; int occ=0,h=-1; *rec=NULL;
+    for(int i=0;i<g_dsn;i++){ DSk*k=&g_dsk[i]; if(k->p==src&&k->n==n&&k->tr==tr&&k->st==g_ds_step) occ++; }
+    for(int i=0;i<g_dsn;i++){ DSk*k=&g_dsk[i]; if(k->p==src&&k->n==n&&k->tr==tr&&k->occ==occ){ h=i; break; } }
+    if(h<0){ if(g_dsn>=DS_MAX) return 0; h=g_dsn++; g_dsk[h].p=src; g_dsk[h].n=n; g_dsk[h].tr=tr; g_dsk[h].occ=occ; g_dsk[h].st=-9; }
+    if(!g_dsh){ g_dsh=(float*)dmalloc(2*DS_MAX*sizeof(float)); cudaMemsetAsync(g_dsh,0,2*DS_MAX*sizeof(float),0); }
+    int seen=g_dsk[h].st==g_ds_step-1, par=(int)(g_ds_step&1); float *cur=g_dsh+2*h+par, *prev=g_dsh+2*h+(par^1);
+    g_dsk[h].st=g_ds_step;
+    if(!seen){ *rec=cur; return 0; }
+    KL(k_dsc,1,1)(prev,cur,sc);
+    if(tr){ dim3 b(32,32),gr((cols+31)/32,(rows+31)/32); KL(k_qtr_am,gr,b)(src,dst,rows,cols,sc+2,cur); }
+    else  { int g=(int)((n+255)/256); if(g>1024)g=1024; if(g<1)g=1; KL(k_quant_am,g,256)(src,dst,n,sc+2,cur); }
+    return 1;
+}
+#endif
 /* Quantize one operand to E4M3 with per-tensor absmax scaling. tr=0: plain cast
  * of an already-Kc-contiguous [outer,Kc] matrix. tr=1: transpose-cast a row-major
  * [rows,cols] matrix into [cols,rows] (Kc=rows becomes contiguous). Writes deq
  * scale into sc[deqi], scratch amax/inv into sc[deqi-1]/sc[deqi+1]. */
-static void fp8_prep(const float* src,__nv_fp8_e4m3* dst,int tr,int rows,int cols,int deqi){
-    size_t n=(size_t)rows*cols;
+static void fp8_prep_sc(const float* src,__nv_fp8_e4m3* dst,int tr,int rows,int cols,float* sc){
+    size_t n=(size_t)rows*cols; float*rec=NULL;
+#ifndef CUDALM_CPU
+    if(g_ds_on && ds_prep(src,dst,tr,rows,cols,sc,&rec)) return;
+#endif
     int g=(int)((n+255)/256); if(g>1024)g=1024; if(g<1)g=1;
-    KL(k_absmax,g,256)(src,n,&g_fp8sc[deqi-1]);
-    KL(k_mkscale,1,1)(&g_fp8sc[deqi-1],&g_fp8sc[deqi],&g_fp8sc[deqi+1]);
-    if(tr){ dim3 b(32,32),gr((cols+31)/32,(rows+31)/32); KL(k_qtr_e4m3,gr,b)(src,dst,rows,cols,&g_fp8sc[deqi+1]); }
-    else  { KL(k_quant_e4m3,nblk(n,TPB),TPB)(src,dst,n,&g_fp8sc[deqi+1]); }
+    KL(k_absmax,g,256)(src,n,sc);
+    KL(k_mkscale,1,1)(sc,sc+1,sc+2);
+    if(tr){ dim3 b(32,32),gr((cols+31)/32,(rows+31)/32); KL(k_qtr_e4m3,gr,b)(src,dst,rows,cols,sc+2); }
+    else  { KL(k_quant_e4m3,nblk(n,TPB),TPB)(src,dst,n,sc+2); }
+#ifndef CUDALM_CPU
+    if(rec) KL(k_cp1,1,1)(sc,rec);
+#endif
+}
+static void fp8_prep(const float* src,__nv_fp8_e4m3* dst,int tr,int rows,int cols,int deqi){
+    fp8_prep_sc(src,dst,tr,rows,cols,&g_fp8sc[deqi-1]);
+}
+/* A-operand hold: while A is held, every FP8 GEMM reading it as plain [M,K] reuses one
+ * quantized copy (q/k/v share a_norm, w1/w3 share f_norm). sc = {amax,deq,inv}.
+ * A producer may also fill buf/sc itself and set valid (fused swiglu -> FP8 act). */
+typedef struct { const float*src; int M,K,valid; __nv_fp8_e4m3*buf; size_t cap; float*sc; } F8Hold;
+static F8Hold g_hold={0};
+static int g_f8hold=1;   /* CUDALM_F8_HOLD=0: off */
+static void f8_hold(const float*A,int M,int K){ g_hold.src=A; g_hold.M=M; g_hold.K=K; g_hold.valid=0;
+    if(!g_hold.sc) g_hold.sc=(float*)dmalloc(4*sizeof(float)); }
+static void f8_drop(void){ g_hold.src=NULL; g_hold.valid=0; }
+static __nv_fp8_e4m3* f8_A(const float*A,int M,int K,float**deq){
+    if(g_f8hold && A==g_hold.src && M==g_hold.M && K==g_hold.K){
+        if(!g_hold.valid){ __nv_fp8_e4m3*b=f8slot(&g_hold.buf,&g_hold.cap,(size_t)M*K);
+            cudaMemsetAsync(g_hold.sc,0,sizeof(float),0); fp8_prep_sc(A,b,0,M,K,g_hold.sc); g_hold.valid=1; }
+        *deq=g_hold.sc+1; return g_hold.buf; }
+    __nv_fp8_e4m3*P8=f8slot(&g8A,&g8Acap,(size_t)M*K); fp8_prep(A,P8,0,M,K,4); *deq=&g_fp8sc[4]; return P8;
 }
 /* Core FP8 E4M3 TN matmul: R[rowsP,rowsQ] = alpha*(P @ Q^T) + beta*C, with both
  * P8[rowsP,Kc] and Q8[rowsQ,Kc] Kc-contiguous E4M3, fp32 accumulate+output. In
  * cublasLt terms A=Q8(op=T), B=P8(op=N), D=C col-major [rowsQ,rowsP]. deqQ/deqP
  * are DEVICE deq-scale pointers (A_SCALE applies to A=Q8, B_SCALE to B=P8). */
+static const void* g_f8cin=NULL;   /* set: the epilogue reads beta*C from here instead of from D */
 static cudaDataType_t g_f8dt=CUDA_R_32F; /* D type; CUDA_R_16F only for head logits (CUDALM_H16) */
 static void fp8_matmul(const __nv_fp8_e4m3* P8,const __nv_fp8_e4m3* Q8,
                        float* deqP,float* deqQ,int rowsP,int rowsQ,int Kc,
@@ -2393,7 +2806,7 @@ static void fp8_matmul(const __nv_fp8_e4m3* P8,const __nv_fp8_e4m3* Q8,
         if(nres==0){ fprintf(stderr,"fp8: no algo for %s (rowsP=%d rowsQ=%d Kc=%d)\n",what,rowsP,rowsQ,Kc); exit(1); }
         if(nhc<128){ hc[nhc].q=rowsQ; hc[nhc].k=Kc; hc[nhc].ld=ldc; hc[nhc].b=bk; hc[nhc].dt=(int)g_f8dt; hc[nhc].algo=h.algo; nhc++; }
     } else h.algo=hc[hi].algo;
-    ckb((cublasStatus_t)cublasLtMatmul(LT,op,alpha,Q8,La,P8,Lb,beta,C,Ld,C,Ld,&h.algo,g_fp8ws,g_fp8wscap,0),what);
+    ckb((cublasStatus_t)cublasLtMatmul(LT,op,alpha,Q8,La,P8,Lb,beta,g_f8cin?g_f8cin:C,Ld,C,Ld,&h.algo,g_fp8ws,g_fp8wscap,0),what);
     if(g_fp8dbg){cudaError_t e=cudaDeviceSynchronize(); if(e!=cudaSuccess){fprintf(stderr,"fp8 FAULT after-matmul %s (rowsP=%d rowsQ=%d Kc=%d): %s\n",what,rowsP,rowsQ,Kc,cudaGetErrorString(e)); exit(2);} else fprintf(stderr,"fp8 OK %s (rowsP=%d rowsQ=%d Kc=%d)\n",what,rowsP,rowsQ,Kc);}
 }
 /* alignment gate: FP8 tensor-core kernel needs all three GEMM dims divisible by
@@ -2405,11 +2818,11 @@ static inline int fp8_ok(int rowsP,int rowsQ,int Kc,int kind){ return g_fp8gemm 
  * B[K,N]->[N,K] so K is contiguous). */
 static void g_ab(const float*A,const float*B,float*C,int M,int K,int N){
     if(fp8_ok(M,N,K,1)){
-        __nv_fp8_e4m3 *P8=f8slot(&g8A,&g8Acap,(size_t)M*K), *Q8=f8slot(&g8B,&g8Bcap,(size_t)K*N);
+        __nv_fp8_e4m3 *Q8=f8slot(&g8B,&g8Bcap,(size_t)K*N); float*dA;
         cudaMemsetAsync(g_fp8sc,0,6*sizeof(float),0);
-        fp8_prep(A,P8,0,M,K,4);      /* P deq at sc[4] */
+        __nv_fp8_e4m3 *P8=f8_A(A,M,K,&dA);
         fp8_prep(B,Q8,1,K,N,1);      /* Q=B^T deq at sc[1] */
-        fp8_matmul(P8,Q8,&g_fp8sc[4],&g_fp8sc[1],M,N,K,&ONE,&ZERO,C,N,"g_ab_f8");
+        fp8_matmul(P8,Q8,dA,&g_fp8sc[1],M,N,K,&ONE,&ZERO,C,N,"g_ab_f8");
         return;
     }
     if(g_fp16gemm){ gemm_ex(CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&ONE,B,N,A,K,&ZERO,C,N,
@@ -2419,25 +2832,38 @@ static void g_ab(const float*A,const float*B,float*C,int M,int K,int N){
 /* C[M,N] = A[M,K] @ B[N,K]^T   (B row-major [N,K], both K-contiguous already) */
 static void g_abt(const float*A,const float*B,float*C,int M,int K,int N){
     if(fp8_ok(M,N,K,2)){
-        __nv_fp8_e4m3 *P8=f8slot(&g8A,&g8Acap,(size_t)M*K), *Q8=f8slot(&g8B,&g8Bcap,(size_t)N*K);
+        __nv_fp8_e4m3 *Q8=f8slot(&g8B,&g8Bcap,(size_t)N*K); float*dA;
         cudaMemsetAsync(g_fp8sc,0,6*sizeof(float),0);
-        fp8_prep(A,P8,0,M,K,4);
+        __nv_fp8_e4m3 *P8=f8_A(A,M,K,&dA);
         fp8_prep(B,Q8,0,N,K,1);
-        fp8_matmul(P8,Q8,&g_fp8sc[4],&g_fp8sc[1],M,N,K,&ONE,&ZERO,C,N,"g_abt_f8");
+        fp8_matmul(P8,Q8,dA,&g_fp8sc[1],M,N,K,&ONE,&ZERO,C,N,"g_abt_f8");
         return;
     }
     if(g_fp16gemm){ gemm_ex(CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&ONE,B,K,A,K,&ZERO,C,N,
                             (size_t)N*K,(size_t)M*K,"g_abt_h"); return; }
     ckb(cublasSgemm(CB,CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&ONE,B,K,A,K,&ZERO,C,N),"g_abt");
 }
+/* C = A@B + R (residual folded into the FP8 epilogue; CUDALM_RESEPI=0: separate add) */
+static int g_resepi=1;
+static void g_ab_res(const float*A,const float*B,float*C,const float*R,int M,int K,int N){
+    if(g_resepi && fp8_ok(M,N,K,1)){
+        __nv_fp8_e4m3 *Q8=f8slot(&g8B,&g8Bcap,(size_t)K*N); float*dA;
+        cudaMemsetAsync(g_fp8sc,0,6*sizeof(float),0);
+        __nv_fp8_e4m3 *P8=f8_A(A,M,K,&dA);
+        fp8_prep(B,Q8,1,K,N,1);
+        g_f8cin=R; fp8_matmul(P8,Q8,dA,&g_fp8sc[1],M,N,K,&ONE,&ONE,C,N,"g_ab_res_f8"); g_f8cin=NULL;
+        return;
+    }
+    g_ab(A,B,C,M,K,N); KL(k_add,nblk((size_t)M*N,TPB),TPB)(C,R,(size_t)M*N);
+}
 /* same but with an explicit beta, so dX = dg@w1^T + du@w3^T accumulates in place */
 static void g_abt_b(const float*A,const float*B,float*C,int M,int K,int N,float beta){
     if(fp8_ok(M,N,K,2)){
-        __nv_fp8_e4m3 *P8=f8slot(&g8A,&g8Acap,(size_t)M*K), *Q8=f8slot(&g8B,&g8Bcap,(size_t)N*K);
+        __nv_fp8_e4m3 *Q8=f8slot(&g8B,&g8Bcap,(size_t)N*K); float*dA;
         cudaMemsetAsync(g_fp8sc,0,6*sizeof(float),0);
-        fp8_prep(A,P8,0,M,K,4);
+        __nv_fp8_e4m3 *P8=f8_A(A,M,K,&dA);
         fp8_prep(B,Q8,0,N,K,1);
-        fp8_matmul(P8,Q8,&g_fp8sc[4],&g_fp8sc[1],M,N,K,&ONE,&beta,C,N,"g_abt_b_f8");
+        fp8_matmul(P8,Q8,dA,&g_fp8sc[1],M,N,K,&ONE,&beta,C,N,"g_abt_b_f8");
         return;
     }
     if(g_fp16gemm){ gemm_ex(CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&ONE,B,K,A,K,&beta,C,N,
@@ -2559,7 +2985,7 @@ static float g_wsd_decay=0.15f;
  * about (re-warm, re-decay, replay). Relative to start_iter, not to zero. */
 static int g_rewarm=0, g_start_iter=0;
 
-typedef struct { int N;
+typedef struct { int N, tr;   /* tr: training step (BF16 FFN/MoE paths); eval/serve GAs stay exact */
     float **a_in,**a_norm,**r1,**qh,**kh,**vh,**att,**f_in,**f_norm,**r2,**gg,**uu,**lse;
     float *x_final,*fn,*fnr,*acttmp;
     float *logits,*dlogits,*lossb;                   /* chunked: CH_ROWS rows */
@@ -2741,8 +3167,19 @@ static void moe_perm(GA*a,int l,int N,int E){
 /* Same build for all K top-K passes of layer l in one round-trip: assign/perm
  * slices at k*N, hoff at (l*Km+k). h_perm is pinned and uploaded async; the next
  * layer's blocking assign D2H orders its reuse. */
-static void moe_perm_all(GA*a,int l,int N,int E,int Km,int K,int sb){
-    ck(cudaMemcpy(a->h_assign,a->assign[l],(size_t)K*N*4,cudaMemcpyDeviceToHost),"assign d2h");
+/* CUDALM_MOE_OVL (default 1): the assign copy is async and the shared expert (which
+ * needs no routing) is queued behind it, so the GPU has work while the host waits. */
+static int g_moe_ovl=1, g_sh_done=0;
+static void (*g_ovl_fn)(GA*,int,float*,int)=NULL;
+static cudaEvent_t g_asn_ev=NULL;
+static void moe_perm_all(GA*a,int l,int N,int E,int Km,int K,int sb,float*out){
+    if(g_ovl_fn&&out){
+        if(!g_asn_ev) ck(cudaEventCreateWithFlags(&g_asn_ev,cudaEventDisableTiming),"asn ev");
+        ck(cudaMemcpyAsync(a->h_assign,a->assign[l],(size_t)K*N*4,cudaMemcpyDeviceToHost,0),"assign d2h");
+        ck(cudaEventRecord(g_asn_ev,0),"asn rec");
+        g_ovl_fn(a,l,out,N); g_sh_done=1;
+        ck(cudaEventSynchronize(g_asn_ev),"assign wait");
+    } else ck(cudaMemcpy(a->h_assign,a->assign[l],(size_t)K*N*4,cudaMemcpyDeviceToHost),"assign d2h");
     size_t Np=a->Np;
     for(int k=0;k<K;k++){
         int *asn=a->h_assign+(size_t)k*N, *prm=a->h_perm+(size_t)k*Np, *off=a->hoff+((size_t)l*Km+k)*(gC.n_exp+1);
@@ -2857,15 +3294,20 @@ static int g_sync=1;
 static inline void layer_sync(void){ if(g_sync) cudaStreamSynchronize(0); }
 static void e_f2h(const float*src,__half*dst,size_t n,float s){
     KL(k_f2h,nblk(n,TPB),TPB)(src,dst,n,s); }
+static int g_ropeh=1, g_h16rdy=0;   /* CUDALM_ROPEH=0: separate rope + cast */
 static void e_attn(GA*a,int N,int l){
     const float *Qb=a->qh[l],*Kb=a->kh[l],*Vb=a->vh[l];
     float *O=a->att[l],*lse=a->lse[l];
     int B=N/gC.T, T=gC.T;
     if(g_fp16){
         /* cast once per layer; the window loop then re-reads the half copies */
-        e_f2h(Qb,a->qh16[l],(size_t)N*gC.D, 1.0f);
-        e_f2h(Kb,a->kh16[l],(size_t)N*gC.KD,1.0f);
-        e_f2h(Vb,a->vh16[l],(size_t)N*gC.KD,1.0f);
+        if(!g_h16rdy){
+            e_f2h(Qb,a->qh16[l],(size_t)N*gC.D, 1.0f);
+            e_f2h(Kb,a->kh16[l],(size_t)N*gC.KD,1.0f);
+            e_f2h(Vb,a->vh16[l],(size_t)N*gC.KD,1.0f); }
+        g_h16rdy=0;
+        if(attn_fwd_fa(a->qh16[l],a->kh16[l],a->vh16[l],O,lse,lwin(l),
+                       B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD)) return;
         if(g_fwd_tc && attn_fwd_tc(a->qh16[l],a->kh16[l],a->vh16[l],O,lse,lwin(l),
                                    B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD)) return;        if(g_lane && attn_fwd_lane(a->qh16[l],a->kh16[l],a->vh16[l],O,lse,lwin(l),
                                    B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD)) return;
@@ -2934,7 +3376,7 @@ static int mb_S(void){ int k=g_topk<1?1:g_topk; if(k>gC.n_exp)k=gC.n_exp; return
 static float* mbias(int l){
     if(g_mbias_u<=0&&!g_mbias_ld) return NULL;
     size_t ls=(size_t)mb_S()*gC.n_exp;
-    if(!g_mbiasD){ size_t n=(size_t)gC.L*ls; g_mbiasH=(float*)calloc(n,4); g_mbiasD=(float*)dmalloc(n*4);
+    if(!g_mbiasD){ size_t n=(size_t)gC.L*ls; ck(cudaHostAlloc((void**)&g_mbiasH,n*4,0),"mbias pin"); memset(g_mbiasH,0,n*4); g_mbiasD=(float*)dmalloc(n*4);
         ck(cudaMemset(g_mbiasD,0,n*4),"mbias z"); }
     return g_mbiasD+(size_t)l*ls;
 }
@@ -2946,7 +3388,9 @@ static void mbias_upd(int l,const int*cs,int ns,int E,float m){
     float u=g_mbias_u*LMUL(g_biaslm,g_biaslm_n,l);
     for(int s=0;s<ns;s++) for(int e=0;e<E;e++){ float c=(float)cs[s*E+e];
         b[s*E+e]+=u*(g_mbias_p?(m-c)/m:(c<m?1.f:c>m?-1.f:0.f)); }
-    ck(cudaMemcpy(g_mbiasD+(size_t)l*ls,b,ls*4,cudaMemcpyHostToDevice),"mbias h2d");
+    /* pinned + async: a pageable cudaMemcpy here drained the GPU once per MoE layer. The host
+     * copy is next written a step later, after the forward's blocking assign copy ordered this one. */
+    ck(cudaMemcpyAsync(g_mbiasD+(size_t)l*ls,b,ls*4,cudaMemcpyHostToDevice,0),"mbias h2d");
 }
 /* train-only host rebalance of layer l's top-K assignment before the perm build.
  * SINK: Sinkhorn column scales c_e so sum_n P_ne c_e r_n = N/E, then reselect top-K by pr*c_e.
@@ -3006,6 +3450,202 @@ static void moe_rebal(GA*a,int l,int N,int E,int K){
 }
 static int g_rpre=0; static const float* rpre_x(const float*P,const Off*rd,GA*a,int l,int N);
 static void rpre_bwd(const float*P,float*G,const Off*og,const Off*rd,GA*a,int l,int N);
+/* ---- BF16 GEMM core (S2 FFN path + S3b MoE experts) ----
+ * bf16 operands, fp32 accumulate: 2x TF32 on sm_120 (gemm19: 45 vs 23 TF/s; grouped
+ * 1.8x). Training activation buffers only (a->tr), so eval/serving/decheck keep the
+ * exact path and no bf16 weight copy can go stale. */
+#ifndef CUDALM_CPU
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 hbf;
+typedef __nv_bfloat162 hbf2;
+static int g_bffn=1, g_bfmoe=1;   /* CUDALM_BFFN / CUDALM_BFMOE */
+static long g_fwd_id=0;
+__global__ void k_f2bf(const float*s,hbf*d,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(4*i+3<n){ float4 v=((const float4*)s)[i];
+        ((hbf2*)d)[2*i]=__floats2bfloat162_rn(v.x,v.y); ((hbf2*)d)[2*i+1]=__floats2bfloat162_rn(v.z,v.w); }
+    else for(size_t j=4*i;j<n;j++) d[j]=__float2bfloat16(s[j]);
+}
+__global__ void k_f2bf1(const float*s,hbf*d,size_t n){ size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) d[i]=__float2bfloat16(s[i]); }
+__global__ void k_swig_bf(const hbf*G,const hbf*U,hbf*O,size_t n2){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n2) return;
+    float2 z=__bfloat1622float2(((const hbf2*)G)[i]), u=__bfloat1622float2(((const hbf2*)U)[i]);
+    ((hbf2*)O)[i]=__floats2bfloat162_rn(z.x/(1.f+__expf(-z.x))*u.x, z.y/(1.f+__expf(-z.y))*u.y);
+}
+__global__ void k_swigb_bf(const hbf*G,const hbf*U,const hbf*dA,hbf*dg,hbf*du,size_t n2){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n2) return;
+    float2 z=__bfloat1622float2(((const hbf2*)G)[i]), u=__bfloat1622float2(((const hbf2*)U)[i]),
+           a=__bfloat1622float2(((const hbf2*)dA)[i]);
+    float s0=1.f/(1.f+__expf(-z.x)), s1=1.f/(1.f+__expf(-z.y));
+    ((hbf2*)dg)[i]=__floats2bfloat162_rn(a.x*u.x*(s0+z.x*s0*(1.f-s0)), a.y*u.y*(s1+z.y*s1*(1.f-s1)));
+    ((hbf2*)du)[i]=__floats2bfloat162_rn(a.x*z.x*s0, a.y*z.y*s1);
+}
+/* MoE row kernels, one block per permuted row j (n = perm[j]), D even */
+__global__ void k_gather_bf(const float*src,const int*perm,hbf*Xp,int D){
+    int j=blockIdx.x, n=perm[j]; hbf2*o=(hbf2*)(Xp+(size_t)j*D); const float2*s=(const float2*)(src+(size_t)(n<0?0:n)*D);
+    for(int d=threadIdx.x;d<D/2;d+=blockDim.x){ float2 v=n<0?make_float2(0.f,0.f):s[d]; o[d]=__floats2bfloat162_rn(v.x,v.y); }
+}
+__global__ void k_scatter_gate_bf(const hbf*yp,const int*perm,const float*gate,float*out,int D){
+    int j=blockIdx.x, n=perm[j]; if(n<0) return; float g=gate[n];
+    const hbf2*y=(const hbf2*)(yp+(size_t)j*D); float2*o=(float2*)(out+(size_t)n*D);
+    for(int d=threadIdx.x;d<D/2;d+=blockDim.x){ float2 v=__bfloat1622float2(y[d]), a=o[d]; a.x+=g*v.x; a.y+=g*v.y; o[d]=a; }
+}
+__global__ void k_scatter_add_bf(const hbf*dXp,const int*perm,float*dst,int D){
+    int j=blockIdx.x, n=perm[j]; if(n<0) return;
+    const hbf2*s=(const hbf2*)(dXp+(size_t)j*D); float2*o=(float2*)(dst+(size_t)n*D);
+    for(int d=threadIdx.x;d<D/2;d+=blockDim.x){ float2 v=__bfloat1622float2(s[d]), a=o[d]; a.x+=v.x; a.y+=v.y; o[d]=a; }
+}
+/* d_gate[n] = dot(dout[n], yp[j]); dyp[j] = gate[n]*dout[n]; Xp[j] = src[n] (re-gather) */
+__global__ void k_moe_dgate_bf(const float*dout,const hbf*yp,const int*perm,const float*gate,float*d_gate,
+                               hbf*dyp,const float*src,hbf*Xp,int D){
+    int j=blockIdx.x, n=perm[j]; hbf2 *dy=(hbf2*)(dyp+(size_t)j*D), *xp=(hbf2*)(Xp+(size_t)j*D);
+    if(n<0){ for(int d=threadIdx.x;d<D/2;d+=blockDim.x){ dy[d]=__floats2bfloat162_rn(0.f,0.f); xp[d]=dy[d]; } return; }
+    const float2 *dO=(const float2*)(dout+(size_t)n*D), *sr=(const float2*)(src+(size_t)n*D); const hbf2*y=(const hbf2*)(yp+(size_t)j*D);
+    __shared__ float sh[8]; float acc=0.f, g=gate[n];
+    for(int d=threadIdx.x;d<D/2;d+=blockDim.x){ float2 a=dO[d], b=__bfloat1622float2(y[d]), s=sr[d];
+        acc+=a.x*b.x+a.y*b.y; dy[d]=__floats2bfloat162_rn(a.x*g,a.y*g); xp[d]=__floats2bfloat162_rn(s.x,s.y); }
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
+    if((threadIdx.x&31)==0) sh[threadIdx.x>>5]=acc;
+    __syncthreads();
+    if(threadIdx.x==0){ float s=0.f; for(int i=0;i<(int)(blockDim.x>>5);i++) s+=sh[i]; d_gate[n]=s; }
+}
+/* G[i] += sum_k T[k*st + i] */
+__global__ void k_addbfk(float*G,const hbf*T,size_t st,int K,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+    float s=0.f; for(int k=0;k<K;k++) s+=__bfloat162float(T[(size_t)k*st+i]); G[i]+=s;
+}
+static void bf_cvt(const float*s,hbf*d,size_t n){
+    if(((size_t)s|(size_t)d)&15) KL(k_f2bf1,nblk(n,TPB),TPB)(s,d,n);
+    else KL(k_f2bf,nblk((n+3)/4,TPB),TPB)(s,d,n); }
+static hbf* bf_slot(hbf**p,size_t*cap,size_t n){ if(n>*cap){ if(*p) cudaFree(*p); *p=(hbf*)dmalloc(n*2); *cap=n; } return *p; }
+/* row-major C = A@B, A@B^T, C += A^T@B with bf16 A/B; C fp32, or bf16 when cb */
+static void hb_g(cublasOperation_t tb,cublasOperation_t ta,int n,int m,int k,const hbf*B,int ldb,const hbf*A,int lda,
+                 float beta,void*C,int cb,int ldc,const char*w){
+    ckb(cublasGemmEx(CB,tb,ta,n,m,k,&ONE,B,CUDA_R_16BF,ldb,A,CUDA_R_16BF,lda,&beta,C,cb?CUDA_R_16BF:CUDA_R_32F,ldc,
+                     CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),w); }
+static void hb_ab (const hbf*A,const hbf*B,void*C,int M,int K,int N,float beta,int cb){ hb_g(CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,B,N,A,K,beta,C,cb,N,"hb_ab"); }
+static void hb_abt(const hbf*A,const hbf*B,void*C,int M,int K,int N,float beta,int cb){ hb_g(CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,B,K,A,K,beta,C,cb,N,"hb_abt"); }
+static void hb_atb(const hbf*A,const hbf*B,float*C,int M,int K,int N){ hb_g(CUBLAS_OP_N,CUBLAS_OP_T,N,K,M,B,N,A,K,1.0f,C,0,N,"hb_atb"); }
+/* grouped bf16 queue (bf16 C only: cuBLAS has no bf16-in/fp32-out grouped GEMM) */
+typedef struct { int n; cublasOperation_t ta[MG_MAXP],tb[MG_MAXP];
+    int m[MG_MAXP],nn[MG_MAXP],k[MG_MAXP],lda[MG_MAXP],ldb[MG_MAXP],ldc[MG_MAXP],gs[MG_MAXP];
+    float al[MG_MAXP],be[MG_MAXP]; const void*A[MG_MAXP],*B[MG_MAXP]; void*C[MG_MAXP]; } MGbq;
+static MGbq mgbq; static void **mgb_h=0,**mgb_d=0; static int mgb_slot=0;
+static void mgb_push(cublasOperation_t ta,cublasOperation_t tb,int m,int n,int k,const hbf*A,int lda,const hbf*B,int ldb,float beta,hbf*C,int ldc){
+    MGbq*g=&mgbq; int i=g->n++;
+    if(i>=MG_MAXP){ fprintf(stderr,"mgb queue overflow\n"); exit(1); }
+    g->ta[i]=ta; g->tb[i]=tb; g->m[i]=m; g->nn[i]=n; g->k[i]=k; g->A[i]=A; g->lda[i]=lda;
+    g->B[i]=B; g->ldb[i]=ldb; g->C[i]=C; g->ldc[i]=ldc; g->al[i]=1.0f; g->be[i]=beta; g->gs[i]=1;
+}
+static void mgb_run(void){
+    MGbq*g=&mgbq; if(!g->n) return;
+    if(!mgb_h){ ck(cudaHostAlloc((void**)&mgb_h,(size_t)MG_RING*3*MG_MAXP*sizeof(void*),0),"mgb host");
+                ck(cudaMalloc((void**)&mgb_d,(size_t)MG_RING*3*MG_MAXP*sizeof(void*)),"mgb dev"); }
+    size_t s=(size_t)mgb_slot*3*MG_MAXP; mgb_slot=(mgb_slot+1)%MG_RING;
+    void **h=mgb_h+s, **d=mgb_d+s; int n=g->n;
+    memcpy(h,g->A,n*sizeof(void*)); memcpy(h+MG_MAXP,g->B,n*sizeof(void*)); memcpy(h+2*MG_MAXP,g->C,n*sizeof(void*));
+    ck(cudaMemcpyAsync(d,h,3*MG_MAXP*sizeof(void*),cudaMemcpyHostToDevice,0),"mgb ptr h2d");
+    ckb(cublasGemmGroupedBatchedEx(CB,g->ta,g->tb,g->m,g->nn,g->k,g->al,(const void*const*)d,CUDA_R_16BF,g->lda,
+        (const void*const*)(d+MG_MAXP),CUDA_R_16BF,g->ldb,g->be,(void*const*)(d+2*MG_MAXP),CUDA_R_16BF,g->ldc,n,g->gs,
+        CUBLAS_COMPUTE_32F),"mgb grouped");
+    g->n=0;
+}
+/* row-major per-expert problems, as mg_ab / mg_abt_b / mg_atb (atb writes, beta 0) */
+static void mgb_ab(const hbf*A,const hbf*B,hbf*C,int M,int K,int N){ mgb_push(CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,B,N,A,K,0.f,C,N); }
+static void mgb_abt(const hbf*A,const hbf*B,hbf*C,int M,int K,int N,float beta){ mgb_push(CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,B,K,A,K,beta,C,N); }
+static void mgb_atb(const hbf*A,const hbf*B,hbf*C,int M,int K,int N){ mgb_push(CUBLAS_OP_N,CUBLAS_OP_T,N,K,M,B,N,A,K,0.f,C,N); }
+/* gate|up fused: per expert W13[D,2F] (row d = w1[d] | w3[d]), so the expert FFN is one
+ * GEMM into gu[ne,2F] and one dgrad/wgrad each way. W2 stays [F,D]. */
+__global__ void k_w13bf(const float*w1,const float*w3,hbf*d,int F,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+    size_t r=i/F, j=i%F; d[r*2*F+j]=__float2bfloat16(w1[i]); d[r*2*F+F+j]=__float2bfloat16(w3[i]); }
+__global__ void k_swig_bf2(const hbf*GU,hbf*O,int F,size_t n2){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n2) return;
+    int F2=F/2; size_t r=i/F2, c=i%F2; const hbf2*g=(const hbf2*)(GU+r*2*F);
+    float2 z=__bfloat1622float2(g[c]), u=__bfloat1622float2(g[F2+c]);
+    ((hbf2*)O)[i]=__floats2bfloat162_rn(z.x/(1.f+__expf(-z.x))*u.x, z.y/(1.f+__expf(-z.y))*u.y); }
+__global__ void k_swigb_bf2(const hbf*GU,const hbf*dA,hbf*dGU,int F,size_t n2){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n2) return;
+    int F2=F/2; size_t r=i/F2, c=i%F2; const hbf2*g=(const hbf2*)(GU+r*2*F); hbf2*o=(hbf2*)(dGU+r*2*F);
+    float2 z=__bfloat1622float2(g[c]), u=__bfloat1622float2(g[F2+c]), a=__bfloat1622float2(((const hbf2*)dA)[i]);
+    float s0=1.f/(1.f+__expf(-z.x)), s1=1.f/(1.f+__expf(-z.y));
+    o[c]=__floats2bfloat162_rn(a.x*u.x*(s0+z.x*s0*(1.f-s0)), a.y*u.y*(s1+z.y*s1*(1.f-s1)));
+    o[F2+c]=__floats2bfloat162_rn(a.x*z.x*s0, a.y*z.y*s1); }
+__global__ void k_addbf13(float*G1,float*G3,const hbf*T,size_t st,int K,int F,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+    size_t o=(i/F)*2*F+i%F; float s1=0.f,s3=0.f;
+    for(int k=0;k<K;k++){ s1+=__bfloat162float(T[(size_t)k*st+o]); s3+=__bfloat162float(T[(size_t)k*st+o+F]); }
+    G1[i]+=s1; G3[i]+=s3; }
+/* expert weights W13 (E*D*2F) | W2 (E*F*D) in bf16, cast once per forward; UniPool layers share one cache */
+static hbf **g_bfm=0; static long *g_bfm_id=0; static size_t *g_bfm_n=0;
+static int bfm_slot(int l){   /* PSCRATCH renders every layer into one buffer, so only share without it */
+    if(!g_prd && lyT(&gC,l)==2) for(int i=0;i<gC.L;i++) if(lyT(&gC,i)==2) return i;
+    return l; }
+static hbf* bfm_w(int l,const float*w1,const float*w3,const float*w2,size_t n,int F){
+    if(!g_bfm){ g_bfm=(hbf**)calloc(gC.L,sizeof(hbf*)); g_bfm_id=(long*)calloc(gC.L,sizeof(long)); g_bfm_n=(size_t*)calloc(gC.L,sizeof(size_t)); }
+    int c=bfm_slot(l);
+    if(g_bfm_n[c]<n){ if(g_bfm[c]) cudaFree(g_bfm[c]); g_bfm[c]=(hbf*)dmalloc(3*n*2); g_bfm_n[c]=n; g_bfm_id[c]=-1; }
+    if(g_bfm_id[c]!=g_fwd_id){ KL(k_w13bf,nblk(n,TPB),TPB)(w1,w3,g_bfm[c],F,n); bf_cvt(w2,g_bfm[c]+2*n,n); g_bfm_id[c]=g_fwd_id; }
+    return g_bfm[c];
+}
+static int bfm_on(const GA*a,int f8,int sb){ return g_bfmoe && a->tr && !f8 && !moef8(2) && !sb && !g_fp16gemm && !(gC.D&1) && !(gC.F&1); }
+/* gu = Xp W13 (bf16 [N,2F] in the gp slice), ap = swiglu(gu), yp = ap W2 */
+static void bfm_ffn(hbf*W,GA*a,const int*off,int N,int E,int D,int F,hbf*gu,hbf*yp){
+    size_t DF=(size_t)D*F, EDF=(size_t)E*DF; hbf *Xp=(hbf*)a->Xp, *ap=(hbf*)a->ap;
+    for(int e=0;e<E;e++){ int ne=off[e+1]-off[e]; if(!ne) continue;
+        mgb_ab(Xp+(size_t)off[e]*D,W+2*e*DF,gu+(size_t)off[e]*2*F,ne,D,2*F); } mgb_run();
+    KL(k_swig_bf2,nblk((size_t)N*F/2,TPB),TPB)(gu,ap,F,(size_t)N*F/2);
+    for(int e=0;e<E;e++){ int ne=off[e+1]-off[e]; if(!ne) continue;
+        mgb_ab(ap+(size_t)off[e]*F,W+2*EDF+e*DF,yp+(size_t)off[e]*D,ne,F,D); } mgb_run();
+}
+static void bfm_fwd(const float*P,const Off*rd,GA*a,int l,int N,int E,int Km,int K,float*out,float*gp0,float*up0,float*yp0){
+    int D=gC.D,F=gC.F; size_t Np=a->Np; int rb=RB4(D/2); (void)up0;
+    hbf *W=bfm_w(l,P+rd->w1[l],P+rd->w3[l],P+rd->w2[l],(size_t)E*D*F,F);
+    for(int k=0;k<K;k++){
+        int *off=a->hoff+((size_t)l*Km+k)*(gC.n_exp+1), *prm=a->perm[l]+(size_t)k*Np; size_t sk=a->gpS?(size_t)k:0;
+        hbf *gu=(hbf*)(gp0+sk*Np*F), *yp=(hbf*)(yp0+sk*Np*D);
+        KL(k_gather_bf,N,rb)(a->f_norm[l],prm,(hbf*)a->Xp,D);
+        bfm_ffn(W,a,off,N,E,D,F,gu,yp);
+        KL(k_scatter_gate_bf,N,rb)(yp,prm,a->gate[l]+(size_t)k*N,out,D);
+        if(g_prof>1) kchk("fm scatter",l);
+    }
+}
+static hbf *g_bfT=0; static size_t g_bfTc=0;
+/* per pass: dyp = gate*dout, dap = dyp W2^T, dgu = swiglu'(gu), dXp = dgu W13^T scattered into
+ * dfnorm; weight grads (own grouped call) go to bf16 temps T[k] = T13|T2, summed into G at the end */
+static void bfm_bwd(const float*P,float*G,const Off*og,GA*a,int l,int N,int E,int Km,int K,float*gp0,float*up0,float*yp0){
+    int D=gC.D,F=gC.F; size_t Np=a->Np, DF=(size_t)D*F, EDF=(size_t)E*DF, st=3*EDF; int rb=RB4(D/2); (void)up0;
+    hbf *W=g_bfm[bfm_slot(l)], *T=bf_slot(&g_bfT,&g_bfTc,(size_t)K*st);
+    hbf *Xp=(hbf*)a->Xp, *ap=(hbf*)a->ap, *dyp=(hbf*)a->dyp, *dap=(hbf*)a->dap, *dgu=(hbf*)a->dgp, *dXp=(hbf*)a->dXp;
+    for(int k=0;k<K;k++){
+        int *off=a->hoff+((size_t)l*Km+k)*(gC.n_exp+1), *prm=a->perm[l]+(size_t)k*Np; size_t sk=a->gpS?(size_t)k:0;
+        hbf *gu=(hbf*)(gp0+sk*Np*F), *yp=(hbf*)(yp0+sk*Np*D), *T13=T+k*st, *T2=T13+2*EDF;
+        if(!a->gpS){ KL(k_gather_bf,N,rb)(a->f_norm[l],prm,Xp,D); bfm_ffn(W,a,off,N,E,D,F,gu,yp); }   /* no stash: recompute */
+        KL(k_moe_dgate_bf,N,rb)(a->dout,yp,prm,a->gate[l]+(size_t)k*N,a->d_gate+(size_t)k*N,dyp,a->f_norm[l],Xp,D);
+        KL(k_swig_bf2,nblk((size_t)N*F/2,TPB),TPB)(gu,ap,F,(size_t)N*F/2);
+        if(g_prof>1) kchk("bm gather+dgate",l);
+        for(int e=0;e<E;e++){ int ne=off[e+1]-off[e]; if(!ne) continue;
+            mgb_abt(dyp+(size_t)off[e]*D,W+2*EDF+e*DF,dap+(size_t)off[e]*F,ne,D,F,0.f); } mgb_run();
+        KL(k_swigb_bf2,nblk((size_t)N*F/2,TPB),TPB)(gu,dap,dgu,F,(size_t)N*F/2);
+        for(int e=0;e<E;e++){ int ne=off[e+1]-off[e]; if(!ne) continue;
+            mgb_abt(dgu+(size_t)off[e]*2*F,W+2*e*DF,dXp+(size_t)off[e]*D,ne,2*F,D,0.f); } mgb_run();
+        if(g_prof>1) kchk("bm dgrad gemms",l);
+        KL(k_scatter_add_bf,N,rb)(dXp,prm,a->dfnorm,D);
+        for(int e=0;e<E;e++){ int ne=off[e+1]-off[e];
+            if(!ne){ cudaMemsetAsync(T13+2*e*DF,0,2*DF*2,0); cudaMemsetAsync(T2+e*DF,0,DF*2,0); continue; }
+            mgb_atb(Xp+(size_t)off[e]*D,dgu+(size_t)off[e]*2*F,T13+2*e*DF,ne,D,2*F);
+            mgb_atb(ap+(size_t)off[e]*F,dyp+(size_t)off[e]*D,T2+e*DF,ne,F,D); } mgb_run();
+        if(g_prof>1) kchk("bm wgrad gemms",l);
+    }
+    KL(k_addbf13,nblk(EDF,TPB),TPB)(G+og->w1[l],G+og->w3[l],T,st,K,F,EDF);
+    KL(k_addbfk,nblk(EDF,TPB),TPB)(G+og->w2[l],T+2*EDF,st,K,EDF);
+}
+#else
+static int g_bffn=0, g_bfmoe=0; static long g_fwd_id=0;
+static int bfm_on(const GA*,int,int){ return 0; }
+static void bfm_fwd(const float*,const Off*,GA*,int,int,int,int,int,float*,float*,float*,float*){}
+static void bfm_bwd(const float*,float*,const Off*,GA*,int,int,int,int,int,float*,float*,float*){}
+#endif
 static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
 #define KF(s) if(g_prof>1) kchk(s,l)
     int D=gC.D,F=gC.F,E=lyE(&gC,l), isP=lyT(&gC,l)==2;
@@ -3043,7 +3683,8 @@ static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
         KL(k_qtrp_b,dim3((D+31)/32,(Fp+31)/32,E),tb)(P+rd->w2[l],mf_buf(5,(size_t)E*D*Fp),F,D,Fp,mf_sc(2)+2);
       }
       int sb=g_moe_sb&&!f8f&&!moef8(2)&&!g_fp16gemm&&!(D&3)&&!(F&3); size_t Np=a->Np;
-      KF("fm router+wq"); moe_perm_all(a,l,N,E,Km,K,sb); KF("fm perm");
+      KF("fm router+wq"); moe_perm_all(a,l,N,E,Km,K,sb,out); KF("fm perm");
+      if(bfm_on(a,f8f,sb)){ bfm_fwd(P,rd,a,l,N,E,Km,K,out,gp0,up0,yp0); return; }
       for(int k=0;k<K;k++){                                          /* each pass = one top-1 FFN, summed */
         int *off=a->hoff+((size_t)l*Km+k)*(gC.n_exp+1), cap=a->hcap[(size_t)l*Km+k], nr=cap?E*cap:N;
         int *prm=a->perm[l]+(size_t)k*Np;
@@ -3147,7 +3788,8 @@ static void moe_backward(const float*P,float*G,const Off*o,GA*a,int l,int N){
         KL(k_quant_pad,nblk((size_t)E*D*Fp,TPB),TPB)(P+rd->w3[l],mf_buf(8,(size_t)E*D*Fp),(size_t)E*D,F,Fp,mf_sc(7)+2);
     }
     size_t Np=a->Np;
-    for(int k=0;k<K;k++){
+    if(bfm_on(a,moef8(1),g_moe_sb&&!moef8(1)&&!f8b&&!g_fp16gemm&&!(D&3)&&!(F&3))) bfm_bwd(P,G,og,a,l,N,E,Km,K,gp0,up0,yp0);
+    else for(int k=0;k<K;k++){
         int *off=a->hoff+((size_t)l*Km+k)*(gC.n_exp+1), cap=a->hcap[(size_t)l*Km+k], nr=cap?E*cap:N;
         int *prm=a->perm[l]+(size_t)k*Np;
         size_t cD=(size_t)cap*D, cF=(size_t)cap*F, DF=(size_t)D*F;
@@ -4323,14 +4965,81 @@ static void ga_x1(GA*a){
     if(g_canC&&!a->cnc){ a->cnc=(float**)malloc(sizeof(float*)*gC.L); for(int l=0;l<gC.L;l++) a->cnc[l]=(float*)dmalloc((size_t)a->N*gC.D*4); }
 }
 /* shared expert: out += swiglu(fn W1s, fn W3s) W2t^T; gg/uu/acttmp are free in MoE mode */
+/* ---- S2: BF16 FFN path for dense layers and the shared expert (CUDALM_BFFN, default 1) ----
+ * Every GEMM of the SwiGLU FFN takes bf16 operands with fp32 accumulate (2x TF32 on
+ * sm_120, no FP8 absmax/quant passes), and gate/up/act/dact/dg/du live as bf16 in the
+ * existing fp32 buffers, halving the elementwise traffic. Weights are cast once per
+ * layer in forward and reused by backward. f_norm/dout get bf16 scratch copies. */
+#ifndef CUDALM_CPU
+static hbf *g_bfn=0,*g_bfo=0; static size_t g_bfnc=0,g_bfoc=0;
+static hbf **g_bfw=0;     /* per layer: w1|w3|w2 (dense) or W1s|W3s|W2t (shared), bf16 */
+static hbf* bf_w(int l,const float*w1,const float*w3,const float*w2,size_t n){
+    if(!g_bfw){ g_bfw=(hbf**)calloc(gC.L,sizeof(hbf*)); }
+    if(!g_bfw[l]) g_bfw[l]=(hbf*)dmalloc(3*n*2);
+    bf_cvt(w1,g_bfw[l],n); bf_cvt(w3,g_bfw[l]+n,n); bf_cvt(w2,g_bfw[l]+2*n,n);
+    return g_bfw[l];
+}
+/* dense: w1,w3 [D,F], w2 [F,D]. out = swiglu(fn W1, fn W3) W2 + res */
+static void bff_dense_fwd(GA*a,const float*P,const Off*rd,int l,float*out,const float*res,int N){
+    int D=gC.D,F=lyF(&gC,l); size_t n=(size_t)D*F, nf=(size_t)N*F;
+    hbf*W=bf_w(l,P+rd->w1[l],P+rd->w3[l],P+rd->w2[l],n), *fn=bf_slot(&g_bfn,&g_bfnc,(size_t)N*D);
+    hbf *gg=(hbf*)a->gg[l], *uu=(hbf*)a->uu[l], *act=(hbf*)a->acttmp;
+    bf_cvt(a->f_norm[l],fn,(size_t)N*D);
+    hb_ab(fn,W,gg,N,D,F,0.f,1); hb_ab(fn,W+n,uu,N,D,F,0.f,1);
+    KL(k_swig_bf,nblk(nf/2,TPB),TPB)(gg,uu,act,nf/2);
+    e_cpy(out,res,(size_t)N*D); hb_ab(act,W+2*n,out,N,F,D,1.f,0);
+}
+static void bff_dense_bwd(GA*a,float*G,const Off*og,int l,int N){
+    int D=gC.D,F=lyF(&gC,l); size_t n=(size_t)D*F, nf=(size_t)N*F;
+    hbf *W=g_bfw[l], *fn=bf_slot(&g_bfn,&g_bfnc,(size_t)N*D), *dO=bf_slot(&g_bfo,&g_bfoc,(size_t)N*D);
+    hbf *gg=(hbf*)a->gg[l], *uu=(hbf*)a->uu[l], *act=(hbf*)a->acttmp, *dact=(hbf*)a->dact, *dg=(hbf*)a->dg, *du=(hbf*)a->du;
+    bf_cvt(a->dout,dO,(size_t)N*D); bf_cvt(a->f_norm[l],fn,(size_t)N*D);
+    KL(k_swig_bf,nblk(nf/2,TPB),TPB)(gg,uu,act,nf/2);
+    hb_atb(act,dO,G+og->w2[l],N,F,D);
+    hb_abt(dO,W+2*n,dact,N,D,F,0.f,1);
+    KL(k_swigb_bf,nblk(nf/2,TPB),TPB)(gg,uu,dact,dg,du,nf/2);
+    hb_abt(dg,W,a->dfnorm,N,F,D,0.f,0); hb_abt(du,W+n,a->dfnorm,N,F,D,1.f,0);
+    hb_atb(fn,dg,G+og->w1[l],N,D,F); hb_atb(fn,du,G+og->w3[l],N,D,F);
+}
+/* shared: W1s,W3s [D,Fs], W2t [D,Fs]. out += swiglu(fn W1s, fn W3s) W2t^T */
+static void bff_shared_fwd(GA*a,int l,float*out,int N){
+    int D=gC.D,Fs=g_shF; size_t n=(size_t)D*Fs, nf=(size_t)N*Fs;
+    hbf*W=bf_w(l,XSH(g_xP,l,0),XSH(g_xP,l,1),XSH(g_xP,l,2),n), *fn=bf_slot(&g_bfn,&g_bfnc,(size_t)N*D);
+    hbf *gg=(hbf*)a->gg[l], *uu=(hbf*)a->uu[l], *act=(hbf*)a->acttmp;
+    bf_cvt(a->f_norm[l],fn,(size_t)N*D);
+    hb_ab(fn,W,gg,N,D,Fs,0.f,1); hb_ab(fn,W+n,uu,N,D,Fs,0.f,1);
+    KL(k_swig_bf,nblk(nf/2,TPB),TPB)(gg,uu,act,nf/2);
+    hb_abt(act,W+2*n,out,N,Fs,D,1.f,0);
+}
+static void bff_shared_bwd(GA*a,int l,int N){
+    int D=gC.D,Fs=g_shF; size_t n=(size_t)D*Fs, nf=(size_t)N*Fs;
+    hbf *W=g_bfw[l], *fn=bf_slot(&g_bfn,&g_bfnc,(size_t)N*D), *dO=bf_slot(&g_bfo,&g_bfoc,(size_t)N*D);
+    hbf *gg=(hbf*)a->gg[l], *uu=(hbf*)a->uu[l], *act=(hbf*)a->acttmp, *dact=(hbf*)a->dact, *dg=(hbf*)a->dg, *du=(hbf*)a->du;
+    bf_cvt(a->dout,dO,(size_t)N*D); bf_cvt(a->f_norm[l],fn,(size_t)N*D);
+    KL(k_swig_bf,nblk(nf/2,TPB),TPB)(gg,uu,act,nf/2);
+    hb_atb(dO,act,XSH(g_xG,l,2),N,D,Fs);
+    hb_ab(dO,W+2*n,dact,N,D,Fs,0.f,1);
+    KL(k_swigb_bf,nblk(nf/2,TPB),TPB)(gg,uu,dact,dg,du,nf/2);
+    hb_abt(dg,W,a->dfnorm,N,Fs,D,1.f,0); hb_abt(du,W+n,a->dfnorm,N,Fs,D,1.f,0);
+    hb_atb(fn,dg,XSH(g_xG,l,0),N,D,Fs); hb_atb(fn,du,XSH(g_xG,l,1),N,D,Fs);
+}
+#else
+static void bff_dense_fwd(GA*,const float*,const Off*,int,float*,const float*,int){}
+static void bff_dense_bwd(GA*,float*,const Off*,int,int){}
+static void bff_shared_fwd(GA*,int,float*,int){}
+static void bff_shared_bwd(GA*,int,int){}
+#endif
 static void shared_fwd(GA*a,int l,float*out,int N){
     int D=gC.D,Fs=g_shF;
+    if(g_bffn&&a->tr){ bff_shared_fwd(a,l,out,N); kchk("fwd shared",l); return; }
+    f8_hold(a->f_norm[l],N,D);
     g_ab(a->f_norm[l],XSH(g_xP,l,0),a->gg[l],N,D,Fs);
-    g_ab(a->f_norm[l],XSH(g_xP,l,1),a->uu[l],N,D,Fs);
+    g_ab(a->f_norm[l],XSH(g_xP,l,1),a->uu[l],N,D,Fs); f8_drop();
     e_swig(a->gg[l],a->uu[l],a->acttmp,(size_t)N*Fs);
     g_abt_b(a->acttmp,XSH(g_xP,l,2),out,N,Fs,D,1.0f);                     kchk("fwd shared",l); }
 static void shared_bwd(GA*a,int l,int N){
     int D=gC.D,Fs=g_shF;
+    if(g_bffn&&a->tr){ bff_shared_bwd(a,l,N); kchk("bwd shared",l); return; }
     e_swig(a->gg[l],a->uu[l],a->acttmp,(size_t)N*Fs);
     g_atb(a->dout,a->acttmp,XSH(g_xG,l,2),N,D,Fs);
     g_ab(a->dout,XSH(g_xP,l,2),a->dact,N,D,Fs);
@@ -4403,23 +5112,30 @@ static int x1_selftest(void){
             x1_st_wr(dp,i,v-e); canon_fwd(x,0,c,y,N); double Lm=x1_st_dot(y,w,ND);
             x1_st_wr(dp,i,v); nu[nc++]=(float)((Lp-Lm)/(2.0*e)); }
         ok&=check(c?"canon C FD grads (docmask)":"canon A FD grads (docmask)",relerr(an,nu,nc),1e-2f); }
-    { GA*a=(GA*)calloc(1,sizeof(GA)); a->N=N; size_t NF=(size_t)N*gC.F;
+    { GA*a=(GA*)calloc(1,sizeof(GA)); a->N=N; a->tr=1; size_t NF=(size_t)N*gC.F;
       float*fn=(float*)dmalloc(ND*4),*gg=(float*)dmalloc(NF*4),*uu=(float*)dmalloc(NF*4);
       a->f_norm=&fn; a->gg=&gg; a->uu=&uu; a->acttmp=(float*)dmalloc(NF*4);
       a->dout=dy; a->dact=(float*)dmalloc(NF*4); a->dg=(float*)dmalloc(NF*4); a->du=(float*)dmalloc(NF*4); a->dfnorm=dx;
       eg_st_rnd(fn,ND,0,1.0f);
       cublasSetMathMode(CB,CUBLAS_DEFAULT_MATH);              /* TF32 GEMMs swamp the FD */
+      int bf0=g_bffn; g_bffn=0;
       ck(cudaMemset(y,0,ND*4),"x1st y0"); shared_fwd(a,0,y,N);
       ck(cudaMemset(g_xG,0,g_xn*4),"x1st G0"); ck(cudaMemset(dx,0,ND*4),"x1st dfn0"); shared_bwd(a,0,N);
-      float an[24],nu[24]; int nc=0; size_t nw=(size_t)D*g_shF;
+      float an[24],nu[24]; int nc=0; size_t nw=(size_t)D*g_shF; const float*gps[24]; size_t gis[24];
       for(int k=0;k<24;k++){
           float*dp= k<6?fn:XSH(g_xP,0,(k-6)/6); const float*gp= k<6?dx:XSH(g_xG,0,(k-6)/6);
-          size_t i= k<6 ? (size_t)(urand()*ND)%ND : (size_t)(urand()*nw)%nw;
+          size_t i= k<6 ? (size_t)(urand()*ND)%ND : (size_t)(urand()*nw)%nw; gps[k]=gp; gis[k]=i;
           an[nc]=x1_st_rd(gp,i); float v=x1_st_rd(dp,i), e=1e-2f;
           x1_st_wr(dp,i,v+e); ck(cudaMemset(y,0,ND*4),"y0"); shared_fwd(a,0,y,N); double Lp=x1_st_dot(y,w,ND);
           x1_st_wr(dp,i,v-e); ck(cudaMemset(y,0,ND*4),"y0"); shared_fwd(a,0,y,N); double Lm=x1_st_dot(y,w,ND);
           x1_st_wr(dp,i,v); nu[nc++]=(float)((Lp-Lm)/(2.0*e)); }
       ok&=check("shared expert FD grads",relerr(an,nu,nc),2e-2f);
+      g_bffn=bf0;
+      if(g_bffn){ float ab[24];
+          ck(cudaMemset(y,0,ND*4),"y0"); shared_fwd(a,0,y,N);
+          ck(cudaMemset(g_xG,0,g_xn*4),"G0"); ck(cudaMemset(dx,0,ND*4),"dfn0"); shared_bwd(a,0,N);
+          for(int k=0;k<24;k++) ab[k]=x1_st_rd(gps[k],gis[k]);
+          ok&=check("shared expert BF16 grads vs fp32",relerr(ab,an,nc),3e-2f); }
       { const char*t=getenv("CUDALM_TF32"); if(!(t&&atoi(t)==0)) cublasSetMathMode(CB,CUBLAS_TF32_TENSOR_OP_MATH); }
       cudaFree(fn); cudaFree(gg); cudaFree(uu); cudaFree(a->acttmp); cudaFree(a->dact); cudaFree(a->dg); cudaFree(a->du); free(a); }
     cudaFree(x); cudaFree(y); cudaFree(dy); cudaFree(dx); cudaFree(g_ds); cudaFree(g_xP); cudaFree(g_xG); cudaFree(g_xpart); free(w);
@@ -4468,6 +5184,7 @@ static void rpre_bwd(const float*P,float*G,const Off*og,const Off*rd,GA*a,int l,
 static void gpu_forward(const float*P,const Off*o,GA*a,const int*tokG){
     int N=a->N,D=gC.D,F=gC.F,KD=gC.KD;
     const Off*rd=g_prd?g_prd:o;
+    g_fwd_id++; g_ds_on=g_dscale&&a->tr; g_ds_step+=g_ds_on;
     KL(k_embed,nblk((size_t)N*D,TPB),TPB)(P,rd->emb,tokG,a->a_in[0],N,D); kchk("fwd embed",-1);
     x1_docstart(tokG,N); ga_x1(a);
     if(g_rpre){ rpre_ga(N); ck(cudaMemset(g_egc,0,(size_t)N*D*4),"egc0"); }
@@ -4479,28 +5196,35 @@ static void gpu_forward(const float*P,const Off*o,GA*a,const int*tokG){
         if(g_eg_on&&l) eg_fwd(a,tokG,N,l);
         e_rmsf(a->a_in[l],P,rd->an1[l],g_canA?a->cna[l]:a->a_norm[l],a->r1[l],N,D); kchk("fwd rmsnorm1",l);
         if(g_canA) canon_fwd(a->cna[l],l,0,a->a_norm[l],N);
+        f8_hold(a->a_norm[l],N,D);
         g_ab(a->a_norm[l],P+rd->wq[l],a->qh[l],N,D,D);
         g_ab(a->a_norm[l],P+rd->wk[l],a->kh[l],N,D,KD);
-        g_ab(a->a_norm[l],P+rd->wv[l],a->vh[l],N,D,KD);                     kchk("fwd qkv",l);
-        e_rope(a->qh[l],gC.H,N,0); e_rope(a->kh[l],gC.KV,N,0);             kchk("fwd rope",l);
+        g_ab(a->a_norm[l],P+rd->wv[l],a->vh[l],N,D,KD); f8_drop();          kchk("fwd qkv",l);
+        if(g_fp16&&g_ropeh){        /* q's fp32 copy is never read again; k's is (decoder prefill) */
+            KL(k_rope_h,nblk((size_t)N*gC.H*gC.half,TPB),TPB)(a->qh[l],a->qh16[l],gRC,gRS,N,gC.H,gC.hd,gC.half,gC.T,0);
+            KL(k_rope_h,nblk((size_t)N*gC.KV*gC.half,TPB),TPB)(a->kh[l],a->kh16[l],gRC,gRS,N,gC.KV,gC.hd,gC.half,gC.T,1);
+            e_f2h(a->vh[l],a->vh16[l],(size_t)N*gC.KD,1.0f); g_h16rdy=1;
+        } else { e_rope(a->qh[l],gC.H,N,0); e_rope(a->kh[l],gC.KV,N,0); } kchk("fwd rope",l);
         e_attn(a,N,l);                                                     kchk("fwd attn",l);
         const float*ao=a->att[l];
         if(g_attg){ g_ab(a->a_norm[l],g_Wg+(size_t)l*D*D,a->agz[l],N,D,D);
             KL(k_agate_f,nblk((size_t)N*D,TPB),TPB)(a->att[l],a->agz[l],a->attg,(size_t)N*D); ao=a->attg; }
-        g_ab(ao,P+rd->wo[l],a->f_in[l],N,D,D);
-        e_add(a->f_in[l],a->a_in[l],(size_t)N*D);                          kchk("fwd wo+res",l);
+        g_ab_res(ao,P+rd->wo[l],a->f_in[l],a->a_in[l],N,D,D);               kchk("fwd wo+res",l);
         e_rmsf(a->f_in[l],P,rd->an2[l],g_canC?a->cnc[l]:a->f_norm[l],a->r2[l],N,D); kchk("fwd rmsnorm2",l);
         if(g_canC) canon_fwd(a->cnc[l],l,1,a->f_norm[l],N);
         float*out=(l+1<gC.L)?a->a_in[l+1]:a->x_final;
         if(lyT(&gC,l)){
+            g_ovl_fn=g_moe_ovl&&g_shF?shared_fwd:NULL;
             moe_forward(P,o,a,l,out,N);                                    kchk("fwd moe",l);
-            if(g_shF) shared_fwd(a,l,out,N);
+            if(g_shF&&!g_sh_done) shared_fwd(a,l,out,N);
+            g_sh_done=0; g_ovl_fn=NULL;
+        } else if(g_bffn&&a->tr){ bff_dense_fwd(a,P,rd,l,out,a->f_in[l],N);       kchk("fwd w2+res",l);
         } else { int F=lyF(&gC,l);
+            f8_hold(a->f_norm[l],N,D);
             g_ab(a->f_norm[l],P+rd->w1[l],a->gg[l],N,D,F);
-            g_ab(a->f_norm[l],P+rd->w3[l],a->uu[l],N,D,F);
+            g_ab(a->f_norm[l],P+rd->w3[l],a->uu[l],N,D,F); f8_drop();
             e_swig(a->gg[l],a->uu[l],a->acttmp,(size_t)N*F);               kchk("fwd swiglu",l);
-            g_ab(a->acttmp,P+rd->w2[l],out,N,F,D);
-            e_add(out,a->f_in[l],(size_t)N*D);                             kchk("fwd w2+res",l);
+            g_ab_res(a->acttmp,P+rd->w2[l],out,a->f_in[l],N,F,D);          kchk("fwd w2+res",l);
         }
         layer_sync();
     }
@@ -4607,6 +5331,7 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
         if(lyT(&gC,l)){
             moe_backward(P,G,o,a,l,N);                                     kchk("bwd moe",l);
             if(g_shF) shared_bwd(a,l,N);
+        } else if(g_bffn&&a->tr){ bff_dense_bwd(a,G,og,l,N);                     kchk("bwd w1/w3",l);
         } else { int F=lyF(&gC,l);
             e_swig(a->gg[l],a->uu[l],a->acttmp,(size_t)N*F);      /* recompute act */
             g_atb(a->acttmp,a->dout,G+og->w2[l],N,F,D);
@@ -4614,7 +5339,7 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
             KL(k_swiglu_bwd,nblk((size_t)N*F,TPB),TPB)(a->gg[l],a->uu[l],a->dact,a->dg,a->du,(size_t)N*F);
             kchk("bwd swiglu",l);
             g_abt(a->dg,P+rd->w1[l],a->dfnorm,N,F,D);
-            g_abt(a->du,P+rd->w3[l],a->d2,N,F,D); e_add(a->dfnorm,a->d2,(size_t)N*D);
+            g_abt_b(a->du,P+rd->w3[l],a->dfnorm,N,F,D,1.0f);
             g_atb(a->f_norm[l],a->dg,G+og->w1[l],N,D,F);
             g_atb(a->f_norm[l],a->du,G+og->w3[l],N,D,F);                    kchk("bwd w1/w3",l);
         }
@@ -4650,7 +5375,9 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
           /* the lane kernel covers the whole window in one launch, so it
            * replaces the chunk loop rather than running inside it */
           int lane_dq = g_fp16 && g_lane &&
-              ((g_dq_tc && attn_bwd_dq_tc(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
+              (attn_bwd_dq_fa(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
+                  a->lse[l],a->drow,a->dq,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD) ||
+               (g_dq_tc && attn_bwd_dq_tc(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
                   a->lse[l],a->drow,a->dq,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD))
                || attn_bwd_dq_lane(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
                   a->lse[l],a->dq,a->drow,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD,g_hfma2));
@@ -4663,7 +5390,9 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
                   a->lse[l],a->dq,a->drow,s0,s1,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD); }
           kchk("bwd attn dQ",l);
           int lane_dkv = g_fp16 && g_lane &&
-              ((g_dkv_tc && attn_bwd_dkv_tc(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
+              (attn_bwd_dkv_fa(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
+                  a->lse[l],a->drow,a->dk,a->dv,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD) ||
+               (g_dkv_tc && attn_bwd_dkv_tc(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
                   a->lse[l],a->drow,a->dk,a->dv,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD))
                || attn_bwd_dkv_lane(a->qh16[l],a->kh16[l],a->vh16[l],a->datt16,
                   a->lse[l],a->drow,a->dk,a->dv,W,B,T,gC.H,gC.KV,gC.hd,gC.D,gC.KD,g_hfma2,g_dkv_split)
@@ -4681,8 +5410,8 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
           kchk("bwd attn dKV",l); }
         e_rope(a->dq,gC.H,N,1); e_rope(a->dk,gC.KV,N,1);                   kchk("bwd rope",l);
         g_abt(a->dq,P+rd->wq[l],a->danorm,N,D,D);
-        g_abt(a->dk,P+rd->wk[l],a->d2,N,KD,D); e_add(a->danorm,a->d2,(size_t)N*D);
-        g_abt(a->dv,P+rd->wv[l],a->d2,N,KD,D); e_add(a->danorm,a->d2,(size_t)N*D);
+        g_abt_b(a->dk,P+rd->wk[l],a->danorm,N,KD,D,1.0f);
+        g_abt_b(a->dv,P+rd->wv[l],a->danorm,N,KD,D,1.0f);
         g_atb(a->a_norm[l],a->dq,G+og->wq[l],N,D,D);
         g_atb(a->a_norm[l],a->dk,G+og->wk[l],N,D,KD);
         g_atb(a->a_norm[l],a->dv,G+og->wv[l],N,D,KD);                       kchk("bwd qkv",l);
@@ -6541,7 +7270,7 @@ static void cmd_train(int argc,char**argv){
                    "      removes the G half)\n");
     }
     rope_tables(&c);
-    GA*a=ga_new(N,1); int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4);
+    GA*a=ga_new(N,1); a->tr=1; int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4);
     /* tok/tgt double-buffered in pinned memory so the upload is async and the
      * host builds batch n+1 while step n runs; upev[b] guards reuse of buffer b */
     int*tokb,*tgtb; cudaEvent_t upev[2];
@@ -6779,9 +7508,11 @@ static void cmd_train(int argc,char**argv){
              * something sane. ~100% means no chat data in the window (all prose);
              * near 0% would mean the markers are not matching at all. */
             if(mask_on) printf(" | train %.0f%%", 100.0*ntrain/N);
+#ifndef CUDALM_CPU
             if(g_tokw==2){ float o[2]={0,0},z[2]={0,0}; cudaMemcpyFromSymbol(o,d_opd,8); cudaMemcpyToSymbol(d_opd,z,8);
                 if(o[1]>0){ float raw=o[0]/o[1]-g_opdb; printf(" | opd adv %.3f raw %.3f",o[0]/o[1],raw);
                     if(g_opdauto) g_opdb=g_opdb?0.8f*g_opdb-0.2f*raw:-raw; } }
+#endif
             printf("\n"); fflush(stdout);
             if(dv_thr>0&&it>=(int)warmup+2000){
                 int nf=!isfinite(L); nanc+=nf-nanw[dvn%50]; nanw[dvn%50]=nf; dvw[dvn%50]=nf?0:L; dvn++;
@@ -7287,7 +8018,7 @@ static void cmd_bench(int argc,char**argv){
     bf16*M=(bf16*)dmalloc(np*2),*Vv=(bf16*)dmalloc(np*2);
     ck(cudaMemset(M,0,np*2),"zero M"); ck(cudaMemset(Vv,0,np*2),"zero V");
     rope_tables(&c);
-    GA*a=ga_new(N,1); int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4);
+    GA*a=ga_new(N,1); a->tr=1; int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4);
     int*tok=(int*)malloc(sizeof(int)*N),*tgt=(int*)malloc(sizeof(int)*N);
     for(int i=0;i<N;i++){ tok[i]=(int)(urand()*c.V); tgt[i]=(int)(urand()*c.V); }
     ck(cudaMemcpy(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice),"h2d");
@@ -7689,6 +8420,13 @@ static void cmd_selftest(void){
         g_atb(dA,dBmn,dCk,M,K,N); cudaMemcpy(Cgk,dCk,(size_t)K*N*4,cudaMemcpyDeviceToHost);
         curlbl="FP8 g_atb (wgrad NT)"; NRAT(Cgk,Ck,(size_t)K*N);
         free(Bmn);cudaFree(dBmn);free(Ck);free(Cgk);cudaFree(dCk); }
+      /* S6: with an unchanged amax the delayed path must reproduce the exact one */
+      { float*C2=(float*)malloc((size_t)M*N*4); int on0=g_ds_on; g_ds_on=1;
+        for(int r=0;r<3;r++){ g_ds_step++; g_ab(dA,dB,dC,M,K,N); }
+        cudaMemcpy(C2,dC,(size_t)M*N*4,cudaMemcpyDeviceToHost);
+        g_ds_on=0; g_ab(dA,dB,dC,M,K,N); cudaMemcpy(Cg,dC,(size_t)M*N*4,cudaMemcpyDeviceToHost);
+        ok &= check("FP8 delayed scale == exact",relerr(C2,Cg,(size_t)M*N),1e-6f);
+        g_ds_on=on0; free(C2); }
       #undef NRAT
       g_fp8gemm=sf8; g_fp16gemm=sf16;
       free(A);free(Bm);free(Bt);free(Cr);free(Cg);
@@ -7963,6 +8701,28 @@ static void cmd_selftest(void){
           free(ra); free(rb);
         } else printf("  attn bwd dQ TC: no instantiation for hd=%d\n",hd);
         cudaFree(aQ); cudaFree(bQ); }
+      { float*aO=dzero(nq),*aL=dzero(nl),*aQ=dzero(nq),*bO=dzero(nq),*bL=dzero(nl),*bQ=dzero(nq),*cK=dzero(nk),*cV=dzero(nk);
+        attn_fwd_lane(dq_,dk_,dv_,aO,aL,WIN,B,T,H,KV,hd,D,KD);
+        attn_bwd_dq_lane(dq_,dk_,dv_,dg_,dl_,aQ,dr_,WIN,B,T,H,KV,hd,D,KD,0);
+        int fa0=g_fa; g_fa=1;
+        if(attn_fwd_fa(dq_,dk_,dv_,bO,bL,WIN,B,T,H,KV,hd,D,KD)){
+          attn_bwd_dq_fa(dq_,dk_,dv_,dg_,dl_,dr_,bQ,WIN,B,T,H,KV,hd,D,KD);
+          attn_bwd_dkv_fa(dq_,dk_,dv_,dg_,dl_,dr_,cK,cV,WIN,B,T,H,KV,hd,D,KD);
+          float*ra=(float*)malloc(nq*4),*rb=(float*)malloc(nq*4); char lb[96];
+          cudaMemcpy(ra,aO,nq*4,cudaMemcpyDeviceToHost); cudaMemcpy(rb,bO,nq*4,cudaMemcpyDeviceToHost);
+          snprintf(lb,sizeof(lb),"attn fwd O FA vs lane (W=%d)",WIN); ok &= check(lb,relerr(rb,ra,nq),5e-3f);
+          cudaMemcpy(ra,aL,nl*4,cudaMemcpyDeviceToHost); cudaMemcpy(rb,bL,nl*4,cudaMemcpyDeviceToHost);
+          snprintf(lb,sizeof(lb),"attn fwd lse FA vs lane (W=%d)",WIN); ok &= check(lb,relerr(rb,ra,nl),1e-3f);
+          cudaMemcpy(ra,aQ,nq*4,cudaMemcpyDeviceToHost); cudaMemcpy(rb,bQ,nq*4,cudaMemcpyDeviceToHost);
+          snprintf(lb,sizeof(lb),"attn bwd dQ FA vs lane (W=%d)",WIN); ok &= check(lb,relerr(rb,ra,nq),5e-3f);
+          cudaMemcpy(ra,aK,nk*4,cudaMemcpyDeviceToHost); cudaMemcpy(rb,cK,nk*4,cudaMemcpyDeviceToHost);
+          snprintf(lb,sizeof(lb),"attn bwd dK FA vs lane (W=%d)",WIN); ok &= check(lb,relerr(rb,ra,nk),5e-3f);
+          cudaMemcpy(ra,aV,nk*4,cudaMemcpyDeviceToHost); cudaMemcpy(rb,cV,nk*4,cudaMemcpyDeviceToHost);
+          snprintf(lb,sizeof(lb),"attn bwd dV FA vs lane (W=%d)",WIN); ok &= check(lb,relerr(rb,ra,nk),5e-3f);
+          free(ra); free(rb);
+        } else printf("  attn FA: no instantiation for hd=%d\n",hd);
+        g_fa=fa0;
+        cudaFree(aO);cudaFree(aL);cudaFree(aQ);cudaFree(bO);cudaFree(bL);cudaFree(bQ);cudaFree(cK);cudaFree(cV); }
       cudaFree(aK);cudaFree(aV);cudaFree(bK);cudaFree(bV);
       cudaFree(dq_);cudaFree(dg_);cudaFree(dk_);cudaFree(dv_);cudaFree(dl_);cudaFree(dr_);
       free(hq);free(hg);free(hk);free(hv);free(hl);free(hr);
@@ -7987,9 +8747,9 @@ static void cmd_selftest(void){
           for(int h=0;h<H;h++){ cudaMemcpy(dl_+(size_t)h*Tn,hl+(size_t)h*T+t0,(size_t)Tn*4,cudaMemcpyHostToDevice);
                                 cudaMemcpy(dr_+(size_t)h*Tn,hr+(size_t)h*T+t0,(size_t)Tn*4,cudaMemcpyHostToDevice); }
           float*O=dzero(q),*L=dzero(l),*Q=dzero(q),*K=dzero(k),*V=dzero(k);
-          attn_fwd_tc(dq_,dk_,dv_,O,L,0,1,Tn,H,KV,hd,D,KD);
-          attn_bwd_dq_tc(dq_,dk_,dv_,dg_,dl_,dr_,Q,0,1,Tn,H,KV,hd,D,KD);
-          attn_bwd_dkv_tc(dq_,dk_,dv_,dg_,dl_,dr_,K,V,0,1,Tn,H,KV,hd,D,KD);
+          attn_fwd_fa(dq_,dk_,dv_,O,L,0,1,Tn,H,KV,hd,D,KD) || attn_fwd_tc(dq_,dk_,dv_,O,L,0,1,Tn,H,KV,hd,D,KD);
+          attn_bwd_dq_fa(dq_,dk_,dv_,dg_,dl_,dr_,Q,0,1,Tn,H,KV,hd,D,KD) || attn_bwd_dq_tc(dq_,dk_,dv_,dg_,dl_,dr_,Q,0,1,Tn,H,KV,hd,D,KD);
+          attn_bwd_dkv_fa(dq_,dk_,dv_,dg_,dl_,dr_,K,V,0,1,Tn,H,KV,hd,D,KD) || attn_bwd_dkv_tc(dq_,dk_,dv_,dg_,dl_,dr_,K,V,0,1,Tn,H,KV,hd,D,KD);
           cudaMemcpy(out+(size_t)t0*D,O,q*4,cudaMemcpyDeviceToHost);
           for(int h=0;h<H;h++) cudaMemcpy(out+nq+(size_t)h*T+t0,L+(size_t)h*Tn,(size_t)Tn*4,cudaMemcpyDeviceToHost);
           cudaMemcpy(out+nq+nl+(size_t)t0*D,Q,q*4,cudaMemcpyDeviceToHost);
@@ -7997,6 +8757,8 @@ static void cmd_selftest(void){
           cudaMemcpy(out+2*nq+nl+nk+(size_t)t0*KD,V,k*4,cudaMemcpyDeviceToHost);
           cudaFree(dq_);cudaFree(dg_);cudaFree(dk_);cudaFree(dv_);cudaFree(dl_);cudaFree(dr_);
           cudaFree(O);cudaFree(L);cudaFree(Q);cudaFree(K);cudaFree(V); };
+      int fa0=g_fa;
+      for(int fv=0;fv<2;fv++){ g_fa=fv; memset(res[0],0,(2*nq+nl+2*nk)*4); memset(res[1],0,(2*nq+nl+2*nk)*4);
       int dsh[T]; for(int t=0;t<T;t++) dsh[t]=t<S?0:S;
       int*dsd; cudaMalloc(&dsd,T*4); cudaMemcpy(dsd,dsh,T*4,cudaMemcpyHostToDevice);
       cudaMemcpyToSymbol(d_dstart,&dsd,sizeof(int*)); run(res[0],0,T);
@@ -8006,8 +8768,9 @@ static void cmd_selftest(void){
       ok &= check("attn docmask fwd lse == split docs",relerr(res[0]+nq,res[1]+nq,nl),1e-4f);
       ok &= check("attn docmask dQ == split docs",relerr(res[0]+nq+nl,res[1]+nq+nl,nq),1e-3f);
       ok &= check("attn docmask dK == split docs",relerr(res[0]+2*nq+nl,res[1]+2*nq+nl,nk),1e-3f);
-      ok &= check("attn docmask dV == split docs",relerr(res[0]+2*nq+nl+nk,res[1]+2*nq+nl+nk,nk),1e-3f);
-      cudaFree(dsd); free(res[0]); free(res[1]); free(hq);free(hg);free(hk);free(hv);free(hl);free(hr);
+      ok &= check(fv?"attn docmask dV == split docs (FA)":"attn docmask dV == split docs",relerr(res[0]+2*nq+nl+nk,res[1]+2*nq+nl+nk,nk),1e-3f);
+      cudaFree(dsd); }
+      g_fa=fa0; free(res[0]); free(res[1]); free(hq);free(hg);free(hk);free(hv);free(hl);free(hr);
       if(g_ds) cudaMemcpyToSymbol(d_dstart,&g_ds,sizeof(int*)); }
 #endif
     /* ---- MoE top-1 forward + backward vs a naive CPU reference -------------
@@ -8090,6 +8853,27 @@ static void cmd_selftest(void){
       ok &= check("moe bwd dW1",   relerr(gG+mo.w1[0],rG+mo.w1[0],(size_t)E*D*F),2e-3f);
       ok &= check("moe bwd dW2",   relerr(gG+mo.w2[0],rG+mo.w2[0],(size_t)E*F*D),2e-3f);
       ok &= check("moe bwd dWr",   relerr(gG+mo.wr[0],rG+mo.wr[0],(size_t)D*E),2e-3f);
+#ifndef CUDALM_CPU
+      /* S3b: top-2 BF16 grouped experts vs the fp32 path, stash on and off */
+      { int tk1=g_topk, st0=g_moe_stash; float mu=g_mbias_u; g_topk=2; g_mbias_u=0;
+        size_t no=(size_t)N*D, nr=2*no+np; float*res[3];
+        for(int r=0;r<3;r++){ g_moe_stash=r<2; GA*gb=ga_new(N,1); gb->tr=r>0; g_fwd_id++;
+          cudaMemcpy(gb->f_norm[0],fn,no*4,cudaMemcpyHostToDevice); cudaMemcpy(gb->f_in[0],fi,no*4,cudaMemcpyHostToDevice);
+          cudaMemcpy(gb->dout,dO,no*4,cudaMemcpyHostToDevice); ck(cudaMemset(Gd,0,np*4),"moe bf G");
+          moe_forward(Pd,&mo,gb,0,outd,N); moe_backward(Pd,Gd,&mo,gb,0,N); ck(cudaDeviceSynchronize(),"moe bf");
+          res[r]=(float*)malloc(nr*4);
+          cudaMemcpy(res[r],outd,no*4,cudaMemcpyDeviceToHost); cudaMemcpy(res[r]+no,gb->dfnorm,no*4,cudaMemcpyDeviceToHost);
+          cudaMemcpy(res[r]+2*no,Gd,np*4,cudaMemcpyDeviceToHost); }
+        float*g0=res[0]+2*no,*g1=res[1]+2*no; size_t nw=(size_t)E*D*F;
+        ok &= check("moe top2 BF16 fwd vs fp32",   relerr(res[1],res[0],no),3e-2f);
+        ok &= check("moe top2 BF16 dfnorm vs fp32",relerr(res[1]+no,res[0]+no,no),3e-2f);
+        ok &= check("moe top2 BF16 dW1 vs fp32",   relerr(g1+mo.w1[0],g0+mo.w1[0],nw),3e-2f);
+        ok &= check("moe top2 BF16 dW3 vs fp32",   relerr(g1+mo.w3[0],g0+mo.w3[0],nw),3e-2f);
+        ok &= check("moe top2 BF16 dW2 vs fp32",   relerr(g1+mo.w2[0],g0+mo.w2[0],nw),3e-2f);
+        ok &= check("moe top2 BF16 no-stash == stash",relerr(res[2],res[1],nr),1e-3f);
+        for(int r=0;r<3;r++) free(res[r]);
+        g_topk=tk1; g_moe_stash=st0; g_mbias_u=mu; }
+#endif
     }
     /* ---- qlm: integer weights + Integer AdamW ----------------------------
      * Every other kernel here is checked against a CPU reference; these must be
@@ -8384,6 +9168,7 @@ int main(int argc,char**argv){
       const char*ks=getenv("CUDALM_DKV_SPLIT"); if(ks){ int v=atoi(ks); if(v==1||v==2||v==4) g_dkv_split=v; }
       const char*kt=getenv("CUDALM_DKV_TC"); if(kt) g_dkv_tc=(atoi(kt)!=0);
       const char*qt=getenv("CUDALM_DQ_TC"); if(qt) g_dq_tc=(atoi(qt)!=0);
+      const char*fa_=getenv("CUDALM_FA"); if(fa_) g_fa=(atoi(fa_)!=0);
       const char*ft=getenv("CUDALM_FWD_TC"); if(ft) g_fwd_tc=(atoi(ft)!=0);
       const char*ms=getenv("CUDALM_MOE_STASH"); if(ms) g_moe_stash=(atoi(ms)!=0);
     { const char*mgs=getenv("CUDALM_MOE_GROUPED"); if(mgs) g_moe_grp=atoi(mgs); }
@@ -8403,6 +9188,14 @@ int main(int argc,char**argv){
         if(g_topk>1) printf("[moe] top-%d routing (CUDALM_TOPK) -- stash keeps one slice per pass\n",g_topk); }
       const char*fg=getenv("CUDALM_FP16_GEMM"); if(fg) g_fp16gemm=(atoi(fg)!=0);
       const char*f8=getenv("CUDALM_FP8_GEMM"); if(f8) g_fp8gemm=(atoi(f8)!=0); { const char*fm=getenv("CUDALM_FP8_MASK"); if(fm) g_fp8mask=atoi(fm); }
+      { const char*fh=getenv("CUDALM_F8_HOLD"); if(fh) g_f8hold=atoi(fh); }
+      { const char*mo=getenv("CUDALM_MOE_OVL"); if(mo) g_moe_ovl=atoi(mo); }
+      { const char*re=getenv("CUDALM_RESEPI"); if(re) g_resepi=atoi(re); }
+      { const char*rh=getenv("CUDALM_ROPEH"); if(rh) g_ropeh=atoi(rh); }
+#ifndef CUDALM_CPU
+      { const char*bf=getenv("CUDALM_BFFN"); if(bf) g_bffn=atoi(bf); bf=getenv("CUDALM_BFMOE"); if(bf) g_bfmoe=atoi(bf); }
+      { const char*v=getenv("CUDALM_F8_DELAY"); if(v) g_dscale=atoi(v); }
+#endif
       const char*f8d=getenv("CUDALM_FP8_DBG"); if(f8d) g_fp8dbg=(atoi(f8d)!=0);
       const char*sc=getenv("CUDALM_SCHED"); if(sc) g_wsd=strcmp(sc,"cosine")!=0;
       const char*wd=getenv("CUDALM_WSD_DECAY");

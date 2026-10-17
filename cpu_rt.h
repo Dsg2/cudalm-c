@@ -106,6 +106,9 @@ static inline cudaError_t cudaSetDevice(int){ return cudaSuccess; }
 static inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t*e,unsigned){ *e=0; return cudaSuccess; }
 static inline cudaError_t cudaEventRecord(cudaEvent_t,cudaStream_t=0){ return cudaSuccess; }
 static inline cudaError_t cudaEventSynchronize(cudaEvent_t){ return cudaSuccess; }
+static inline cudaError_t cudaEventCreate(cudaEvent_t*e){ *e=0; return cudaSuccess; }
+static inline cudaError_t cudaEventQuery(cudaEvent_t){ return cudaSuccess; }
+static inline cudaError_t cudaEventElapsedTime(float*ms,cudaEvent_t,cudaEvent_t){ *ms=0.f; return cudaSuccess; }
 static inline cudaError_t cudaEventDestroy(cudaEvent_t){ return cudaSuccess; }
 /* big copies/fills split across threads: a cold 100 MB memset is ~4x faster */
 static __attribute__((noinline)) void cpu_memcpy(void*d,const void*s,size_t n){

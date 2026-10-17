@@ -355,11 +355,21 @@ __global__ void k_f2h(const float*src,__half*dst,size_t n,float s){
     #pragma omp parallel for schedule(static) if(n>=CPU_PMIN)
     for(long i=0;i<(long)n;i++) dst[i]=__half(src[i]*s);
 }
+__global__ void k_rope_h(float*buf,__half*dst,const float*cosb,const float*sinb,int N,int nh,int hd,int hf,int T,int wb){
+    #pragma omp parallel for schedule(static) if((size_t)N*nh*hf>=CPU_PMIN)
+    for(long r=0;r<(long)N*nh;r++){ int h=(int)(r%nh), n=(int)(r/nh), t=n%T; size_t o=(size_t)n*nh*hd+(size_t)h*hd;
+        for(int i=0;i<hf;i++){ float c=cosb[t*hf+i],s=sinb[t*hf+i],a=buf[o+i],b=buf[o+i+hf],x=a*c-b*s,y=b*c+a*s;
+            dst[o+i]=__half(x); dst[o+i+hf]=__half(y); if(wb){ buf[o+i]=x; buf[o+i+hf]=y; } } }
+}
 CPU_STUB(k_attn_fwd_h) CPU_STUB(k_attn_bwd_dq_h) CPU_STUB(k_attn_bwd_dkv_h)
 template<class...A> static int attn_bwd_dkv_tc(A...){ return 0; }
 template<class...A> static int attn_bwd_dq_tc(A...){ return 0; }
 template<class...A> static int attn_fwd_tc(A...){ return 0; }
 template<class...A> static int attn_fwd_lane(A...){ return 0; }
+template<class...A> static int attn_fwd_fa(A...){ return 0; }
+template<class...A> static int attn_bwd_dq_fa(A...){ return 0; }
+template<class...A> static int attn_bwd_dkv_fa(A...){ return 0; }
+static int g_fa=0;
 template<class...A> static int attn_bwd_dq_lane(A...){ return 0; }
 template<class...A> static int attn_bwd_dkv_lane(A...){ return 0; }
 

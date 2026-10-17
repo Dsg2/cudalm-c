@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-18
 
+- Add k_rope_h kernel to cpu_kern.h for forward RoPE
+- Add k_attn_fwd_fa, k_attn_bwd_dq_fa, k_attn_bwd_dkv_fa kernels to cudalm.cu
+- Add attn_fwd_fa, attn_bwd_dq_fa, attn_bwd_dkv_fa templates to cpu_kern.h
+- Add cudaEventCreate, cudaEventQuery, cudaEventElapsedTime to cpu_rt.h
+- Enhance profiling with drain tracking and async GPU time in cudalm.cu
+
+## Unreleased - 2026-10-18
+
 - Changed sfx array from 6 to 7 entries in cudalm.cu
 - Added ".opt.x1" to checkpoint naming at line 6809
 - Loop now iterates 7 times instead of 6
