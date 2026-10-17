@@ -6809,8 +6809,8 @@ static void cmd_train(int argc,char**argv){
             lrs_save();
             printf("[ckpt] saved %s @ iter %d\n",mpath,it); fflush(stdout);
             if(keep_every>0&&it%keep_every==0){
-                const char*sfx[6]={"",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env"}; char s[1200],d[1300]; int nk=0;
-                for(int i=0;i<6;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
+                const char*sfx[7]={"",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1"}; char s[1200],d[1300]; int nk=0;
+                for(int i=0;i<7;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
                     const char*dot=strrchr(mpath,'.'); int bl=dot?(int)(dot-mpath):(int)strlen(mpath);
                     snprintf(d,sizeof d,"%.*s_it%d%s%s",bl,mpath,it,dot?dot:"",sfx[i]);
                     if(CopyFileA(s,d,FALSE)) nk++; }
