@@ -17,7 +17,7 @@ architectures can host that:
       contributes exactly 0.0 and the graph reduces to tinylm's. That costs
       3*D*F zero weights per layer (5-10% of the file).
 
-  llama (--arch llama, APPROXIMATE)
+  llama (--arch llama, APPROXIMATE for MoE; the default and exact for dense models)
       build_moe_ffn(..., norm_w=true, ...) divides the selected weights by their
       own sum; with one expert used that forces gate == 1.0 and drops the router
       probability entirely. On LS-63M that costs 2.9x perplexity (10.24 -> 29.66
@@ -34,12 +34,15 @@ tokenizes with the exact training vocab, and the chatml prompt format from
 cmd_chat() is written as a Jinja chat template.
 
 Usage:
-  python bin2gguf.py <model.bin> [out.gguf] [--type q8_0|f16|f32] [--arch deepseek|llama]
+  python bin2gguf.py <model.bin> [out.gguf] [--type q4n|q4|q8|fp16|f32] [--target tinylm|llama]
+  (or `cudalm gguf <name> [type] [target]`, which applies the model's .env first)
 """
 
 import argparse
 import os
+import shutil
 import struct
+import subprocess
 import sys
 
 import numpy as np
@@ -450,14 +453,14 @@ def size_label(n):
 GGUF_TAGS = {"q8_0": "Q8_0", "f16": "F16", "f32": "F32"}
 
 
-def default_out(model_path, out_type):
+def default_out(model_path, out_type, kind=""):
     stem = os.path.splitext(os.path.basename(model_path))[0]
     for tag in SRC_TAGS:
         if stem.lower().endswith(tag):
             stem = stem[:-len(tag)]
             break
     return os.path.join(os.path.dirname(model_path),
-                        f"{stem}-{GGUF_TAGS[out_type]}.gguf")
+                        f"{stem}{kind}-{GGUF_TAGS[out_type]}.gguf")
 
 
 ARCHS = {
@@ -884,6 +887,20 @@ def convert_tinylm(cfg, pr, tltk, ngram, out_path, out_type, rbias=None):
     return len(g.tensors)
 
 
+TYPE_ALIAS = {"f16": "fp16", "q8_0": "q8", "fp32": "f32"}
+QTYPE = {"fp16": 0, "q8": 1, "q4": 2, "q4n": 4}            # cudalm quantize mode -> parsed qtype
+QNAME = {v: k for k, v in QTYPE.items()} | {3: "q4s"}
+
+
+def find_cudalm(path):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (path, os.environ.get("CUDALM_EXE"), os.path.join(here, "..", "cudalm.exe"),
+              os.path.join(here, "..", "cudalm"), shutil.which("cudalm")):
+        if c and os.path.isfile(c):
+            return c
+    sys.exit("[bin2gguf] cudalm executable not found (needed for q4n/q4/q8); pass --cudalm PATH")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -894,11 +911,17 @@ def main():
                     help="tinylm (default): a faithful GGUF the tinylm C loader "
                          "reads back exactly, including the n-gram. llama: a stock "
                          "llama.cpp-compatible GGUF (lossy for MoE / ngram).")
-    ap.add_argument("--type", choices=["q8_0", "f16", "f32"], default=None,
-                    help="tensor precision. tinylm target: f32 (default) or f16. "
-                         "llama target: q8_0 (default), f16, or f32.")
-    ap.add_argument("--arch", choices=sorted(ARCHS), default="deepseek",
-                    help="target llama.cpp architecture (default deepseek, exact)")
+    ap.add_argument("--type", type=lambda t: TYPE_ALIAS.get(t.lower(), t.lower()),
+                    choices=["q4n", "q4", "q8", "fp16", "f32"], default=None,
+                    help="cudalm quantize modes. tinylm target: q4n/q4/q8 run "
+                         "`cudalm quantize` on an fp32 model first (q4n is lossless "
+                         "for QLM); fp16/f32 store floats; default = the source's own "
+                         "precision. llama target: q8 (default, Q8_0), fp16, f32.")
+    ap.add_argument("--cudalm", default=None,
+                    help="cudalm executable for q4n/q4/q8 (default: CUDALM_EXE, "
+                         "../cudalm.exe next to this script, or PATH)")
+    ap.add_argument("--arch", choices=sorted(ARCHS), default=None,
+                    help="llama.cpp architecture (default: deepseek for MoE, exact; llama for dense)")
     ap.add_argument("--ctx", type=int, default=0,
                     help="context length to advertise (default: the training "
                          "sliding window, beyond which llama.cpp diverges)")
@@ -907,46 +930,77 @@ def main():
     args = ap.parse_args()
 
     cfg, pr, tk, tltk = parse_checkpoint(args.model)
+    src = QNAME.get(cfg["qtype"], f"qtype {cfg['qtype']}")
 
     if args.target == "tinylm":
-        out_type = args.type or "f32"
-        if out_type == "q8_0":
-            sys.exit("--target tinylm supports --type f32 or f16 (not q8_0)")
-        if cfg["qtype"] >= 0:
-            # Quantized source: the body is preserved verbatim, so the F32/F16
-            # tensor-type flag is moot. Tag the filename by the native quant.
-            tag = {0: "F16", 1: "Q8_64", 2: "Q4", 3: "Q4S", 4: "Q4N"}.get(cfg["qtype"], "Q")
-            stem = os.path.splitext(os.path.basename(args.model))[0]
-            for t in SRC_TAGS:
-                if stem.lower().endswith(t):
-                    stem = stem[:-len(t)]
-                    break
-            out = args.out or os.path.join(os.path.dirname(args.model),
-                                           f"{stem}-{tag}.gguf")
-        else:
-            out = args.out or default_out(args.model, out_type)
-        ngram = load_ngram(args.model, cfg["D"], cfg["V"], cfg["L"], args.ng_f32)
-        rbias = load_rbias(args.model, cfg)
-        if cfg["n_exp"] > 0:
-            print(f"[bin2gguf] MoE top-K = {cfg['topk'] or '1 (not recorded)'}")
-        nt = convert_tinylm(cfg, pr, tltk, ngram, out, out_type, rbias)
+        t, model, tmp = args.type, args.model, None
+        if cfg["qtype"] >= 0 and t not in (None, src):
+            sys.exit(f"[bin2gguf] {args.model} is already {src}; re-export from the fp32 model to get {t}")
+        if cfg["qtype"] < 0 and t in QTYPE:
+            base = args.out or os.path.join(os.path.dirname(args.model), base_name(args.model) + ".gguf")
+            tmp = os.path.splitext(base)[0] + ".tmp.bin"
+            exe = find_cudalm(args.cudalm)
+            print(f"[bin2gguf] {exe} quantize -> {t}", flush=True)
+            if subprocess.call([exe, "quantize", args.model, tmp, t]) != 0 or not os.path.exists(tmp):
+                sys.exit("[bin2gguf] cudalm quantize failed")
+            cfg, pr, tk, tltk = parse_checkpoint(tmp)
+            model = tmp
+        out_type = "f16" if t == "fp16" else "f32"
+        try:
+            out = tinylm_export(args, cfg, pr, tltk, model, out_type)
+        finally:
+            for f in ((tmp, tmp + ".opt.ng", tmp + ".opt.t1") if tmp else ()):
+                if os.path.exists(f):
+                    os.remove(f)
         size = os.path.getsize(out)
-        print(f"[bin2gguf] {args.model} -> {out}  (target=tinylm)")
-        print(f"[bin2gguf] V={cfg['V']} D={cfg['D']} L={cfg['L']} H={cfg['H']} "
-              f"KV={cfg['KV']} F={cfg['F']} experts={cfg['n_exp']} "
-              f"ngram={('engram' if isinstance(ngram, dict) else 'yes') if ngram else 'no'}")
-        print(f"[bin2gguf] {cfg['n_params']:,} params, {nt} tensors, {size/1e6:.1f} MB")
+        print(f"[bin2gguf] {args.model} -> {out}  (target=tinylm, {QNAME.get(cfg['qtype'], 'f16' if out_type == 'f16' else 'f32')})")
+        print(f"[bin2gguf] {cfg['n_params']:,} params, {size/1e6:.1f} MB")
         return
 
+    if args.type in ("q4n", "q4"):
+        sys.exit("[bin2gguf] --target llama has no exact 4-bit form (Q4_0 blocks run along the transposed "
+                 "rows and cut across cudalm's quant groups); use --type q8, or --target tinylm for q4n/q4")
     if cfg["qtype"] >= 2:
-        sys.exit(f"[bin2gguf] qtype={cfg['qtype']} (q4) sources are tinylm-target only; use --target tinylm")
-    if cfg["topk"] > 1:
+        sys.exit(f"[bin2gguf] {src} sources are tinylm-target only; use --target tinylm or the fp32 model")
+    args.type = {"q8": "q8_0", "fp16": "f16", "f32": "f32", None: "q8_0"}[args.type]
+    llama_export(args, cfg, pr, tk)
+
+
+def tinylm_export(args, cfg, pr, tltk, model, out_type):
+    if cfg["qtype"] >= 0:
+        # Quantized source: the body is preserved verbatim, so the F32/F16
+        # tensor-type flag is moot. Tag the filename by the native quant.
+        tag = {0: "F16", 1: "Q8_64", 2: "Q4", 3: "Q4S", 4: "Q4N"}.get(cfg["qtype"], "Q")
+        stem = os.path.splitext(os.path.basename(args.model))[0]
+        for t in SRC_TAGS + ("-q4n", "-q4"):
+            if stem.lower().endswith(t):
+                stem = stem[:-len(t)]
+                break
+        out = args.out or os.path.join(os.path.dirname(args.model),
+                                       f"{stem}-{tag}.gguf")
+    else:
+        out = args.out or default_out(args.model, out_type)
+    ngram = load_ngram(model, cfg["D"], cfg["V"], cfg["L"], args.ng_f32)
+    rbias = load_rbias(model, cfg)
+    if cfg["n_exp"] > 0:
+        print(f"[bin2gguf] MoE top-K = {cfg['topk'] or '1 (not recorded)'}")
+    convert_tinylm(cfg, pr, tltk, ngram, out, out_type, rbias)
+    print(f"[bin2gguf] V={cfg['V']} D={cfg['D']} L={cfg['L']} H={cfg['H']} "
+          f"KV={cfg['KV']} F={cfg['F']} experts={cfg['n_exp']} "
+          f"ngram={('engram' if isinstance(ngram, dict) else 'yes') if ngram else 'no'}")
+    return out
+
+
+def llama_export(args, cfg, pr, tk):
+    args.arch = args.arch or ("deepseek" if cfg["n_exp"] > 0 else "llama")
+    if args.arch == "deepseek" and cfg["n_exp"] == 0:
+        sys.exit("[bin2gguf] --arch deepseek is for MoE checkpoints; use --arch llama for dense")
+    if cfg["topk"] > 1 and cfg["n_exp"] > 0:
         print(f"[bin2gguf] WARNING: model routes top-{cfg['topk']}; the llama target is top-1.")
     if os.path.exists(args.model + ".opt.ng"):
         print(f"[bin2gguf] WARNING: {args.model}.opt.ng (ngram/engram memory) has no llama.cpp "
               f"equivalent and is DROPPED; the output will not match tinylm. Use --target tinylm.")
-    args.type = args.type or "q8_0"
-    out = args.out or default_out(args.model, args.type)
+    out = args.out or default_out(args.model, args.type, "-llama")
 
     win, T = cfg["win"], cfg["T"]
     ctx = args.ctx or (min(T, win) if win > 0 else T)
@@ -965,7 +1019,7 @@ def main():
     size = os.path.getsize(out)
     print(f"[bin2gguf] {args.model} -> {out}")
     print(f"[bin2gguf] arch={args.arch} V={cfg['V']} D={cfg['D']} L={cfg['L']} "
-          f"H={cfg['H']} KV={cfg['KV']} F={cfg['F']} experts={cfg['E']} top-1 "
+          f"H={cfg['H']} KV={cfg['KV']} F={cfg['F']} experts={cfg['n_exp']} "
           f"win={cfg['win'] or 'full'} ctx={ctx} {args.type}")
     print(f"[bin2gguf] {cfg['n_params']:,} params, {nt} tensors, {size/1e6:.1f} MB")
 

@@ -132,6 +132,7 @@ __device__ __forceinline__ void qd_write_group(signed char*d, unsigned long long
 }
 
 /* ---- init: quantize P in place into (d,r,s) ---------------------------- */
+#ifndef CUDALM_CPU
 __global__ void k_qlm_encode(const float*P, signed char*d, signed char*r, float*s,
                              const QSpanD*sp, int nspan, int group, int dmax, int packed){
     int gi = blockIdx.x;
@@ -368,6 +369,10 @@ __global__ void __launch_bounds__(256) k_qlm_stepw(float*P, const float*G,
         }
     }
 }
+#else
+#define CPUK_PART 21
+#include "cpu_kern.h"
+#endif
 /* Dispatch: warp kernel for group 64/128/256, else the block kernel. */
 static void qlm_step_launch(float*P, const float*G, signed char*d, signed char*r, float*s,
                             signed char*m8, float*m8s, unsigned char*v8, float*v8s,
@@ -378,14 +383,14 @@ static void qlm_step_launch(float*P, const float*G, signed char*d, signed char*r
                             int gi_base, int ng){
     static int old=-1; if(old<0){ const char*e=getenv("QLM_STEP_OLD"); old=e&&atoi(e); }
     unsigned nb=(unsigned)((ng+7)/8);
-#define QSW(E_) k_qlm_stepw<E_><<<nb,256>>>(P,G,d,r,s,m8,m8s,v8,v8s,sp,nspan,dmax,lr,b1,b2,wd,gscale,gsp,\
+#define QSW(E_) KL(k_qlm_stepw<E_>,nb,256)(P,G,d,r,s,m8,m8s,v8,v8s,sp,nspan,dmax,lr,b1,b2,wd,gscale,gsp,\
         inv_bc1,inv_sqrt_bc2,lrmode,t,adam,stat,packed,gi_base,ng)
     if(!old && group==128) QSW(4);
     else if(!old && group==64) QSW(2);
     else if(!old && group==256) QSW(8);
     else {
         if(gsp){ float h; cudaMemcpy(&h,gsp,4,cudaMemcpyDeviceToHost); gscale=h; }
-        k_qlm_step<<<(unsigned)ng,group,group>>>(P,G,d,r,s,m8,m8s,v8,v8s,sp,nspan,group,dmax,
+        KL(k_qlm_step,(unsigned)ng,group,group)(P,G,d,r,s,m8,m8s,v8,v8s,sp,nspan,group,dmax,
             lr,b1,b2,wd,gscale,inv_bc1,inv_sqrt_bc2,lrmode,t,adam,stat,packed,gi_base);
     }
 #undef QSW
@@ -395,6 +400,7 @@ static void qlm_step_launch(float*P, const float*G, signed char*d, signed char*r
  * mean|W| from, so each group's scale is steered by how often it rails.
  * Measured on CPU to be NOT load-bearing at 4-bit -- kept because it costs
  * nothing and guards against drift over a long run. */
+#ifndef CUDALM_CPU
 __global__ void k_qlm_servo(signed char*d, signed char*r, float*s,
                             const QSpanD*sp, int nspan, int group, int dmax,
                             float f_hi, float f_lo, int packed){
@@ -433,6 +439,10 @@ __global__ void k_qlm_servo(signed char*d, signed char*r, float*s,
     __syncthreads();
     if(act) qd_write_group(d,qi0,shd2,n,j,packed);
 }
+#else
+#define CPUK_PART 22
+#include "cpu_kern.h"
+#endif
 
 /* ---- host side --------------------------------------------------------- */
 static void qlm_add_span(Qlm*q, unsigned long long pof, unsigned long long n){
@@ -465,18 +475,19 @@ static void qlm_gpu_init(Qlm*q, const Cfg*c, const Off*o, float*P, size_t np){
     q->np = np;
 
     q->spanH=(QSpanD*)calloc(QLM_MAXSPAN,sizeof(QSpanD));
-    int E = c->n_exp>0 ? c->n_exp : 1;
-    for(int l=0;l<c->L;l++){
+    int PE=0, pl=0;
+    for(int l=0;l<c->L;l++){ int t=lyT(c,l);
         qlm_add_span(q,o->wq[l],(unsigned long long)c->D*c->D);
         qlm_add_span(q,o->wk[l],(unsigned long long)c->D*c->KD);
         qlm_add_span(q,o->wv[l],(unsigned long long)c->D*c->KD);
         qlm_add_span(q,o->wo[l],(unsigned long long)c->D*c->D);
-        if(!c->pool){                                 /* UniPool: pool span added once, last (spans ascend) */
-        qlm_add_span(q,o->w1[l],(unsigned long long)E*c->D*c->F);
-        qlm_add_span(q,o->w3[l],(unsigned long long)E*c->D*c->F);
-        qlm_add_span(q,o->w2[l],(unsigned long long)E*c->F*c->D); }
+        if(t==2){ if(!PE){ PE=lyE(c,l); pl=l; } continue; }   /* UniPool: pool span added once, last (spans ascend) */
+        unsigned long long W=t?(unsigned long long)lyE(c,l)*c->F:(unsigned long long)lyF(c,l);
+        qlm_add_span(q,o->w1[l],W*c->D);
+        qlm_add_span(q,o->w3[l],W*c->D);
+        qlm_add_span(q,o->w2[l],W*c->D);
     }
-    if(c->pool){ qlm_add_span(q,o->w1[0],(unsigned long long)3*E*c->D*c->F); }
+    if(PE){ qlm_add_span(q,o->w1[pl],(unsigned long long)3*PE*c->D*c->F); }
     /* float spans = the gaps (embeddings, both norms, router, final norm, MTP);
      * they keep the stock bf16 AdamW so only the representation is under test */
     { unsigned long long cur=0;
@@ -510,7 +521,7 @@ static void qlm_gpu_init(Qlm*q, const Cfg*c, const Off*o, float*P, size_t np){
     ck(cudaMemcpy(q->spanD,q->spanH,(size_t)q->nspan*sizeof(QSpanD),cudaMemcpyHostToDevice),"qlm span h2d");
 
     cudaDeviceSynchronize(); g_tprev=wall();
-    k_qlm_encode<<<(unsigned)q->ngrp,q->group,q->group>>>(P,q->d,q->r,q->s,q->spanD,q->nspan,q->group,q->dmax,q->packed);
+    KL(k_qlm_encode,(unsigned)q->ngrp,q->group,q->group)(P,q->d,q->r,q->s,q->spanD,q->nspan,q->group,q->dmax,q->packed);
     kchk("qlm encode",-1);
 
     /* freeze each span's reference scale (mean of its group scales at init) */
@@ -524,7 +535,7 @@ static void qlm_gpu_init(Qlm*q, const Cfg*c, const Off*o, float*P, size_t np){
       ck(cudaMemcpy(q->spanD,q->spanH,(size_t)q->nspan*sizeof(QSpanD),cudaMemcpyHostToDevice),"qlm span h2d 2");
     }
     cudaDeviceSynchronize(); g_tprev=wall();
-    k_qlm_render<<<(unsigned)q->ngrp,q->group>>>(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,0);
+    KL(k_qlm_render,(unsigned)q->ngrp,q->group)(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,0);
     kchk("qlm render",-1);
     q->on=1;
 }
@@ -564,7 +575,7 @@ static void qlm_set_gof(Qlm*q, const Cfg*c, const Off*go){
 }
 
 static void qlm_gpu_render(Qlm*q, float*P){
-    k_qlm_render<<<(unsigned)q->ngrp,q->group>>>(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,0);
+    KL(k_qlm_render,(unsigned)q->ngrp,q->group)(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,0);
     kchk("qlm render",-1);
 }
 
@@ -575,7 +586,7 @@ static void qlm_gpu_render(Qlm*q, float*P){
 static void qlm_render_layer(Qlm*q, float*P, int l){
     int s0=7*l, gi0=q->spanH[s0].gi0, ng=0;
     for(int i=s0;i<s0+7;i++) ng+=q->spanH[i].ngrp;
-    k_qlm_render<<<(unsigned)ng,q->group>>>(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,gi0);
+    KL(k_qlm_render,(unsigned)ng,q->group)(P,q->d,q->s,q->spanD,q->nspan,q->group,q->packed,gi0);
     kchk("qlm render layer",l);
 }
 

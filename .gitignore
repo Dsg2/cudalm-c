@@ -8,3 +8,6 @@ bench/judge/
 *.exp
 *.lib
 __pycache__/
+
+# gitpub: logs, run captures and build output live here
+_scratch/

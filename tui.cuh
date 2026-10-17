@@ -85,6 +85,15 @@ static const TCmd T_CMDS[]={
    {"noise","",F_OPT,"--noise"}}},
  {"quantize","Quantize","shrink a checkpoint on disk",
   {{"in model","",F_MODEL},{"out .bin","",F_TEXT},{"mode","q4n",F_CHOICE,"q8|q4|q4n|fp16"}}},
+ {"gguf","Export GGUF","model -> .gguf (runs export\\bin2gguf.py: python + numpy)",
+  {{"model","",F_MODEL},
+   {"type","q4n",F_CHOICE,"q4n|q4|q8|fp16|f32",0,0,"Same modes as Quantize, applied to an fp32 model first.\n"
+    "q4n = lossless for QLM models (smallest exact). q4 = 4-bit, lossy. q8 = 8-bit.\n"
+    "fp16/f32 = floats. A quantized input keeps its own type (leave type at its mode)."},
+   {"target","tinylm",F_CHOICE,"tinylm|llama",0,0,"tinylm = exact GGUF for the tinylm C runtime (top-k MoE, ngram/engram kept).\n"
+    "llama = stock llama.cpp (q8|fp16|f32 only): top-1 routing, ngram/engram dropped -> lossy."},
+   {"out .gguf","",F_TEXT,0,0,0,"Blank = next to the model: <model>-<TYPE>.gguf (llama target: <model>-llama-<TYPE>.gguf)."},
+   {"ctx","",F_OPT,"--ctx",0,0,"llama target: context to advertise (default = the training window)."}}},
  {"qlmcheck","QLM check","distinct values per weight group",{{"model","",F_MODEL},{"group","128",F_TEXT}}},
  {"selftest","Selftest","GPU kernels vs CPU references",{{0}}},
  /* ---- Data tools (grp 1): text -> tokenizer -> corpus; all CPU ---- */
@@ -380,7 +389,7 @@ static void t_new_stats(const TCmd*c, char vals[][T_MAXL]){
     Cfg cf; if(!preset(vals[1],&cf)){ printf("  \x1b[2m(unknown preset)\x1b[0m\n"); return; }
     cf.n_mtp=0; cf.n_exp=atoi(vals[2]); if(cf.n_exp<=1) cf.n_exp=0;
     t_form_env(c,vals);
-    cf.pool=env_i("CUDALM_UNIPOOL",0)&&cf.n_exp>1; cfg_derive(&cf);
+    cf.pool=env_i("CUDALM_UNIPOOL",0)&&cf.n_exp>1; if(!layout_apply(&cf)) return; cfg_derive(&cf);
     int kl[64], k=topk_parse(getenv("CUDALM_TOPK"),getenv("CUDALM_TOPK_L"),kl);
     MemCfg m; mem_from_env(&m,cf.L);
     printf("\x1b[1mparams\x1b[0m \x1b[2m(V=%d from the preset; the first train resizes it to the data's vocab)\x1b[0m\n",cf.V);

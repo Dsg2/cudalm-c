@@ -233,7 +233,6 @@ static int d_cls(unsigned c){ if(d_isW(c)) return 0;
     if(c<128) return ((c|32)>='a'&&(c|32)<='z')?1:(c>='0'&&c<='9')?2:3;
     return d_inr(UNI_L,sizeof UNI_L/8,c)?1:d_inr(UNI_N,sizeof UNI_N/8,c)?2:3; }
 /* GPT-2 ByteLevel regex split ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+); cp/off hold n+1 */
-typedef void (*DPieceFn)(void*,const unsigned char*,int);
 static void d_split(const unsigned char*s,int n,unsigned*cp,int*off,DPieceFn f,void*ctx){
     int k=0;
     for(int i=0;i<n;){ unsigned c=s[i]; int l=c<0x80?1:c<0xE0?2:c<0xF0?3:4; if(i+l>n) l=n-i;
@@ -265,8 +264,12 @@ static void de_seg(DEnc*e,const char*s,size_t n){ if(!n) return;
     if(n+1>e->cb){ e->cb=n+1; e->cp=(unsigned*)realloc(e->cp,4*e->cb); e->off=(int*)realloc(e->off,4*e->cb); }
     d_split((const unsigned char*)s,(int)n,e->cp,e->off,de_bpe,e); }
 static void de_text(DEnc*e,const char*s,size_t n){ const char*end=s+n;
-    for(;;){ const char*p=d_memstr(s,end-s,"<|endoftext|>",13); if(!p){ de_seg(e,s,end-s); return; }
-        de_seg(e,s,p-s); de_put(e,e->t->eot); s=p+13; } }
+    if(!e->t->tk->nsp){                              /* v3: only <|endoftext|> is special */
+        for(;;){ const char*p=d_memstr(s,end-s,"<|endoftext|>",13); if(!p){ de_seg(e,s,end-s); return; }
+            de_seg(e,s,p-s); de_put(e,e->t->eot); s=p+13; } }
+    while(s<end){ const char*q=s; int sid=-1,sl=0;   /* v4: same scan as tok_encode */
+        for(;q<end;q++){ q=(const char*)memchr(q,'<',end-q); if(!q){ q=end; break; } if((sid=tok_special_at(e->t->tk,q,end,&sl))>=0) break; }
+        de_seg(e,s,q-s); if(sid>=0){ de_put(e,sid); q+=sl; } s=q; } }
 static int d_samefile(const char*a,const char*b){ size_t la,lb; uint8_t*x=read_file(a,&la),*y=read_file(b,&lb);
     int same=x&&y&&la==lb&&!memcmp(x,y,la); free(x); free(y); return same; }
 static void d_copy(const char*sd,const char*dd,const char*nm){ char a[1200],b[1200];
@@ -540,10 +543,10 @@ static int cmd_data_tokenizer(int argc,char**argv){
     return 0; }
 
 /* ---------------- mix: weighted blend of corpora (doc-level, shuffled) ---------------- */
-typedef struct { HANDLE f,m; const uint16_t*p; size_t n; } DMap;
+typedef struct { HANDLE f,m; const uint16_t*p; size_t n,nb; } DMap;
 static int dmap(DMap*d,const char*path){ memset(d,0,sizeof *d);
     d->f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,NULL); if(d->f==INVALID_HANDLE_VALUE){ d->f=NULL; return 0; }
-    LARGE_INTEGER s; GetFileSizeEx(d->f,&s); d->n=(size_t)s.QuadPart/2; if(!d->n) return 1;
+    LARGE_INTEGER s; GetFileSizeEx(d->f,&s); d->nb=(size_t)s.QuadPart; d->n=d->nb/2; if(!d->nb) return 1;
     d->m=CreateFileMappingA(d->f,NULL,PAGE_READONLY,0,0,NULL); d->p=d->m?(const uint16_t*)MapViewOfFile(d->m,FILE_MAP_READ,0,0,0):NULL; return d->p!=NULL; }
 static void dunmap(DMap*d){ if(d->p) UnmapViewOfFile(d->p); if(d->m) CloseHandle(d->m); if(d->f) CloseHandle(d->f); memset(d,0,sizeof *d); }
 typedef struct { uint64_t s; uint32_t n; } DSpan;
@@ -561,12 +564,13 @@ static int cmd_data_mix(int argc,char**argv){
     snprintf(p,sizeof p,"%s\\train.bin",out); if(d_exists(p)){ fprintf(stderr,"[mix] %s already holds a corpus - pick a new name\n",out); return 1; }
     double total=atof(argv[4]), rep=atof(argv[5]), vtok=atof(argv[6]); if(rep<=0) rep=1;
     int ns=(argc-7)/2; if(ns>16){ fprintf(stderr,"[mix] at most 16 corpora\n"); return 1; }
-    char dir[16][1200]; double w[16],ws=0; DMap tr[16],va[16]; DSpan*dd[16]; size_t nd[16]; DTok*t0=NULL;
+    char dir[16][1200]; double w[16],ws=0; DMap tr[16],va[16],tw[16]; DSpan*dd[16]; size_t nd[16]; DTok*t0=NULL; int anyw=0;
     for(int i=0;i<ns;i++){ data_resolve(argv[7+2*i],dir[i],sizeof dir[i]); w[i]=atof(argv[8+2*i]); ws+=w[i];
         DTok*t=dtok_load(dir[i]); if(!t) return 1;
         if(!t0) t0=t; else if(t->blen!=t0->blen||memcmp(t->blob,t0->blob,t->blen)){ fprintf(stderr,"[mix] REFUSED: %s uses a different tokenizer than %s\n",dir[i],dir[0]); return 1; }
         snprintf(p,sizeof p,"%s\\train.bin",dir[i]); if(!dmap(&tr[i],p)||!tr[i].n){ fprintf(stderr,"[mix] no train.bin in %s\n",dir[i]); return 1; }
         snprintf(p,sizeof p,"%s\\val.bin",dir[i]); dmap(&va[i],p);
+        snprintf(p,sizeof p,"%s\\train.w",dir[i]); if(dmap(&tw[i],p)){ if(tw[i].nb!=tr[i].n){ fprintf(stderr,"[mix] %s: train.w is not one byte per token\n",dir[i]); return 1; } anyw=1; }
         dd[i]=d_docs(&tr[i],t0->eot,&nd[i]);
         printf("[mix] %-24s %10.1fM tok %9zu docs  weight %g\n",d_base(dir[i]),tr[i].n/1e6,nd[i],w[i]); fflush(stdout); }
     if(ws<=0){ fprintf(stderr,"[mix] weights must be > 0\n"); return 1; }
@@ -584,14 +588,16 @@ static int cmd_data_mix(int argc,char**argv){
     if(!CreateDirectoryA(out,NULL)&&!d_isdir(out)){ fprintf(stderr,"[mix] cannot create %s\n",out); return 1; }
     const char*cp[]={"tokenizer.bin","tokenizer.json","template.txt","canon.bin"}; for(int i=0;i<4;i++) d_copy(dir[0],out,cp[i]); d_template(out);
     snprintf(p,sizeof p,"%s\\train.bin",out); FILE*ft=fopen(p,"wb"); snprintf(p,sizeof p,"%s\\val.bin",out); FILE*fv=fopen(p,"wb");
+    FILE*fw=NULL; static int8_t one[65536]; if(anyw){ snprintf(p,sizeof p,"%s\\train.w",out); fw=fopen(p,"wb"); memset(one,32,sizeof one); }
     long long ntr=0,nva=0; DWORD t0s=GetTickCount(),tl=t0s;
     for(size_t k=0;k<n;k++){ int i=(int)(sel[k]>>40); DSpan*s=&dd[i][sel[k]&0xFFFFFFFFFFull]; fwrite(tr[i].p+s->s,2,s->n,ft); ntr+=s->n;
+        if(fw){ if(tw[i].p) fwrite((const int8_t*)tw[i].p+s->s,1,s->n,fw); else for(size_t q=0;q<s->n;q+=sizeof one) fwrite(one,1,s->n-q<sizeof one?s->n-q:sizeof one,fw); }
         if(GetTickCount()-tl>10000){ tl=GetTickCount(); printf("[mix] %.1fM / %.1fM tokens written\n",ntr/1e6,total/1e6); fflush(stdout); } }
     double vgot[16];
     for(int i=0;i<ns;i++){ vgot[i]=0; if(!va[i].n) continue; double want=vtok*w[i]/ws; size_t s=0;
         for(size_t j=0;j<va[i].n && vgot[i]<want;j++) if(va[i].p[j]==t0->eot){ fwrite(va[i].p+s,2,j+1-s,fv); vgot[i]+=j+1-s; s=j+1; }
         nva+=(long long)vgot[i]; }
-    fclose(ft); fclose(fv);
+    fclose(ft); fclose(fv); if(fw){ fclose(fw); printf("[mix] wrote train.w (per-token weights; 1.0 for corpora without one)\n"); }
     snprintf(p,sizeof p,"%s\\meta.json",out); FILE*f=fopen(p,"wb"); const char*nm=d_base(out);
     fprintf(f,"{\n  \"profile\": "); jesc(f,nm);
     fprintf(f,",\n  \"vocab_size\": %d,\n  \"eot_id\": %d,\n  \"total_tokens\": %lld,\n  \"train_tokens\": %lld,\n  \"val_tokens\": %lld,\n  \"max_repeat\": %g,\n"
@@ -602,7 +608,7 @@ static int cmd_data_mix(int argc,char**argv){
     fprintf(f,"  }\n}\n"); fclose(f);
     printf("[mix] done in %.1f s: %lld train + %lld val tokens -> %s\n",(GetTickCount()-t0s)/1000.0,ntr,nva,out);
     for(int i=0;i<ns;i++) printf("  %-24s %5.1f%%  repeat %.2f\n",d_base(dir[i]),100.0*got[i]/(ntr?ntr:1),got[i]/tr[i].n);
-    for(int i=0;i<ns;i++){ dunmap(&tr[i]); dunmap(&va[i]); }
+    for(int i=0;i<ns;i++){ dunmap(&tr[i]); dunmap(&va[i]); dunmap(&tw[i]); }
     return 0; }
 
 /* ---------------- info ---------------- */
@@ -646,20 +652,56 @@ static int cmd_data_fetch(int argc,char**argv){
     if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url> <out> [target_tokens]   download\n"
         "       cudalm data fetch <file|folder> <out> [category]       convert parquet/json/jsonl\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
     char out[1200],src[1200],cl[4096]; data_outdir(argv[4],out,sizeof out); data_resolve(argv[3],src,sizeof src);
-    const char*py=getenv("CUDALM_PYTHON"); if(!py||!*py) py="py -3";
     int conv=_strnicmp(argv[3],"http",4) && (!d_bare(argv[3])||strchr(argv[3],'.')) && d_exists(src);   /* bare word = profile */
-    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py,exe_dir(),conv?"convert":"get",conv?src:argv[3],out,argc>5?argv[5]:"");
-    printf("> %s\n",cl); fflush(stdout);
-    STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si; DWORD code=1;
-    if(!CreateProcessA(NULL,cl,NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){ fprintf(stderr,"[fetch] cannot start python (%lu) - set CUDALM_PYTHON\n",GetLastError()); return 1; }
-    WaitForSingleObject(pi.hProcess,INFINITE); GetExitCodeProcess(pi.hProcess,&code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    return (int)code; }
+    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,argc>5?argv[5]:"");
+    return run_cmd(cl); }
 
 static int cmd_data_canon(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm data canon <tokenizer|corpus dir> [out.bin]\n"); return 1; }
     char dir[1200],p[1200]; data_resolve(argv[3],dir,sizeof dir); DTok*t=dtok_load(dir); if(!t) return 1;
     if(argc>4) snprintf(p,sizeof p,"%s",argv[4]); else snprintf(p,sizeof p,"%s\\canon.bin",dir);
     return d_canon(t,p); }
+
+/* weights <corpus> <rows.jsonl>: train.w (int8, one per token) for a corpus encoded from those rows in order with
+ * val%=0 dedup=0 (doc k of train.bin = row k). CUDALM_TOKW=1 trains with it.
+ *   "w": per-doc loss weight, q = round(32*w) > 0 (GRPO advantage; negative = push down)
+ *   "a0","tl","tp" (agentenv tscore): teacher log p per token of the transcript from byte a0; each student token gets
+ *   the sum over teacher tokens ending inside its bytes, stored as q = round(8*lp) in [-127,-1] (on-policy distillation);
+ *   tool results (<|result|>..<|end|>) and misaligned rows get q = 0 (masked); successful episodes ("r" >= 1) get 32
+ *   on everything else, failed ones the teacher log p except on tool calls (0: the teacher doesn't know the syntax) */
+static double* d_nums(const char*v,int*n){ int cap=256; double*a=(double*)malloc(8*cap); *n=0; if(!v||*v!='[') return a;
+    for(const char*p=v+1;*p&&*p!=']';){ char*e; double x=strtod(p,&e); if(e==p){ p++; continue; } if(*n==cap){ cap*=2; a=(double*)realloc(a,8*cap); } a[(*n)++]=x; p=e; }
+    return a; }
+static int cmd_data_weights(int argc,char**argv){
+    if(argc<5){ fprintf(stderr,"usage: cudalm data weights <corpus> <rows.jsonl>\n"); return 1; }
+    char dir[1200],p[1200]; data_resolve(argv[3],dir,sizeof dir); DTok*t=dtok_load(dir); if(!t) return 1;
+    snprintf(p,sizeof p,"%s\\train.bin",dir); DMap m; if(!dmap(&m,p)||!m.n){ fprintf(stderr,"[weights] no train.bin in %s\n",dir); return 1; }
+    size_t nd,len; DSpan*dd=d_docs(&m,t->eot,&nd); char*b=(char*)read_file(argv[4],&len); if(!b){ fprintf(stderr,"[weights] cannot read %s\n",argv[4]); return 1; }
+    b=(char*)realloc(b,len+1); b[len]=0;
+    snprintf(p,sizeof p,"%s\\train.w",dir); FILE*o=fopen(p,"wb"); size_t k=0; long long pos=0,neg=0,opd=0,mis=0; int8_t buf[65536];
+    for(char*l=b,*e;l<b+len;l=e+1){ e=strchr(l,'\n'); if(!e) e=b+len; *e=0; while(*l==' '||*l=='\r') l++; if(*l!='{') continue;
+        if(k>=nd){ fprintf(stderr,"[weights] more rows than docs (%zu)\n",nd); return 1; }
+        const char*v=jget(l,"w"),*tl=jget(l,"tl"),*tp=jget(l,"tp"),*a0v=jget(l,"a0");
+        if(tl&&tp&&a0v){ int nl,np; double*L=d_nums(tl,&nl),*P=d_nums(tp,&np); size_t a0=(size_t)atof(a0v),b=0,te=a0; int ti=0;
+            const uint16_t*ids=m.p+dd[k].s; size_t tot=0; for(uint32_t j=0;j<dd[k].n;j++) if(ids[j]!=t->eot) tot+=t->tk->declen[ids[j]];
+            size_t tt=a0; for(int j=0;j<nl;j++) tt+=(size_t)L[j];
+            if(nl!=np||tt!=tot){ mis++; memset(buf,0,sizeof buf); for(size_t r=dd[k].n;r;){ size_t c=r<sizeof buf?r:sizeof buf; fwrite(buf,1,c,o); r-=c; } }
+            else { char*s=(char*)malloc(tot+1),*c8=(char*)calloc(tot+1,1); size_t n=0; const char*rv=jget(l,"r"); int8_t qc=rv&&atof(rv)>=1?32:0;
+                for(uint32_t j=0;j<dd[k].n;j++) if(ids[j]!=t->eot){ memcpy(s+n,t->tk->dec[ids[j]],t->tk->declen[ids[j]]); n+=t->tk->declen[ids[j]]; } s[n]=0;
+                static const char*tg[2]={"<|call|>","<|result|>"};
+                for(int c=0;c<2;c++) for(char*x=s+a0;(x=strstr(x,tg[c]));){ char*y=strstr(x,"<|end|>"); y=y?y+7:s+n; memset(c8+(x-s),c+1,y-x); x=y; }
+                for(uint32_t j=0;j<dd[k].n;j++){ int id=ids[j]; size_t e=id==t->eot?b:b+t->tk->declen[id]; int8_t q=32;
+                    if(e>a0&&id!=t->eot){ double lp=0; while(ti<nl&&te+(size_t)L[ti]<=e){ te+=(size_t)L[ti]; lp+=P[ti]; ti++; }
+                        int qq=(int)lround(lp*8); q=c8[b]==2?0:qc?qc:c8[b]==1?0:(int8_t)(qq<-127?-127:qq>-1?-1:qq); }
+                    fwrite(&q,1,1,o); b=e; }
+                free(s); free(c8); }
+            free(L); free(P); opd++; k++; continue; }
+        double w=v?atof(v):1.0; int q=(int)lround(w*32); q=q<-127?-127:q>127?127:q; memset(buf,q,sizeof buf);
+        for(size_t r=dd[k].n;r;){ size_t c=r<sizeof buf?r:sizeof buf; fwrite(buf,1,c,o); r-=c; }
+        if(q>0) pos++; else if(q<0) neg++; k++; }
+    fclose(o); dunmap(&m);
+    if(k!=nd){ fprintf(stderr,"[weights] %zu rows but %zu docs - encode with val%%=0 dedup=0\n",k,nd); remove(p); return 1; }
+    printf("[weights] %s: %zu docs, %lld positive, %lld negative, %lld teacher-scored (%lld misaligned -> masked)\n",p,nd,pos,neg,opd,mis); return 0; }
 
 static int cmd_data(int argc,char**argv){
     const char*s=argc>2?argv[2]:"";
@@ -668,6 +710,7 @@ static int cmd_data(int argc,char**argv){
     if(!strcmp(s,"mix"))       return cmd_data_mix(argc,argv);
     if(!strcmp(s,"info"))      return cmd_data_info(argc,argv);
     if(!strcmp(s,"canon"))     return cmd_data_canon(argc,argv);
+    if(!strcmp(s,"weights"))   return cmd_data_weights(argc,argv);
     if(!strcmp(s,"fetch"))     return cmd_data_fetch(argc,argv);
     char roots[2048]; data_roots(roots,sizeof roots);
     fprintf(stderr,
@@ -678,6 +721,7 @@ static int cmd_data(int argc,char**argv){
         "  cudalm data mix       <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...\n"
         "  cudalm data info      <corpus|tokenizer>\n"
         "  cudalm data canon     <tokenizer> [out.bin]\n"
+        "  cudalm data weights   <corpus> <rows.jsonl>     per-doc loss weights (\"w\") -> train.w\n"
         "  inputs: files or folders (.jsonl .json .txt), ';'-separated\n"
         "  data roots: %s  (CUDALM_DATA_ROOTS)\n",roots);
     return 1; }

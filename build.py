@@ -5,6 +5,9 @@
     python build.py --tools         also build judge.exe / teachgen.exe (needs gcc, or MSVC)
     python build.py --python-deps   also pip-install what prep/fetch.py needs (pyarrow)
     python build.py --dry-run       show what would be downloaded / run, change nothing
+    python build.py --cpu           build cudalm_cpu.exe instead: no GPU, CUDA or MSVC needed, just g++ with OpenMP
+                                    (Windows: MSYS2 mingw-w64). --cpu-arch picks -march (default native; haswell
+                                    runs on any AVX2 CPU; x86-64-v2 for CPUs without AVX2, much slower)
 
 What it does:
   1. CUDA: uses --cuda DIR, else a suitable installed toolkit (CUDA_PATH / nvcc on PATH, >= 12.8 for sm_120),
@@ -239,8 +242,11 @@ def main():
     ap.add_argument("--python-deps", action="store_true", help="pip install requirements.txt")
     ap.add_argument("--install-msvc", action="store_true", help="download + install VS Build Tools if MSVC is missing")
     ap.add_argument("--accept-msvc-license", action="store_true", help="no Visual Studio: fetch the portable compiler without asking")
+    ap.add_argument("--cpu", action="store_true", help="CPU-only build with g++/OpenMP (no CUDA, no MSVC)")
+    ap.add_argument("--cpu-arch", default="native", help="-march for --cpu: native (default), haswell (any AVX2), x86-64-v2")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(); dry = a.dry_run
+    if a.cpu: return build_cpu(a, dry)
 
     det = gpu_arch()
     arch = a.arch if a.arch != "auto" else (det or "120")
@@ -285,6 +291,20 @@ def main():
     if not dry:
         for d in ("data", "models"): os.makedirs(os.path.join(HERE, d), exist_ok=True)
     log("done. Run it with no arguments for the menu, or `cudalm help`.")
+
+def build_cpu(a, dry):
+    gxx = shutil.which("g++")
+    if not gxx: die("--cpu needs g++ with OpenMP (Windows: MSYS2, pacman -S mingw-w64-x86_64-gcc; Linux: build-essential)")
+    exe = os.path.join(HERE, (a.out if a.out != "cudalm" else "cudalm_cpu") + (".exe" if WIN else ""))
+    cmd = [gxx, "-O3", f"-march={a.cpu_arch}", "-fopenmp", "-DCUDALM_CPU", "-x", "c++", os.path.join(HERE, "cudalm.cu"), "-o", exe]
+    cmd += ["-static", "-ladvapi32"] if WIN else ["-lm"]
+    log("compiling cudalm, CPU build (about a minute)")
+    if run(cmd, dry=dry, cwd=HERE): die("g++ failed (see the messages above)")
+    if not dry:
+        for d in ("data", "models"): os.makedirs(os.path.join(HERE, d), exist_ok=True)
+    log("built", exe)
+    if a.tools: build_tools(dict(os.environ), dry)
+    if a.python_deps: run([sys.executable, "-m", "pip", "install", "-r", os.path.join(HERE, "requirements.txt")], dry=dry)
 
 def build_tools(env, dry):
     if not WIN: log("judge/teachgen are Windows-only; skipped"); return

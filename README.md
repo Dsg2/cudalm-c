@@ -7,7 +7,8 @@ chat benchmark, and GGUF export.
 - Models are MoE transformers with top-k routing. An optional hashed n-gram "engram" memory is attached to chosen layers.
 - QLM mode: 4-bit weights with an integer AdamW optimizer, so a ~100M-parameter model trains in a few GB of VRAM.
 - The schedule is WSD/cosine, checkpoints can be resumed, and chat SFT works with an assistant-only loss mask (ChatML).
-- Everything except the optional helper tools is C/C++ in `cudalm.cu` plus four headers. The only external library is cuBLAS.
+- Everything except the optional helper tools is C/C++ in `cudalm.cu` plus a few headers. The only external library is cuBLAS.
+- No NVIDIA GPU? `python build.py --cpu` builds the same program for the CPU (OpenMP + AVX2). See [CPU build](#cpu-build).
 
 **Tested on:** Windows 11, an RTX 50-series GPU (sm_120), and CUDA 12.9. Other architectures (`--arch 89`, `86`, ...)
 and Linux should compile, but they are untested. The data tools and the console menu are Windows-only.
@@ -39,6 +40,29 @@ The result is `cudalm.exe`, with the two cuBLAS DLLs copied next to it. Other op
 | `--cuda-version X.Y.Z` | Picks a different redist version. |
 | `--accept-msvc-license` | Downloads the portable MSVC without asking (for scripted builds). |
 
+### CPU build
+
+```
+python build.py --cpu                    (needs only g++ with OpenMP; Windows: MSYS2 mingw-w64)
+```
+
+This builds `cudalm_cpu.exe` from the same `cudalm.cu` with `-DCUDALM_CPU`. `cpu_rt.h` stands in for the CUDA runtime
+and cuBLAS (it has a packed AVX2/FMA SGEMM). `cpu_kern.h` has OpenMP versions of every kernel, including blocked
+flash attention with a fused backward. All commands, model files and data are shared with the GPU build. The fp16, FP8 and
+tensor-core paths are GPU-only, so the CPU build always runs the fp32 path. It gives the same results as the GPU with
+`CUDALM_FP16=0 CUDALM_FP8_GEMM=0 CUDALM_H16=0 CUDALM_TF32=0`: identical greedy text and identical eval loss, checked on the
+~120M-parameter 32-expert reference checkpoint.
+
+| `--cpu-arch` | Runs on |
+|---|---|
+| `native` (default) | the build machine (fastest; the exe may not run on other CPUs) |
+| `haswell` | any x86-64 CPU with AVX2 + FMA (2013+) |
+| `x86-64-v2` | CPUs without AVX2 (SSE fallbacks, ~3.5x slower) |
+
+Speed on a 6-core i5-9400F: ~1.9k tok/s training the 10M `s8w` preset (B=8, T=1024), ~2k tok/s eval and ~16 tok/s
+generation on that ~120M 32-expert top-2 model. That is fine for testing, evaluation, chat and small models. Real pretraining
+still wants a GPU.
+
 ## Quick start
 
 ```
@@ -63,7 +87,9 @@ cudalm eval      <name> <corpus> [batches] [batch_size]
 cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]
 cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp]
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
+cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>
+cudalm serve     <name> [port=8090]                  HTTP /completion for agentenv (continuous batching, CUDALM_SERVE_SLOTS)
 cudalm data      <fetch|tokenizer|encode|mix|info|canon> ...
 cudalm help                                        all commands + every environment variable
 ```
@@ -83,8 +109,20 @@ again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press
   - `content` / `code` / `markdown` / `body`.
 - **Mixing:** `cudalm data mix <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...` mixes encoded
   corpora that share a tokenizer.
+- **Per-token loss weights (RL):** `cudalm data weights <corpus> <rows.jsonl>` writes `train.w` from each row's `"w"`
+  (encode those rows with `val%=0 dedup=0` first). `data mix` carries it through (1.0 for corpora without one), and
+  `CUDALM_TOKW=1` trains with it: negative weights push failed rollouts down until their p < `CUDALM_NEG_PMIN`.
 - **Python:** `cudalm data fetch` runs `prep\fetch.py` with `py -3`. Override it with `CUDALM_PYTHON`. `HF_TOKEN`
   is sent when set (needed for gated datasets).
+
+### GGUF export
+
+`cudalm gguf <name> [type] [target]` runs `export\bin2gguf.py` (python + numpy, `CUDALM_PYTHON` applies) with the
+model's saved `.env`, so MoE top-k is recorded. `type` uses the quantize modes: q4n/q4/q8 quantize an fp32 model first,
+fp16/f32 keep floats; a quantized model exports as its own type.
+
+- `tinylm` (default, type default q4n): exact. Keeps top-k routing, router bias and the ngram/engram memory.
+- `llama` (type default q8; q8|fp16|f32): stock llama.cpp `deepseek` arch. Routes top-1 and drops ngram/engram, so it is lossy.
 
 ## Layout
 
@@ -92,10 +130,11 @@ again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press
 |---|---|
 | `cudalm.cu` | Engine: model, training, eval, sampling, chatbench, quantize, CLI |
 | `qlm.cuh` | 4-bit weights + integer AdamW (QLM) |
+| `cpu_rt.h`, `cpu_kern.h` | CPU build only: CUDA runtime/cuBLAS stand-in (AVX2 SGEMM) and OpenMP/AVX2 kernels |
 | `tui.cuh` | Console menu (Windows) |
 | `data.cuh` | `cudalm data`: BPE trainer, encoder, mixer, canon map (CPU, Windows) |
 | `uniclass.h` | Unicode tables for the GPT-2 pre-tokenizer regex |
-| `build.py` | Toolchain download and build |
+| `build.py` | Toolchain download and build (`--cpu` for the CPU build) |
 | `prep\fetch.py` | Hugging Face downloads and parquet/json → jsonl conversion (called by `cudalm data fetch`) |
 | `prep\legacy\` | Older Python corpus builders (numpy + `tokenizers`); kept for reference |
 | `runs\` | Reference recipe: `s8w2env.bat` (model env), `pretrain.bat`, `sft.bat` (chat SFT continuing a base model) |
@@ -103,6 +142,8 @@ again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press
 | `bench\judge.c`, `judgerun.bat` | Coherence judge: scores chatbench replies with any instruct GGUF via llama-server (`JUDGE_GGUF`, `LLAMA_SERVER`) |
 | `bench\gemmbench.cu` | MoE expert-GEMM micro-benchmark |
 | `teach\teachgen.c`, `teachrun.bat` | Synthetic teacher data from llama-server instances (`TEACHER_GGUF`, `LLAMA_SERVER`) |
+| `teach\teachtok.c` | Teacher jsonl → train/val token bins with the model's tokenizer (special tokens matched literally) |
+| `agent\agentenv.c` | Agent evals against `cudalm serve` (or a teacher server): tool use, code pass@k, task generation |
 | `export\bin2gguf.py` | Model `.bin` → GGUF (needs numpy) |
 
 ## Recipe notes
