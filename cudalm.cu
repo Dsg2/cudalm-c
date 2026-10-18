@@ -3646,6 +3646,26 @@ static int bfm_on(const GA*,int,int){ return 0; }
 static void bfm_fwd(const float*,const Off*,GA*,int,int,int,int,int,float*,float*,float*,float*){}
 static void bfm_bwd(const float*,float*,const Off*,GA*,int,int,int,int,int,float*,float*,float*){}
 #endif
+/* router z-loss (CUDALM_ROUTER_Z=c): L += c * mean_n lse(logits_n)^2, training GAs only. Keeps router
+ * logits from growing until the softmax saturates and experts die (ST-MoE). lse kept per layer. */
+static float g_zl=0, *g_zlse=0; static size_t g_zlc=0;
+#ifndef CUDALM_CPU
+__global__ void k_rlse(const float*rt,float*lse,int N,int E){
+    int n=blockIdx.x*blockDim.x+threadIdx.x; if(n>=N) return; const float*r=rt+(size_t)n*E;
+    float mx=-1e30f; for(int e=0;e<E;e++) mx=fmaxf(mx,r[e]);
+    float s=0; for(int e=0;e<E;e++) s+=expf(r[e]-mx); lse[n]=mx+logf(s); }
+__global__ void k_zl_bwd(float*drt,const float*pr,const float*lse,int N,int E,float c){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<(size_t)N*E) drt[i]+=c*lse[i/E]*pr[i]; }
+static void zl_fwd(GA*a,int l,int N,int E){
+    if(g_zl<=0||!a->tr) return;
+    size_t need=(size_t)gC.L*N; if(need>g_zlc){ if(g_zlse) cudaFree(g_zlse); g_zlse=(float*)dmalloc(need*4); g_zlc=need; }
+    KL(k_rlse,nblk(N,TPB),TPB)(a->rt,g_zlse+(size_t)l*N,N,E); }
+static void zl_bwd(GA*a,int l,int N,int E){
+    if(g_zl>0&&a->tr) KL(k_zl_bwd,nblk((size_t)N*E,TPB),TPB)(a->drt,a->rprobs[l],g_zlse+(size_t)l*N,N,E,2.f*g_zl/N); }
+#else
+static void zl_fwd(GA*,int,int,int){}
+static void zl_bwd(GA*,int,int,int){}
+#endif
 static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
 #define KF(s) if(g_prof>1) kchk(s,l)
     int D=gC.D,F=gC.F,E=lyE(&gC,l), isP=lyT(&gC,l)==2;
@@ -3655,7 +3675,7 @@ static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
     float *gp=a->gpS?a->gpS[l]:a->gp, *up=a->upS?a->upS[l]:a->up, *yp=a->ypS?a->ypS[l]:a->yp;
     g_ab(g_rpre?rpre_x(P,rd,a,l,N):a->f_norm[l],P+rd->wr[l],a->rt,N,D,E);   /* router logits */
     if(g_topk<=1){
-      KL(k_router_top1,nblk(N,TPB),TPB)(a->rt,a->rprobs[l],a->assign[l],a->gate[l],N,E,mbias(l));
+      KL(k_router_top1,nblk(N,TPB),TPB)(a->rt,a->rprobs[l],a->assign[l],a->gate[l],N,E,mbias(l)); zl_fwd(a,l,N,E);
       moe_perm(a,l,N,E);
       int *off=a->hoff+(size_t)l*(gC.n_exp+1);
       e_cpy(out,a->f_in[l],(size_t)N*D);                             /* residual */
@@ -3669,7 +3689,7 @@ static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
       KL(k_scatter_gate,nblk((size_t)N*D,TPB),TPB)(yp,a->perm[l],a->gate[l],out,N,D);
     } else {
       int Km=g_topk; if(Km>gC.n_exp)Km=gC.n_exp; int K=(g_topkL[l]>0&&g_topkL[l]<Km)?g_topkL[l]:Km; if(K>E)K=E;
-      KL(k_router_topk,nblk(N,TPB),TPB)(a->rt,a->rprobs[l],a->assign[l],a->gate[l],N,E,K,mbias(l),g_mbias_slot?E:0);
+      KL(k_router_topk,nblk(N,TPB),TPB)(a->rt,a->rprobs[l],a->assign[l],a->gate[l],N,E,K,mbias(l),g_mbias_slot?E:0); zl_fwd(a,l,N,E);
       if(g_moe_train&&(g_moe_rcap>0||g_moe_sink>0)) moe_rebal(a,l,N,E,K);
       float *gp0=gp, *up0=up, *yp0=yp;
       e_cpy(out,a->f_in[l],(size_t)N*D);                             /* residual, once */
@@ -3765,6 +3785,7 @@ static void moe_backward(const float*P,float*G,const Off*o,GA*a,int l,int N){
       ck(cudaMemcpy(a->d_cnt,isP?ps:cnt,(size_t)E*4,cudaMemcpyHostToDevice),"cnt h2d"); mbias_upd(l,cnt,1,E,(float)N/E); }
     KL(k_router_bwd,nblk(N,TPB),TPB)(a->rprobs[l],a->assign[l],a->d_gate,a->d_cnt,
                                       a->drt,N,E,(isP?MOE_AUX/NPOOL(&gC):MOE_AUX)*LMUL(g_auxlm,g_auxlm_n,l));
+    zl_bwd(a,l,N,E);
     if(g_rpre) rpre_bwd(P,G,og,rd,a,l,N); else {
     g_abt_b(a->drt,P+rd->wr[l],a->dfnorm,N,E,D,1.0f);      /* dfnorm += drt @ wr^T */
     g_atb(a->f_norm[l],a->drt,G+og->wr[l],N,D,E); }        /* dWr += fnorm^T @ drt */
@@ -3877,6 +3898,7 @@ static void moe_backward(const float*P,float*G,const Off*o,GA*a,int l,int N){
       if(g_mbias_slot) mbias_upd(l,cs,K,E,(float)N/E); else mbias_upd(l,cnt,1,E,(float)K*N/E); }
     KL(k_router_bwd_topk,nblk(N,TPB),TPB)(a->rprobs[l],a->assign[l],a->d_gate,(const float*)a->d_cnt,
                                            a->drt,N,E,K);
+    zl_bwd(a,l,N,E);
     if(g_rpre) rpre_bwd(P,G,og,rd,a,l,N); else {
     g_abt_b(a->drt,P+rd->wr[l],a->dfnorm,N,E,D,1.0f);      /* dfnorm += drt @ wr^T */
     g_atb(a->f_norm[l],a->drt,G+og->wr[l],N,D,E); }        /* dWr += fnorm^T @ drt */
@@ -6070,6 +6092,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_DOCMASK","0","train","mask attention/canon across eot (pretraining; not for eot-separated chat turns)",1},
  {"CUDALM_UNIPOOL","0","model","at new: one expert pool shared by all layers",0},
  {"CUDALM_TOPK","2","moe","experts routed per token (1..8)",0},
+ {"CUDALM_ROUTER_Z","0","moe","router z-loss coef (ST-MoE uses 1e-3)",0},
  {"CUDALM_TOPK_L","","moe","per-layer top-k, e.g. 1,2,2,2",0},
  {"CUDALM_MOE_AUX","0.03","moe","load-balance aux loss weight",0},
  {"CUDALM_MOE_AUX_L","0","moe","per-layer aux on top of pool aux",0},
@@ -9209,6 +9232,7 @@ int main(int argc,char**argv){
         if(g_moe_rcap>0&&g_moe_capf<g_moe_rcap+0.05f) g_moe_capf=g_moe_rcap+0.05f; /* SB pads each expert to 16 */
         if((v=getenv("CUDALM_MOE_SINK"))) g_moe_sink=atoi(v);
         if((v=getenv("CUDALM_MOE_AUX_L"))&&atof(v)>0) g_moe_auxL=(float)atof(v);
+        if((v=getenv("CUDALM_ROUTER_Z"))) g_zl=(float)atof(v);
         if((v=getenv("CUDALM_MOE_AUX_LM"))) g_auxlm_n=parse_flist(v,g_auxlm,64);
         if((v=getenv("CUDALM_MOE_BIAS_LM"))) g_biaslm_n=parse_flist(v,g_biaslm,64);
         if((v=getenv("CUDALM_ROUTER_PRE"))&&atoi(v)){ g_rpre=1; printf("[moe] router reads the pre-injection residual\n"); }
