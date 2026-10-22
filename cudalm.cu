@@ -3054,6 +3054,9 @@ static float g_wsd_decay=0.15f;
  * step the LR by 10x, which is exactly the case continual-pretraining work warns
  * about (re-warm, re-decay, replay). Relative to start_iter, not to zero. */
 static int g_rewarm=0, g_start_iter=0;
+/* g_stage0: first iteration of the current training stage. `train` on an already trained model starts a new
+ * stage (its own warmup + WSD/cosine over the stage's steps); lr_at() works relative to it. */
+static int g_stage0=0;
 
 typedef struct { int N, tr;   /* tr: training step (BF16 FFN/MoE paths); eval/serve GAs stay exact */
     float **a_in,**a_norm,**r1,**qh,**kh,**vh,**att,**f_in,**f_norm,**r2,**gg,**uu,**lse;
@@ -6046,7 +6049,7 @@ static void lr_boost_setup(const Cfg*c,const Off*o){
  * schedule fighting it (MiniCPM's WSD; Hagele et al. on constant-LR + cooldown,
  * which reports parity with cosine at equal budget). */
 static float lr_at(int it,int iters,float lr,float warmup,int wsd,float dfrac){
-    float base;
+    float base; int ita=it; it-=g_stage0; iters-=g_stage0;
     if(it<warmup) base=lr*(it+1)/warmup;
     else {
         float lo=0.1f*lr;
@@ -6062,7 +6065,7 @@ static float lr_at(int it,int iters,float lr,float warmup,int wsd,float dfrac){
         }
     }
     if(g_rewarm>0){                    /* ramp whatever the schedule asked for */
-        int d=it-g_start_iter;
+        int d=ita-g_start_iter;
         if(d<g_rewarm){ float w=(float)(d+1)/(float)g_rewarm; if(w<0.0f)w=0.0f; base*=w; }
     }
     return base;
@@ -6280,9 +6283,9 @@ static const EnvReg g_envreg[]={
  {"CUDALM_LR","auto","optim","peak LR (auto from model size)",0},
  {"CUDALM_WARMUP","100","optim","warmup iters",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
- {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",0},
- {"CUDALM_REWARMUP","0","optim","re-warmup iters after resume",0},
- {"CUDALM_ITERS","auto","optim","pin schedule length in iters (else from epochs)",0},
+ {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
+ {"CUDALM_REWARMUP","0","optim","re-warmup iters after resume",1},
+ {"CUDALM_ITERS","auto","optim","pin ONE schedule over iters 0..N of the whole run (else: epochs of this corpus, as a new stage)",1},
  {"CUDALM_LR_BOOST","","optim","LR multiplier for CUDALM_LR_BOOST_LAYERS",0},
  {"CUDALM_LR_BOOST_LAYERS","","optim","layers to boost, e.g. 2,5,8",0},
  {"CUDALM_LRS","0","optim","LR scaler (periodic val-probed LR search)",0},
@@ -6315,7 +6318,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_DIVSTOP","0.3","train","divergence stop threshold",0},
  {"CUDALM_MASK_PROMPT","1","train","chatml: loss on assistant tokens only",0},
  {"CUDALM_SAMPLER","perm","train","perm | rand",0},
- {"CUDALM_PERM_BASE","0","train","perm sampler start offset",0},
+ {"CUDALM_PERM_BASE","0","train","perm sampler start offset",1},
  {"CUDALM_SEED","random","train","pins batch order / sampling",0},
  {"CUDALM_TOKW","0","train","per-token loss weights from <corpus>/train.w: 1 = weights (GRPO), 2 = q<0 is teacher log p*8 (on-policy distillation)",0},
  {"CUDALM_OPD_BIAS","auto","train","TOKW=2 baseline added to teacher log p; auto = running mean of the advantage, so it is centred; mask = drop teacher tokens (control)",0},
@@ -6385,6 +6388,8 @@ static void side_apply(const char*name){
     char p[1100]; model_resolve(name,p,sizeof p-4); strcat(p,".env");
     FILE*f=fopen(p,"rb"); if(!f) return; char l[1024]; int n=0;
     while(fgets(l,sizeof l,f)){ l[strcspn(l,"\r\n")]=0; char*eq=strchr(l,'='); if(!eq||eq==l||l[0]=='#') continue; *eq=0;
+        const EnvReg*rg=envreg_find(l,strlen(l));
+        if(rg&&rg->rt){ fprintf(stderr,"[config] %s=%s in %s ignored (per-run setting; set it in the environment for this run)\n",l,eq+1,p); continue; }
         const char*cur=getenv(l);
         if(cur){ if(strcmp(cur,eq+1)) fprintf(stderr,"[config] %s=%s from environment (model config has %s)\n",l,cur,eq+1); continue; }
         lm_setenv(l,eq+1); n++; }
@@ -7302,7 +7307,11 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
 #include "data.cuh"
 static void cmd_train(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm train <name> <data_dir> [epochs]\n"
-        "  <name> must already exist (create with: cudalm new <name> <preset>)\n"); exit(1); }
+        "  <name> must already exist (create with: cudalm new <name> <preset>)\n"
+        "  epochs = passes over THIS corpus from now on (default 1). On a model that has been trained before, this starts\n"
+        "  a new stage: warmup and LR schedule restart over the stage, sampling starts at epoch 0 of the corpus.\n"
+        "  <name>.bin.run records the stage; re-running the same command after a stop resumes it instead of adding more.\n"
+        "  CUDALM_ITERS=N instead pins one schedule over iters 0..N of the model's whole life (old behaviour).\n"); exit(1); }
     const char*name=argv[2],*ddir=argv[3]; float epochs=argc>4?(float)atof(argv[4]):1.0f;
     char mpath[1024],optpath[1100]; model_path(name,mpath,sizeof(mpath)); snprintf(optpath,sizeof(optpath),"%s.opt",mpath);
     FILE*ex=fopen(mpath,"rb"); if(!ex){ fprintf(stderr,"model '%s' not found.\n  create it: cudalm new %s <preset>\n",mpath,name); exit(1);} fclose(ex);
@@ -7484,8 +7493,22 @@ static void cmd_train(int argc,char**argv){
      * otherwise have its schedule silently rescaled by the new corpus's size --
      * the cooldown would start in the wrong place. Pin it and the schedule is
      * a property of the run, not of whichever data directory it points at. */
-    { const char*e=getenv("CUDALM_ITERS"); if(e){ int v=atoi(e); if(v>0) iters=v; } }
+    /* Stages. [epochs] = passes over THIS corpus from now on. A trained model starts a new stage at its current iter
+     * (fresh warmup + schedule over the stage, sampler at epoch 0 of this corpus); <model>.bin.run records the stage
+     * (start, end, corpus) so re-running after a stop/crash finishes it instead of adding more.
+     * CUDALM_ITERS keeps the old absolute meaning (total iters counted from 0, one schedule over the whole run). */
+    char runp[1200]; snprintf(runp,sizeof runp,"%s.run",mpath); int pin_iters=0, run_note=0;
+    { const char*e=getenv("CUDALM_ITERS"); if(e){ int v=atoi(e); if(v>0){ iters=v; pin_iters=1; } } }
+    int stage_n=iters>0?iters:1;
+    if(!pin_iters&&start_iter>0){
+        int rs=-1,re=-1; long long rn=-1; char rd[1100]={0}; FILE*rf=fopen(runp,"r");
+        if(rf){ if(fscanf(rf,"start=%d end=%d tokens=%lld corpus=%1099[^\n]",&rs,&re,&rn,rd)!=4) rs=-1; fclose(rf); }
+        if(rs>=0&&re>start_iter&&rn==(long long)ntr&&!strcmp(rd,ddir)){ g_stage0=rs; iters=re; run_note=1; }
+        else { if(rs>=0&&re>start_iter) printf("[cudalm train] note: the stage on %s stopped at iter %d of %d; starting a new stage on this corpus instead\n",rd,start_iter,re);
+               g_stage0=start_iter; iters=start_iter+stage_n; run_note=2; }
+    }
     if(iters<1)iters=1; if(iters<start_iter)iters=start_iter;
+    if(!pin_iters){ FILE*rf=fopen(runp,"w"); if(rf){ fprintf(rf,"start=%d end=%d tokens=%lld corpus=%s\n",g_stage0,iters,(long long)ntr,ddir); fclose(rf); } }
     int save_every=spe<400?spe:200; if(save_every<50)save_every=50;
     /* On a flaky box, checkpoint interval is how much work a hang costs.
      * Saves are atomic+fsynced so a frequent cadence is safe, it just costs
@@ -7527,12 +7550,19 @@ static void cmd_train(int argc,char**argv){
         for(int i=0;i<ms.n;i++) printf(" %s(%d)", i<2?(i?"call":"asst"):(i==2?"user":(i==3?"sys":(i==4?"tools":"result"))), ms.len[i]);
         printf("\n               raw prose (no markers) stays fully trainable.\n");
     }
-    printf("[cudalm train] %s %s params=%zu B=%d V=%d | epochs=%.2f -> %d iters (steps/ep=%d) start=%d lr=%g\n",
-           name, trained?"(resume)":"(fresh)", np, B, c.V, epochs, iters, spe, start_iter, lr);
+    printf("[cudalm train] %s %s params=%zu B=%d V=%d lr=%g | corpus %d steps/epoch\n",
+           name, trained?"(resume)":"(fresh)", np, B, c.V, lr, spe);
+    if(pin_iters) printf("[cudalm train] CUDALM_ITERS=%d: one schedule over iters 0..%d (absolute), now at %d\n",iters,iters,start_iter);
+    else if(run_note==1) printf("[cudalm train] continuing the unfinished stage: iters %d..%d (%.2f epochs of this corpus), now at %d, %d left\n",
+                                g_stage0,iters,(double)(iters-g_stage0)/spe,start_iter,iters-start_iter);
+    else printf("[cudalm train] %s: %.2f epochs of this corpus = %d steps, iters %d..%d%s\n",
+                run_note==2?"new stage":"stage 1",epochs,iters-g_stage0,g_stage0,iters,
+                run_note==2?" (warmup + schedule restart; CUDALM_LR sets the peak, 1e-4 suits chat SFT)":"");
     g_start_iter=start_iter;
-    if(g_wsd) printf("[cudalm train] schedule WSD: hold %g, cooldown over the last %.0f%% (%d iters, from iter %d) to %g\n",
-                     lr, g_wsd_decay*100.0f, (int)(iters*g_wsd_decay), iters-(int)(iters*g_wsd_decay), 0.1f*lr);
-    else      printf("[cudalm train] schedule cosine: %g -> %g over %d iters\n", lr, 0.1f*lr, iters);
+    { int S=iters-g_stage0, d=(int)(S*g_wsd_decay);
+      if(g_wsd) printf("[cudalm train] schedule WSD: warmup %d, hold %g, cooldown over the last %.0f%% of the stage (%d iters, from iter %d) to %g\n",
+                       (int)warmup, lr, g_wsd_decay*100.0f, d, iters-d, 0.1f*lr);
+      else      printf("[cudalm train] schedule cosine: %g -> %g over iters %d..%d\n", lr, 0.1f*lr, g_stage0, iters); }
     if(g_rewarm>0) printf("[cudalm train] re-warmup: ramping to the scheduled rate over %d iters from iter %d\n",
                           g_rewarm, start_iter);
     lr_boost_setup(&c,&o);
@@ -7559,7 +7589,7 @@ static void cmd_train(int argc,char**argv){
     PermSampler pm; memset(&pm,0,sizeof(pm)); int perm_on=1, perm_base=0;
     { const char*e=getenv("CUDALM_SAMPLER"); if(e && strcmp(e,"perm")) perm_on=0; }   /* default perm; CUDALM_SAMPLER=rand = old urand64 */
     if(perm_on){
-        const char*b=getenv("CUDALM_PERM_BASE"); if(b) perm_base=atoi(b);
+        const char*b=getenv("CUDALM_PERM_BASE"); perm_base=b?atoi(b):g_stage0;   /* a stage starts at epoch 0 of its corpus */
         const char*sd=getenv("CUDALM_SEED");
         pm.seed = sd ? (uint64_t)lm_strtou64(sd) : 0x5EEDULL;
         pm.T=c.T; pm.nw=(ntr-2)/(size_t)c.T; pm.epoch=-1;
@@ -7728,7 +7758,7 @@ static void cmd_train(int argc,char**argv){
             double L=0; for(int i=0;i<N;i++)L+=lossh[i]; L/=ntrain;
             double dt=wall()-t0;
             printf("iter %5d (ep %.2f) | loss %.4f | lr %.2e | gn %.2f | %.0fs | %.0f tok/s",
-                   it,(double)it/spe,L,cur,g_gn,dt, it>start_iter?(double)N*(it-start_iter)/dt:0.0);
+                   it,(double)(it-g_stage0)/spe,L,cur,g_gn,dt, it>start_iter?(double)N*(it-start_iter)/dt:0.0);
             /* trainable fraction: the one number that shows masking is doing
              * something sane. ~100% means no chat data in the window (all prose);
              * near 0% would mean the markers are not matching at all. */

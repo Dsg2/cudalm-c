@@ -22,7 +22,9 @@ typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int 
 #define T_PRESETS "nano|micro|m1|m3|m6|m8|m16|m32|m70|m50|m64e|m220e|a8m|a8m9|s8x|s8w"
 static const TCmd T_CMDS[]={
  {"train","Train","continue training a model (create it first with New model)",
-  {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT}}},
+  {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT,0,0,0,
+    "Passes over THIS corpus from now on. A model trained before starts a new stage here (warmup + LR schedule\n"
+    "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models\\<name>.bin.run)."}}},
  {"run","Generate","sample one continuation of a prompt",
   {{"model","",F_MODEL},{"prompt","Once upon a time",F_TEXT},{"tokens","120",F_TEXT},{"temp","0.8",F_TEXT},{"top-k","40",F_TEXT}}},
  {"serve","Serve","HTTP /completion server for the model (used by agentenv)",

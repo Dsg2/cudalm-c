@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-22
 
+- Add `g_stage0` flag to track first iteration of a training stage
+- Update `lr_at()` to use `g_stage0` for relative iteration counting
+- Add `CUDALM_PERM_BASE` to `envreg` with `rt=1` to mark it as per-run setting
+- Update `cmd_train()` to detect stage boundaries and print stage info
+- Update `tui.cuh` `train` command to document stage behavior
+
+## Unreleased - 2026-10-22
+
 - README.md: document new cudalm lmeval output
 - cudalm.cu: extend cmd_lmeval with acc_norm index calculation
 - cudalm.cu: add index summary to lmeval output

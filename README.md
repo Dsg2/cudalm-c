@@ -104,6 +104,16 @@ Training options are `CUDALM_*`, `QLM_*` and `NGRAM_*` environment variables (`c
 `cudalm new` and `cudalm train` save the ones in effect to `models\<name>.bin.env`, so later commands don't need them
 again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press Ctrl+C in the menu).
 
+**Epochs and stages.** `[epochs]` is how many passes over *the corpus you name* to train from now on. Training a model
+that has been trained before (e.g. chat SFT on a pretrained base) starts a new **stage**: the warmup and the LR schedule
+restart over the stage's steps, and sampling starts at epoch 0 of the new corpus. `models\<name>.bin.run` records the
+stage (start/end iteration, corpus), so re-running the same command after a stop or crash finishes that stage instead
+of adding more. For a stage on a trained model, set the peak LR with `CUDALM_LR` (1e-4 suits chat SFT) and the cooldown
+share with `CUDALM_WSD_DECAY` (fraction of the stage). `CUDALM_ITERS=N` keeps the old behaviour: one schedule over
+iterations 0..N of the model's whole life (`runs\sft.bat` uses it). `CUDALM_ITERS`, `CUDALM_WSD_DECAY`,
+`CUDALM_REWARMUP` and `CUDALM_PERM_BASE` are per-run settings: they are not saved to `.bin.env`, and old `.bin.env`
+files that contain them are ignored for those keys.
+
 In the menu every command is a form (required fields are checked before Run). Its output is shown live and also
 saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the input for `bench\judgerun.bat`. Diagnostics
 (selftest, decode / tokenizer / QLM checks) have their own submenu.
