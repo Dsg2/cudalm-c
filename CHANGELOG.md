@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-22
 
+- Add "ufw-l3-qa" and "ufw-l3-ms" entries to S
+- Add "ufwl3-en" profile with qa + multi_style sources
+- Update save() to write .done file for data encode follow=1
+
+## Unreleased - 2026-10-22
+
 - Add `g_stage0` flag to track first iteration of a training stage
 - Update `lr_at()` to use `g_stage0` for relative iteration counting
 - Add `CUDALM_PERM_BASE` to `envreg` with `rt=1` to mark it as per-run setting

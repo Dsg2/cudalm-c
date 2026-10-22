@@ -163,6 +163,10 @@ S = {  # name: (urls, parser, license)
                     p_col("content", 200), "openbmb/Ultra-FineWeb (ODC-By-1.0; derived from FineWeb/CommonCrawl)"),
   "ufw-l3":        (shards(f"{HF}/openbmb/Ultra-FineWeb-L3/resolve/main/data/ultrafineweb_en_l3/multi_style/part-{{:05d}}-f36f5a53-4a77-434b-b9bc-67ed69b93fe2-c000.snappy.parquet", 30),
                     p_col("content", 200), "openbmb/Ultra-FineWeb-L3 (ODC-By-1.0; synthetic-styled web)"),
+  "ufw-l3-qa":     (shards(f"{HF}/openbmb/Ultra-FineWeb-L3/resolve/main/data/ultrafineweb_en_l3/qa/part-{{:05d}}-37dc9f21-f87f-4f43-8dd2-134424f1537a-c000.snappy.parquet", 60),
+                    p_col("content", 200), "openbmb/Ultra-FineWeb-L3 qa (Apache-2.0; synthetic Q&A-styled web)"),
+  "ufw-l3-ms":     (shards(f"{HF}/openbmb/Ultra-FineWeb-L3/resolve/main/data/ultrafineweb_en_l3/multi_style/part-{{:05d}}-f36f5a53-4a77-434b-b9bc-67ed69b93fe2-c000.snappy.parquet", 60, 30),
+                    p_col("content", 200), "openbmb/Ultra-FineWeb-L3 multi_style, shards 30+ (unused by v3pre) (Apache-2.0)"),
   "github-python": (shards("https://huggingface.co/api/datasets/codeparrot/github-code-clean/parquet/Python-all/train/{}.parquet", 16),
                     p_col("code", 100), "codeparrot/github-code-clean (per-file OSS licences, permissive subset)"),
   "cosmopedia-v2": (shards(f"{HF}/HuggingFaceTB/cosmopedia/resolve/main/data/web_samples_v2/train-{{:05d}}-of-00118.parquet", 30),
@@ -195,6 +199,8 @@ P = {  # profile: (description, {cat: weight}, [(cat, source)])
              {"general": .24, "chat": .20, "code": .18, "reasoning": .14, "tool": .14, "agentic": .10},
              [("general", "tulu3"), ("chat", "smoltalk2"), ("code", "github-python"), ("reasoning", "openthoughts3"),
               ("tool", "toolace"), ("tool", "hermes-fc"), ("agentic", "hermes-rtu")]),
+  "ufwl3-en": ("Ultra-FineWeb-L3 English, qa + multi_style at the card's token ratio", {"qa": .6, "style": .4},
+               [("qa", "ufw-l3-qa"), ("style", "ufw-l3-ms")]),
   "v3chat": ("plain chat SFT (tulu3 + smoltalk2)", {"general": .62, "chat": .38}, [("general", "tulu3"), ("chat", "smoltalk2")]),
 }
 SINGLE = {"web": ("web", "ultrafineweb"), "code": ("code", "github-python"), "math": ("math", "finemath"),
@@ -267,7 +273,7 @@ def get_source(out, cat, name, urls, parser, budget, state, save):
         except queue.Empty: break
         if it is None: break
         if it[1]: rm(it[1])
-    st["done"] = True; save(); return st
+    st["done"] = True; save(); open(path + ".done", "w").close(); return st   # .done lets `data encode ... follow=1` finish
 
 def cmd_get(spec, out, tokens):
     os.makedirs(out, exist_ok=True)
