@@ -95,6 +95,11 @@ cudalm data      <fetch|tokenizer|encode|mix|info|canon> ...
 cudalm help                                        all commands + every environment variable
 ```
 
+`cudalm lmeval` ends with the Open SLM intelligence index. Each component is normalised against chance,
+N(s, c) = 100 × (s − c) ÷ (100 − c), using acc_norm: HellaSwag (c 25), ARC = mean of ARC-Easy and ARC-Challenge (c 25),
+PIQA (c 50), ArithMark-3 (c 25, weight 0.65). Index = (HS + ARC + PIQA + 0.65 × ArithMark) ÷ 3.65. A task that wasn't
+run drops out of both sums (at least two components needed), and scores below chance count as negative.
+
 Training options are `CUDALM_*`, `QLM_*` and `NGRAM_*` environment variables (`cudalm help` lists them all).
 `cudalm new` and `cudalm train` save the ones in effect to `models\<name>.bin.env`, so later commands don't need them
 again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press Ctrl+C in the menu).

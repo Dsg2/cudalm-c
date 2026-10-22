@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-22
 
+- README.md: document new cudalm lmeval output
+- cudalm.cu: extend cmd_lmeval with acc_norm index calculation
+- cudalm.cu: add index summary to lmeval output
+
+## Unreleased - 2026-10-22
+
 - README.md: update lmeval command line and benchmark table
 - bench/lmeval_prep.py: add arcc_test.parquet and arithmark-3.jsonl sources
 - cudalm.cu: extend lmeval tasks list and usage help

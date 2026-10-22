@@ -8217,7 +8217,9 @@ static void le_unescape(char*s){ char*w=s; for(char*r=s;*r;r++){ if(*r=='\\'&&r[
 static void cmd_lmeval(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: cudalm lmeval <name|model.bin> [tasks|all] [n=all] [Tmax=1024]\n"
         "  tasks: comma list of hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark (files $CUDALM_BENCH_DIR/<task>.tsv, default dir bench)\n"
-        "         or .tsv paths; n>0 scores only the first n items of each task\n"); exit(1); }
+        "         or .tsv paths; n>0 scores only the first n items of each task\n"
+        "  ends with the Open SLM intelligence index (acc_norm, chance-normalised:\n"
+        "  (HellaSwag + mean(ARC-E,ARC-C) + PIQA + 0.65 ArithMark-3) / 3.65; missing tasks drop out, >=2 needed)\n"); exit(1); }
     g_fp8gemm=0;    /* per-tensor FP8 scales see the whole batch (padding included): scores would depend on batching */
     char path[1024]; model_path(argv[2],path,sizeof(path));
     FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
@@ -8247,6 +8249,8 @@ static void cmd_lmeval(int argc,char**argv){
     float*lp=(float*)malloc((size_t)N*4),*lg=(float*)malloc((size_t)CH_ROWS*V*4);
     printf("[lmeval] %s | Tmax %d | %d tokens per forward | tasks %s\n",argv[2],Tm,N,tl);
     char sum[16][200]; int ns=0; double t0=wall();
+    /* Open SLM intelligence index inputs (acc_norm %): hellaswag, arc_easy, arc_challenge, piqa, arithmark */
+    static const char*ixn[5]={"hellaswag","arc_easy","arc_challenge","piqa","arithmark"}; double ixs[5]; int ixh[5]={0};
     for(char*tn=tl,*tc; tn&&*tn; tn=tc){
         tc=strchr(tn,','); if(tc) *tc++=0;
         char fp[1200]; if(strstr(tn,".tsv")) snprintf(fp,sizeof fp,"%s",tn); else snprintf(fp,sizeof fp,"%s/%s.tsv",bd,tn);
@@ -8301,6 +8305,8 @@ static void cmd_lmeval(int argc,char**argv){
             int bs=0,bn=0; for(int j=1;j<nc[i];j++){ if(ll[k+j]>ll[k+bs]) bs=j; if(ll[k+j]/by[k+j]>ll[k+bn]/by[k+bn]) bn=j; }
             A+=bs==gold[i]; AN+=bn==gold[i]; CH+=1.0/nc[i]; }
         double p=A/ni,pn=AN/ni;
+        if(!greedy){ const char*b=tn+strlen(tn); while(b>tn&&b[-1]!='/'&&b[-1]!='\\') b--; size_t bl=strcspn(b,".");
+            for(int q=0;q<5;q++) if(strlen(ixn[q])==bl&&!strncmp(b,ixn[q],bl)){ ixs[q]=100*pn; ixh[q]=1; } }
         if(greedy) snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),T,wall()-tt,trunc?", truncated":"");
         else snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   (T %d, %.1fs)",tn,ni,
                       100*p,100*sqrt(p*(1-p)/ni),100*pn,100*sqrt(pn*(1-pn)/ni),100*CH/ni,T,wall()-tt);
@@ -8308,6 +8314,18 @@ static void cmd_lmeval(int argc,char**argv){
         for(int k=0;k<nq;k++) free(sq[k]); free(sq); free(ln); free(st); free(by); free(gold); free(nc); free(q0); free(ll); free(gr);
     }
     printf("\n[lmeval] summary %s (%.1fs)\n",argv[2],wall()-t0); for(int i=0;i<ns;i++) printf("%s\n",sum[i]);
+    {   /* Open SLM intelligence index: N(s,c)=100(s-c)/(100-c); (HS + ARC + PIQA + 0.65 ArithMark) / 3.65,
+         * ARC = mean(ARC-E, ARC-C) before normalising; missing components drop out of both sums (>=2 needed) */
+        double cs[4]={0},cc[4]={25,25,50,25},cw[4]={1,1,1,0.65},num=0,den=0; int ch[4]={ixh[0],ixh[1]||ixh[2],ixh[3],ixh[4]},nc=0;
+        static const char*cn[4]={"HellaSwag","ARC","PIQA","ArithMark-3"}; char line[300]; int lo=0;
+        cs[0]=ixs[0]; cs[2]=ixs[3]; cs[3]=ixs[4];
+        if(ch[1]) cs[1]=ixh[1]&&ixh[2]?(ixs[1]+ixs[2])/2:ixh[1]?ixs[1]:ixs[2];
+        for(int q=0;q<4;q++) if(ch[q]){ double v=100*(cs[q]-cc[q])/(100-cc[q]); num+=cw[q]*v; den+=cw[q]; nc++;
+            lo+=snprintf(line+lo,sizeof line-lo,"  %s %.2f",cn[q],v); }
+        if(nc>=2) printf("\n[lmeval] Open SLM intelligence index %.2f   (normalised:%s%s%s)\n",num/den,line,
+                         ch[1]&&!(ixh[1]&&ixh[2])?"; ARC from one of ARC-E/ARC-C only":"",nc<4?"; partial":"");
+        else printf("\n[lmeval] Open SLM intelligence index: needs at least 2 of HellaSwag, ARC, PIQA, ArithMark-3\n");
+    }
 }
 
 /* ===================== bench ============================================ */
