@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - 2026-10-23
+
+- Add DSCALE and DSCALE_INV definitions to k_attn_fwd_tiled
+- Add g_dsc array and k_dsc_amax/k_dsc_set functions for adaptive scale
+- Replace DSCALE_INV with g_dsc[1] in dQ/dK/dV writes
+- Replace DSCALE_INV/DSCALE_INV with g_dsc[1] in backward functions
+- Add nan_where locator for non-finite grad analysis
+
 ## Unreleased - 2026-10-22
 
 - Add "ufw-l3-qa" and "ufw-l3-ms" entries to S

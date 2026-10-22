@@ -1008,6 +1008,21 @@ __global__ void k_attn_fwd_tiled(const float*Q,const float*K,const float*V,float
  *   dKV : accumulated over t-chunks, consumes the finished dr
  * Each warp still owns its own output slot across every chunk, so all three
  * stay atomic-free; the buffers are zeroed once before the chunk loops. */
+/* fp16 attention backward: dA is scaled by DSCALE on the cast (see k_f2h below). */
+#ifndef DSCALE
+#define DSCALE     1024.0f
+#endif
+#define DSCALE_INV (1.0f/DSCALE)
+/* DSCALE is only the ceiling: before each layer's cast the scale is lowered (powers of 2) until
+ * max|dA|*scale <= 1, so large attention grads (LS-Micro, norm gains ~0.003) cannot overflow fp16
+ * into NaN dQ/dK. Normal models (max|dA| << 1e-3) keep exactly 1024. */
+__device__ float g_dsc[2]={DSCALE,DSCALE_INV}; __device__ unsigned g_dsc_amax;
+__global__ void k_dsc_amax(const float*x,size_t n){
+    float m=0.f; for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x) m=fmaxf(m,fabsf(x[i]));
+    for(int o=16;o>0;o>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,o));
+    if((threadIdx.x&31)==0) atomicMax(&g_dsc_amax,__float_as_uint(m)); }
+__global__ void k_dsc_set(void){ float m=__uint_as_float(g_dsc_amax), s=DSCALE; g_dsc_amax=0;
+    while(s>1.0f/1024 && m*s>1.0f) s*=0.5f; g_dsc[0]=s; g_dsc[1]=1.0f/s; }
 /* Drow without touching a single key.
  *
  * k_attn_bwd_dr below computes  dr_t = sum_s a_s (dA_t . v_s)  by re-walking the
@@ -1030,7 +1045,7 @@ __global__ void k_attn_drow(const float*dA,const float*O,float*Drow,
     float acc=0.f;
     for(int d=lane;d<hd;d+=WARP) acc+=da[d]*o[d];
     for(int off=16;off>0;off>>=1) acc+=__shfl_xor_sync(0xffffffff,acc,off);
-    if(lane==0) Drow[(size_t)(b*H+h)*T+t]=acc*s;
+    if(lane==0) Drow[(size_t)(b*H+h)*T+t]=acc*(s<0.f?g_dsc[0]:s);   /* s<0: the adaptive scale */
 }
 __global__ void k_attn_bwd_dr(const float*Q,const float*K,const float*V,const float*dA,
                               const float*lse,float*Drow,int s0,int s1,int win,
@@ -1145,12 +1160,10 @@ __global__ void k_attn_bwd_dkv(const float*Q,const float*K,const float*V,const f
  * scale is undone by a single multiply at the final write, with no extra launch.
  *
  * sm_75 has no tensor cores; the gain here is bandwidth, not math throughput. */
-#define DSCALE     1024.0f
-#define DSCALE_INV (1.0f/DSCALE)
 
 __global__ void k_f2h(const float*src,__half*dst,size_t n,float s){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n) dst[i]=__float2half(src[i]*s);
+    if(i<n) dst[i]=__float2half(src[i]*(s<0.f?g_dsc[0]:s));
 }
 /* forward RoPE straight into the fp16 attention copy; wb: also write the fp32 back */
 __global__ void k_rope_h(float*buf,__half*dst,const float*cosb,const float*sinb,int N,int nh,int hd,int hf,int T,int wb){
@@ -1217,7 +1230,7 @@ __global__ void k_attn_bwd_dq_h(const __half*Q,const __half*K,const __half*V,con
         a0+=ds*kv2.x; a1+=ds*kv2.y;
     }
     float*dq=dQ+(size_t)(b*T+t)*D+h*hd;
-    if(lane<h2){ dq[2*lane]+=a0*DSCALE_INV; dq[2*lane+1]+=a1*DSCALE_INV; }
+    if(lane<h2){ dq[2*lane]+=a0*g_dsc[1]; dq[2*lane+1]+=a1*g_dsc[1]; }
 }
 __global__ void k_attn_bwd_dkv_h(const __half*Q,const __half*K,const __half*V,const __half*dA,
                                  const float*lse,const float*Drow,float*dK,float*dV,int t0,int t1,int win,
@@ -1245,8 +1258,8 @@ __global__ void k_attn_bwd_dkv_h(const __half*Q,const __half*K,const __half*V,co
             dv0+=p*gv.x; dv1+=p*gv.y; dk0+=ds*qv.x; dk1+=ds*qv.y;
         } }
     float*dkp=dK+(size_t)(b*T+s)*KD+kvh*hd,*dvp=dV+(size_t)(b*T+s)*KD+kvh*hd;
-    if(lane<h2){ dkp[2*lane]+=dk0*DSCALE_INV; dkp[2*lane+1]+=dk1*DSCALE_INV;
-                 dvp[2*lane]+=dv0*DSCALE_INV; dvp[2*lane+1]+=dv1*DSCALE_INV; }
+    if(lane<h2){ dkp[2*lane]+=dk0*g_dsc[1]; dkp[2*lane+1]+=dk1*g_dsc[1];
+                 dvp[2*lane]+=dv0*g_dsc[1]; dvp[2*lane+1]+=dv1*g_dsc[1]; }
 }
 
 /* ---- lane-per-query flash tile -------------------------------------------
@@ -1418,7 +1431,7 @@ void k_attn_bwd_dq_lane(const __half*Q,const __half*K,const __half*V,const __hal
     if(!act) return;
     float*dq=dQ+(size_t)(b*T+t)*D+h*HD;
     #pragma unroll
-    for(int d=0;d<HD;d++) dq[d]+=acc[d]*DSCALE_INV;
+    for(int d=0;d<HD;d++) dq[d]+=acc[d]*g_dsc[1];
 }
 /* dK/dV under the same mapping, with the roles swapped: a thread owns a KEY and
  * holds k, v and both accumulators, while q and dA become the broadcast operands
@@ -1477,7 +1490,7 @@ void k_attn_bwd_dkv_lane(const __half*Q,const __half*K,const __half*V,const __ha
     if(!act) return;
     float*dkp=dK+(size_t)(b*T+s)*KD+kvh*HD,*dvp=dV+(size_t)(b*T+s)*KD+kvh*HD;
     #pragma unroll
-    for(int d=0;d<HD;d++){ dkp[d]+=dk[d]*DSCALE_INV; dvp[d]+=dv[d]*DSCALE_INV; }
+    for(int d=0;d<HD;d++){ dkp[d]+=dk[d]*g_dsc[1]; dvp[d]+=dv[d]*g_dsc[1]; }
 }
 /* Tensor-core dKV (FA2-style). One block owns TC_BK=64 keys of one (b,kvh);
  * each of the four warps owns 16 of them and keeps its K/V rows as wmma A
@@ -1589,13 +1602,13 @@ void k_attn_bwd_dkv_tc(const __half*Q,const __half*K,const __half*V,const __half
     for(int f=0;f<NF;f++) wmma::store_matrix_sync(sO+16*f,ak[f],HD,wmma::mem_row_major);
     __syncwarp();
     for(int e=ln;e<16*HD;e+=32){ int r=e/HD, d=e-r*HD, s=k0+r;
-        if(s<T) dK[(size_t)(b*T+s)*KD+kvh*HD+d]+=sO[e]*(DSCALE_INV/TC_DSS); }
+        if(s<T) dK[(size_t)(b*T+s)*KD+kvh*HD+d]+=sO[e]*(g_dsc[1]/TC_DSS); }
     __syncwarp();
     #pragma unroll
     for(int f=0;f<NF;f++) wmma::store_matrix_sync(sO+16*f,av[f],HD,wmma::mem_row_major);
     __syncwarp();
     for(int e=ln;e<16*HD;e+=32){ int r=e/HD, d=e-r*HD, s=k0+r;
-        if(s<T) dV[(size_t)(b*T+s)*KD+kvh*HD+d]+=sO[e]*DSCALE_INV; }
+        if(s<T) dV[(size_t)(b*T+s)*KD+kvh*HD+d]+=sO[e]*g_dsc[1]; }
 }
 /* 0 = no instantiation (hd not 16/32/64, or rows not 16-byte aligned) */
 static int attn_bwd_dkv_tc(const __half*Q,const __half*K,const __half*V,const __half*dA,
@@ -1704,7 +1717,7 @@ void k_attn_bwd_dq_tc(const __half*Q,const __half*K,const __half*V,const __half*
     for(int f=0;f<NF;f++) wmma::store_matrix_sync(sO+16*f,aq[f],HD,wmma::mem_row_major);
     __syncwarp();
     for(int e=ln;e<16*HD;e+=32){ int r=e/HD, d=e-r*HD, t=q0+r;
-        if(t<T) dQ[(size_t)(b*T+t)*D+h*HD+d]+=sO[e]*(DSCALE_INV/TC_DSS); }
+        if(t<T) dQ[(size_t)(b*T+t)*D+h*HD+d]+=sO[e]*(g_dsc[1]/TC_DSS); }
 }
 static int attn_bwd_dq_tc(const __half*Q,const __half*K,const __half*V,const __half*dA,
                           const float*lse,const float*Drow,float*dQ,int win,
@@ -2007,7 +2020,7 @@ void k_attn_bwd_dq_fa(const __half*Q,const __half*K,const __half*V,const __half*
                 fa_mma(dq[2*p],xa,bk); fa_mma(dq[2*p+1],xa,bk+2); }
         }
     }
-    const float os=DSCALE_INV/TC_DSS;
+    const float os=g_dsc[1]/TC_DSS;
     if(tA<T){ float*op=dQ+(size_t)(b*T+tA)*D+h*HD+2*tq;
         #pragma unroll
         for(int n=0;n<ND;n++){ float2 v=*(float2*)(op+8*n); v.x+=dq[n][0]*os; v.y+=dq[n][1]*os; *(float2*)(op+8*n)=v; } }
@@ -2093,7 +2106,7 @@ void k_attn_bwd_dkv_fa(const __half*Q,const __half*K,const __half*V,const __half
                 fa_mma(dk[2*p],xa,bq); fa_mma(dk[2*p+1],xa,bq+2); }
         }
       } }
-    const float ok_=DSCALE_INV/TC_DSS, ov=DSCALE_INV;
+    const float ok_=g_dsc[1]/TC_DSS, ov=g_dsc[1];
     #pragma unroll
     for(int r=0;r<2;r++){ int key=r?kB:kA; if(key>=T) continue;
         float*pk=dK+(size_t)(b*T+key)*KD+kvh*HD+2*tq, *pv=dV+(size_t)(b*T+key)*KD+kvh*HD+2*tq;
@@ -2220,7 +2233,7 @@ void k_attn_bwd_dkv_sub(const __half*Q,const __half*K,const __half*V,const __hal
     float*dkp=dK+(size_t)(b*T+s)*KD+kvh*HD+sub*HS;
     float*dvp=dV+(size_t)(b*T+s)*KD+kvh*HD+sub*HS;
     #pragma unroll
-    for(int d=0;d<HS;d++){ dkp[d]+=dk[d]*DSCALE_INV; dvp[d]+=dv[d]*DSCALE_INV; }
+    for(int d=0;d<HS;d++){ dkp[d]+=dk[d]*g_dsc[1]; dvp[d]+=dv[d]*g_dsc[1]; }
 }
 
 /* returns 0 if this head dim has no instantiation, so the caller can fall back */
@@ -5474,10 +5487,12 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
           /* Q/K/V half copies were made in forward and are still valid; only dA
            * is new here. DSCALE keeps it off fp16's denormal floor and is undone
            * at the dQ/dK/dV writes. */
-          if(g_fp16) e_f2h(a->datt,a->datt16,(size_t)N*D,DSCALE);
+#ifndef CUDALM_CPU
+          if(g_fp16){ KL(k_dsc_amax,64,256)(a->datt,(size_t)N*D); KL(k_dsc_set,1,1)(); e_f2h(a->datt,a->datt16,(size_t)N*D,-1.0f); }
+#endif
           /* one dot product per query -- no window walk, no memset (it writes) */
           KL(k_attn_drow,B*gC.H*T,WARP)(a->datt,a->att[l],a->drow,
-              B,T,gC.H,gC.hd,gC.D, g_fp16?DSCALE:1.0f);
+              B,T,gC.H,gC.hd,gC.D, g_fp16?-1.0f:1.0f);
           kchk("bwd attn dr",l);
 #ifdef CUDALM_CPU
           cpu_attn_bwd(a->qh[l],a->kh[l],a->vh[l],a->datt,a->lse[l],a->drow,a->dq,a->dk,a->dv,
@@ -7305,6 +7320,24 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
     "python3"; }
 #endif
 #include "data.cuh"
+/* [nan] locator: per tensor, non-finite grad count, max|G| and max|P| (first few events only) */
+static void nan_where(const float*P,const float*G,const Off*o,size_t np){
+    static int calls; if(++calls>3) return;
+    typedef struct { char n[16]; size_t off; } T; T t[64*10+20]; int k=0;
+    const char*nm[10]={"an1","wq","wk","wv","wo","an2","wr","w1","w3","w2"};
+    const size_t*ar[10]={o->an1,o->wq,o->wk,o->wv,o->wo,o->an2,o->wr,o->w1,o->w3,o->w2};
+    snprintf(t[k].n,16,"emb"); t[k++].off=o->emb;
+    for(int l=0;l<gC.L;l++) for(int j=0;j<10;j++) if(ar[j][l]){ snprintf(t[k].n,16,"L%d.%s",l,nm[j]); t[k++].off=ar[j][l]; }
+    if(o->nf){ snprintf(t[k].n,16,"nf"); t[k++].off=o->nf; }
+    for(int i=0;i<k;i++) for(int j=i+1;j<k;j++) if(t[j].off<t[i].off){ T x=t[i]; t[i]=t[j]; t[j]=x; }
+    float*g=(float*)malloc(np*4),*p=(float*)malloc(np*4);
+    ck(cudaMemcpy(g,G,np*4,cudaMemcpyDeviceToHost),"nan G"); ck(cudaMemcpy(p,P,np*4,cudaMemcpyDeviceToHost),"nan P");
+    for(int i=0;i<k;i++){ size_t a=t[i].off,b=i+1<k?t[i+1].off:np; size_t bad=0; float mg=0,mp=0;
+        for(size_t x=a;x<b;x++){ if(!isfinite(g[x])) bad++; else if(fabsf(g[x])>mg) mg=fabsf(g[x]); if(fabsf(p[x])>mp) mp=fabsf(p[x]); }
+        if(bad||i==0||!strcmp(t[i].n,"nf")||strstr(t[i].n,"an")) printf("  [nan] %-9s n=%-8zu nonfinite=%-7zu max|G|=%-10.3g max|P|=%.3g\n",t[i].n,b-a,bad,mg,mp); }
+    if(g_side_gs){ float h[64*(1+SIDE_MAX)]; ck(cudaMemcpy(h,g_side_gs-64*(1+SIDE_MAX),sizeof h,cudaMemcpyDeviceToHost),"nan side");
+        for(int s=0;s<=SIDE_MAX;s++){ double q=0; for(int i=0;i<64;i++) q+=h[64*s+i]; if(q!=0) printf("  [nan] %s sq-sum %g\n",s?"side":"main G",q); } }
+    fflush(stdout); free(g); free(p); }
 static void cmd_train(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm train <name> <data_dir> [epochs]\n"
         "  <name> must already exist (create with: cudalm new <name> <preset>)\n"
@@ -7750,6 +7783,7 @@ static void cmd_train(int argc,char**argv){
         } else {
             printf("[nan] iter %d grad norm %g - %s (%d in a row)\n",it,g_gn,
                    g_fused?"side-parameter updates skipped (fused layers already stepped)":"step skipped",++nskip); fflush(stdout);
+            if(!g_fused) nan_where(P,G,&o,np);
             if(nskip>=20){ printf("[nan] %d non-finite steps in a row - aborting, last ckpt is intact\n",nskip); fflush(stdout); exit(3); }
         }
         if(it%20==0){ ck(cudaDeviceSynchronize(),"sync");
