@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-22
 
+- Change g_asn_ev initialization from NULL to 0 in moe_perm
+- Update cmd_bench to print "system RAM" or "VRAM" instead of hardcoded value
+- Add GPU build-only message for "decheck" command in main
+
+## Unreleased - 2026-10-22
+
 Add download logic for missing task files in cudalm lmeval
 Add lmeval_prep.py download helper for missing benchmarks
 Add grow_sidecars() to copy model config and sidecars

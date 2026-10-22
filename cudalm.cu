@@ -3241,7 +3241,7 @@ static void moe_perm(GA*a,int l,int N,int E){
  * needs no routing) is queued behind it, so the GPU has work while the host waits. */
 static int g_moe_ovl=1, g_sh_done=0;
 static void (*g_ovl_fn)(GA*,int,float*,int)=NULL;
-static cudaEvent_t g_asn_ev=NULL;
+static cudaEvent_t g_asn_ev=0;
 static void moe_perm_all(GA*a,int l,int N,int E,int Km,int K,int sb,float*out){
     if(g_ovl_fn&&out){
         if(!g_asn_ev) ck(cudaEventCreateWithFlags(&g_asn_ev,cudaEventDisableTiming),"asn ev");
@@ -8351,8 +8351,12 @@ static void cmd_bench(int argc,char**argv){
     double toks=(double)N*iters;
     double flops=6.0*np*toks;
     size_t fr=0,tt=0; cudaMemGetInfo(&fr,&tt);
-    printf("[bench] %d iters in %.2fs -> %.1f ms/step | %.0f tok/s | ~%.2f TFLOP/s | VRAM used %.2f GB\n",
-           iters,dt,dt*1000/iters,toks/dt,flops/dt/1e12,(tt-fr)/1e9);
+    printf("[bench] %d iters in %.2fs -> %.1f ms/step | %.0f tok/s | ~%.2f TFLOP/s | %s used %.2f GB\n",
+#ifdef CUDALM_CPU
+           iters,dt,dt*1000/iters,toks/dt,flops/dt/1e12,"system RAM",(tt-fr)/1e9);
+#else
+           iters,dt,dt*1000/iters,toks/dt,flops/dt/1e12,"VRAM",(tt-fr)/1e9);
+#endif
     prof_report();
 }
 
@@ -9641,6 +9645,8 @@ int main(int argc,char**argv){
 #endif
 #ifndef CUDALM_CPU
     if(!strcmp(argv[1],"decheck"))  { return cmd_decheck(argc,argv); }
+#else
+    if(!strcmp(argv[1],"decheck"))  { fprintf(stderr,"decheck: GPU build only (it tests the KV-cache decoder; the CPU build recomputes the full forward)\n"); return 1; }
 #endif
     fprintf(stderr,"unknown command '%s'\n",argv[1]); return 1;
 }
