@@ -43,7 +43,7 @@ def conv_turns(convs, tools=None, system=None):
 
 # ------------------------------ readers ------------------------------------
 def iter_jsonl(p):
-    with open(p, encoding="utf-8", errors="ignore") as f:
+    with open(p, encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -51,7 +51,7 @@ def iter_jsonl(p):
                 except json.JSONDecodeError: pass
 
 def iter_json_array(p):
-    raw = open(p, encoding="utf-8", errors="ignore").read()
+    raw = open(p, encoding="utf-8-sig", errors="ignore").read()
     dec = json.JSONDecoder(); i = raw.find("[") + 1; n = len(raw)
     while i < n:
         while i < n and raw[i] in " \t\r\n,": i += 1
@@ -69,7 +69,7 @@ def iter_rows(p, cols=None):
         for b in pf.iter_batches(batch_size=256, columns=have):
             yield from b.to_pylist()
     else:
-        with open(p, encoding="utf-8", errors="ignore") as f: head = f.read(4096).lstrip()
+        with open(p, encoding="utf-8-sig", errors="ignore") as f: head = f.read(4096).lstrip()
         yield from (iter_json_array(p) if head.startswith("[") else iter_jsonl(p))
 
 def auto_doc(r, minlen=1):

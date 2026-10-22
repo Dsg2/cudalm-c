@@ -6694,6 +6694,7 @@ static void dec_move(Dec*d,int s,int t){
 /* decheck <model> [n=200] [k=40]: decode logits vs the full forward, 2 slots with different prefixes */
 static int cmd_decheck(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: cudalm decheck <model> [n=200] [k=40]\n"); return 1; }
+    g_fp8gemm=0;    /* batch-wide FP8 scales would make the full-forward reference differ from the decoder by up to ~3.6 logits */
     char path[1024]; model_path(argv[2],path,sizeof(path)); FILE*e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
     Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk); gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
     size_t np=param_count(&c); float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P"); rope_tables(&c);
@@ -6733,7 +6734,8 @@ static int* tok_encode_whole(const Tok*tk,const char*s,int*out){   /* pre-18b en
 static int cmd_tokcheck(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm tokcheck <model> <tokens.u16> [maxdocs] [old]\n"); return 1; }
     int*(*enc)(const Tok*,const char*,int*)=argc>5&&!strcmp(argv[5],"old")?tok_encode_whole:tok_encode;
-    Cfg c; Tok*tk=NULL; float*Ph=model_load_full(argv[2],&c,&tk); free(Ph);
+    char mp[1024]; model_resolve(argv[2],mp,sizeof mp);
+    Cfg c; Tok*tk=NULL; float*Ph=model_load_full(mp,&c,&tk); free(Ph);
     size_t len; uint8_t*b=read_file(argv[3],&len); if(!b){ fprintf(stderr,"cannot open %s\n",argv[3]); return 1; }
     const uint16_t*t=(const uint16_t*)b; size_t n=len/2; int maxd=argc>4?atoi(argv[4]):1000000, docs=0, bad=0; size_t toks=0;
     printf("[tokcheck] %d special tokens\n",tk->nsp);
@@ -7284,7 +7286,7 @@ static int run_cmd(const char*cmd){
 #ifdef _WIN32
     static char cl[8192]; snprintf(cl,sizeof cl,"%s",cmd);
     STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si; DWORD code=1;
-    if(!CreateProcessA(NULL,cl,NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){ fprintf(stderr,"cannot start: %s (%lu) - set CUDALM_PYTHON\n",cmd,GetLastError()); return 1; }
+    if(!CreateProcessA(NULL,cl,NULL,NULL,TRUE,0,NULL,NULL,&si,&pi)){ fprintf(stderr,"cannot start: %s (%lu) - set CUDALM_PYTHON\n",cmd,GetLastError()); return 1; }
     WaitForSingleObject(pi.hProcess,INFINITE); GetExitCodeProcess(pi.hProcess,&code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return (int)code;
 #else
@@ -7300,10 +7302,10 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
 #include "data.cuh"
 static void cmd_train(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm train <name> <data_dir> [epochs]\n"
-        "  <name> must already exist (create with: tinylm new <name> <preset>)\n"); exit(1); }
+        "  <name> must already exist (create with: cudalm new <name> <preset>)\n"); exit(1); }
     const char*name=argv[2],*ddir=argv[3]; float epochs=argc>4?(float)atof(argv[4]):1.0f;
     char mpath[1024],optpath[1100]; model_path(name,mpath,sizeof(mpath)); snprintf(optpath,sizeof(optpath),"%s.opt",mpath);
-    FILE*ex=fopen(mpath,"rb"); if(!ex){ fprintf(stderr,"model '%s' not found.\n  create it (CPU): tinylm new %s <preset>\n",mpath,name); exit(1);} fclose(ex);
+    FILE*ex=fopen(mpath,"rb"); if(!ex){ fprintf(stderr,"model '%s' not found.\n  create it: cudalm new %s <preset>\n",mpath,name); exit(1);} fclose(ex);
     char p[1024]; snprintf(p,sizeof(p),"%s/tokenizer.bin",ddir); size_t tlz; uint8_t*tok_blob=read_file(p,&tlz);
     if(!tok_blob){fprintf(stderr,"no %s\n",p);exit(1);} int tok_len=(int)tlz;
     Tok*dtk=tok_parse(tok_blob,tlz,0); int dataV=dtk->V,dataEot=dtk->eot;
@@ -8224,7 +8226,18 @@ static void cmd_lmeval(int argc,char**argv){
     char tl[1024]; snprintf(tl,sizeof tl,"%s",argc>3&&strcmp(argv[3],"all")?argv[3]:"hellaswag,arc_easy,piqa,lambada");
     int nmax=argc>4?atoi(argv[4]):0, Tm=64, Tq=argc>5?atoi(argv[5]):1024; if(Tq>c.T) Tq=c.T;
     while(Tm*2<=Tq) Tm*=2;
-    const char*bd=getenv("CUDALM_BENCH_DIR"); if(!bd) bd="bench";
+    char bdd[1100]; const char*bd=getenv("CUDALM_BENCH_DIR");
+    if(!bd||!*bd){ snprintf(bdd,sizeof bdd,"%s" PSEP "bench",exe_dir()); bd=bdd; }
+    for(char*tn=tl;*tn;){ size_t k=strcspn(tn,","); char fp[1200];       /* missing task files: download + convert once */
+        snprintf(fp,sizeof fp,"%s" PSEP "%.*s.tsv",bd,(int)k,tn);
+        if(!strstr(fp+strlen(bd),".tsv.tsv") && !d_exists(fp)){ char sp[1200],cl[3000];
+            snprintf(sp,sizeof sp,"%s" PSEP "bench" PSEP "lmeval_prep.py",exe_dir());
+            if(!d_exists(sp)) snprintf(sp,sizeof sp,"%s" PSEP "lmeval_prep.py",exe_dir());
+            snprintf(cl,sizeof cl,"%s -u \"%s\" \"%s\"",py_cmd(),sp,bd);
+            printf("[lmeval] %s missing - fetching the benchmark files\n",fp); fflush(stdout);
+            if(run_cmd(cl)) fprintf(stderr,"[lmeval] lmeval_prep.py failed (needs python + pyarrow; CUDALM_PYTHON picks the interpreter)\n");
+            break; }
+        tn+=k; if(*tn) tn++; }
     int N=Tm>16384?Tm:16384, D=c.D, V=c.V;
     c.T=Tm; cfg_derive(&c); gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
     size_t np=param_count(&c);
@@ -8366,6 +8379,36 @@ static void cmd_bench(int argc,char**argv){
  * The correctness gate is exact and cheap: run `eval` before and after. For a
  * layers-only grow at noise 0 the val loss must come out IDENTICAL. If it does
  * not, the surgery is wrong -- do not spend GPU hours finding that out later. */
+/* grow: carry the model config and the sidecars eval/run need (.env, .opt.ng, .opt.t1). Per-layer blocks of
+ * the new layer l come from its source layer src[l] (inserted layers are zero-output, so any copy is exact);
+ * layer indices (ngram/engram injection points) move to the source layer's new index. */
+static void grow_sidecars(const char*in,const char*out,const int*src,const int*ident,int Lold,int Lnew,int D){
+    int map[64]; for(int l=0;l<Lnew;l++) if(!ident[l]) map[src[l]]=l;
+    char a[1200],b[1200]; size_t n; uint8_t*d;
+    snprintf(a,sizeof a,"%s.env",in); snprintf(b,sizeof b,"%s.env",out);
+    if((d=read_file(a,&n))){ FILE*f=fopen(b,"wb"); d=(uint8_t*)realloc(d,n+1); d[n]=0;
+        for(char*l=(char*)d,*e;l&&*l;l=e){ e=strchr(l,'\n'); if(e) *e++=0; l[strcspn(l,"\r")]=0;
+            if(!strncmp(l,"NGRAM_LAYER=",12)){ int v=atoi(l+12); fprintf(f,"NGRAM_LAYER=%d\n",v>=0&&v<Lold?map[v]:v); }
+            else if(!strncmp(l,"NGRAM_LAYERS=",13)){ fprintf(f,"NGRAM_LAYERS="); int k=0;
+                for(char*t=l+13;*t;){ int v=atoi(t); fprintf(f,"%s%d",k++?",":"",v>=0&&v<Lold?map[v]:v); t+=strcspn(t,","); if(*t) t++; }
+                fprintf(f,"\n"); }
+            else fprintf(f,"%s\n",l); }
+        fclose(f); free(d); printf("[grow] config %s -> %s\n",a,b); }
+    snprintf(a,sizeof a,"%s.opt.ng",in); snprintf(b,sizeof b,"%s.opt.ng",out);
+    if((d=read_file(a,&n))){ if(n>=4+24*4&&!memcmp(d,"NGR2",4)){ int*h=(int*)(d+4); for(int i=0;i<h[10]&&i<8;i++) if(h[11+i]<Lold) h[11+i]=map[h[11+i]]; }
+        FILE*f=fopen(b,"wb"); fwrite(d,1,n,f); fclose(f); free(d); printf("[grow] memory table %s -> %s\n",a,b); }
+    snprintf(a,sizeof a,"%s.opt.t1",in); snprintf(b,sizeof b,"%s.opt.t1",out);
+    if((d=read_file(a,&n))){ int*h=(int*)(d+4); size_t o=4+9*4; FILE*f=fopen(b,"wb");
+        int hn[9]; memcpy(hn,h,36); hn[1]=Lnew; if(h[7]>=0&&h[7]<Lold) hn[7]=map[h[7]];
+        fwrite(d,1,4,f); fwrite(hn,4,9,f);
+        if(h[0]) for(int part=0;part<3;part++){ size_t per=(size_t)D*D*(part?2:4);   /* Wg fp32, then M, V 16-bit */
+            for(int l=0;l<Lnew;l++) fwrite(d+o+(size_t)src[l]*per,1,per,f); o+=(size_t)Lold*per; }
+        if(h[3]){ size_t w=(size_t)h[4]*D*8; fwrite(d+o,1,w,f); o+=w; }                /* ngram Wk(+M,V): no layers */
+        if(h[5]){ size_t per=(size_t)h[5]*4; for(int l=0;l<Lnew;l++) fwrite(d+o+(size_t)src[l]*per,1,per,f); o+=(size_t)Lold*per; }
+        fclose(f); printf("[grow] side weights %s -> %s%s\n",a,b,o==n?"":"  (SIZE MISMATCH - check it)"); free(d); }
+    snprintf(a,sizeof a,"%s.opt.x1",in);
+    if(d_exists(a)) printf("[grow] note: %s (canon/shared side params) is not carried over\n",a);
+}
 static int cmd_grow(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
         "usage: cudalm grow <in|name> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
@@ -8463,6 +8506,7 @@ static int cmd_grow(int argc,char**argv){
         free(raw);
     }
 
+    grow_sidecars(inpath,out,src,ident,Lold,Lnew,D);
     int addF = F1-F0;
     printf("[grow] %s -> %s\n", inpath, out);
     printf("[grow] layers %d -> %d  (%d inserted, zero-init identity)\n", Lold,Lnew,add);
@@ -8538,7 +8582,7 @@ static int cmd_quantize(int argc,char**argv){
     fwrite(q,1,qlen,f);
     fwrite(&tl,4,1,f); if(tl>0&&blob) fwrite(blob,1,tl,f);
     fclose(f);
-    for(int k=0;k<2;k++){ const char*sx=k?".opt.t1":".opt.ng"; char si[1100],so[1100]; size_t sl;
+    for(int k=0;k<3;k++){ const char*sx=k==2?".env":k?".opt.t1":".opt.ng"; char si[1100],so[1100]; size_t sl;   /* .env: the model config */
         snprintf(si,sizeof si,"%s%s",inpath,sx); snprintf(so,sizeof so,"%s%s",out,sx);
         uint8_t*sb=read_file(si,&sl); if(!sb) continue;
         FILE*g=fopen(so,"wb"); if(g){ fwrite(sb,1,sl,g); fclose(g); printf("[quantize] sidecar %s -> %s (%.1f MB)\n",si,so,sl/1e6); }
@@ -9475,6 +9519,7 @@ static void cmd_selftest(void){
 #include "tui.cuh"
 
 int main(int argc,char**argv){
+    if(getenv("LMTUI_CHILD")) setvbuf(stdout,NULL,_IONBF,0);     /* the TUI pipes our output: keep it live */
     if(argc>2 && strcmp(argv[1],"new") && strcmp(argv[1],"bench") && strcmp(argv[1],"data")) side_apply(argv[2]);   /* before any env is read */
 #ifdef _WIN32
     if(argc>1 && !strcmp(argv[1],"data")) return cmd_data(argc,argv);
@@ -9569,6 +9614,8 @@ int main(int argc,char**argv){
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
         "  cudalm gguf     <name> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]\n"
         "  cudalm qlmcheck <name> [group]\n"
+        "  cudalm decheck  <name> [n=200] [k=40]   (decoder vs full forward)\n"
+        "  cudalm tokcheck <name> <tokens.u16> [maxdocs] [old]\n"
         "  cudalm info     <name>   (config + total / ngram-engram / active params)\n"
         "  cudalm selftest\n"
         "  cudalm data     <fetch|tokenizer|encode|mix|info|canon> ...  (tokenizer + corpus tools)\n"
@@ -9589,6 +9636,9 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"qlmcheck")) { return cmd_qlmcheck(argc,argv); }
     if(!strcmp(argv[1],"info"))     { return cmd_info(argc,argv); }
     if(!strcmp(argv[1],"tokcheck")) { return cmd_tokcheck(argc,argv); }
+#ifdef _WIN32
+    if(!strcmp(argv[1],"tuicheck")) { return tui_check(argc>2?argv[2]:NULL); }
+#endif
 #ifndef CUDALM_CPU
     if(!strcmp(argv[1],"decheck"))  { return cmd_decheck(argc,argv); }
 #endif

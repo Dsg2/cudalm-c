@@ -99,6 +99,10 @@ Training options are `CUDALM_*`, `QLM_*` and `NGRAM_*` environment variables (`c
 `cudalm new` and `cudalm train` save the ones in effect to `models\<name>.bin.env`, so later commands don't need them
 again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press Ctrl+C in the menu).
 
+In the menu every command is a form (required fields are checked before Run). Its output is shown live and also
+saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the input for `bench\judgerun.bat`. Diagnostics
+(selftest, decode / tokenizer / QLM checks) have their own submenu.
+
 ### Data
 
 - **Corpus names:** bare names resolve under the data roots: `<exe>\data`, `<exe>\prep\data`, and any extra folders
@@ -141,7 +145,7 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 | `runs\` | Reference recipe: `s8w2env.bat` (model env), `pretrain.bat`, `sft.bat` (chat SFT continuing a base model) |
 | `bench\chatbench.txt`, `chatbench.bat`, `bench\chatbench_v2.txt` | Chat benchmark: 118 multiple-choice + 24 open-generation prompts (v2 expanded) |
 | `bench\judge.c`, `judgerun.bat` | Coherence judge: scores chatbench replies with any instruct GGUF via llama-server (`JUDGE_GGUF`, `LLAMA_SERVER`) |
-| `bench\lmeval_prep.py` | Converts HellaSwag (val), ARC-Easy (test), PIQA (val) and LAMBADA (OpenAI test) into the `cudalm lmeval` .tsv files (lm-eval-harness prompts); `cudalm lmeval` reads them from `CUDALM_BENCH_DIR` (default `bench`) |
+| `bench\lmeval_prep.py` | Converts HellaSwag (val), ARC-Easy (test), PIQA (val) and LAMBADA (OpenAI test) into the `cudalm lmeval` .tsv files (lm-eval-harness prompts); `cudalm lmeval` reads them from `CUDALM_BENCH_DIR` (default `<exe dir>\bench`) and runs it to download + convert them when a task file is missing |
 | `bench\gemmbench.cu` | MoE expert-GEMM micro-benchmark |
 | `teach\teachgen.c`, `teachrun.bat` | Synthetic teacher data from llama-server instances (`TEACHER_GGUF`, `LLAMA_SERVER`) |
 | `teach\teachtok.c` | Teacher jsonl → train/val token bins with the model's tokenizer (special tokens matched literally) |

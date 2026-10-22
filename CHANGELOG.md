@@ -2,6 +2,63 @@
 
 ## Unreleased - 2026-10-22
 
+Add download logic for missing task files in cudalm lmeval
+Add lmeval_prep.py download helper for missing benchmarks
+Add grow_sidecars() to copy model config and sidecars
+Add new lmeval command with missing-file detection
+Add new tui.cuh commands for lmeval and diagnostics
+Add new cudalm decheck and tokcheck commands
+Add new cudalm quantize option for .env files
+Add new cudalm data command for tokenizer and corpus tools
+Add new cudalm selftest child support
+Add utf-8-sig handling in prep/fetch.py readers
+Add new cudalm lmeval_prep.py usage and download logic
+Add new cudalm lmeval_prep.py benchmark file detection
+Add new cudalm lmeval_prep.py missing-file handling
+Add new cudalm lmeval_prep.py run logic
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file conversion
+Add new cudalm lmeval_prep.py benchmark file download
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py benchmark file handling
+Add new cudalm lmeval_prep.py benchmark file fetching
+Add new cudalm lmeval_prep.py
+
+## Unreleased - 2026-10-22
+
 - Add cudalm lmeval command to README.md
 - Create bench/lmeval_prep.py to convert HellaSwag, ARC-Easy, PIQA and LAMBADA parquet/jsonl files into cudalm lmeval .tsv files
 - Add cmd_lmeval function to cudalm.cu with zero-shot lm-eval-harness prompt handling

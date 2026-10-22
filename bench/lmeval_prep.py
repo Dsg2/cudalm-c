@@ -1,9 +1,25 @@
-# Convert raw benchmark files into cudalm lmeval .tsv (prompt formats follow lm-eval-harness).
+# Download (if missing) and convert the lmeval benchmarks into cudalm lmeval .tsv files
+# (prompt formats follow lm-eval-harness). Usage: python lmeval_prep.py <bench_dir>
 # line: gold \t context \t cont0 \t cont1 ...   (one cont = greedy/ppl task); \n,\t,\\ escaped
-import json, re, sys, os
+import json, re, sys, os, urllib.request
 import pyarrow.parquet as pq
 
 d = sys.argv[1] if len(sys.argv) > 1 else "."
+os.makedirs(d, exist_ok=True)
+SRC = {
+    "hs_val.parquet": "https://huggingface.co/datasets/Rowan/hellaswag/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet",
+    "arce_test.parquet": "https://huggingface.co/datasets/allenai/ai2_arc/resolve/main/ARC-Easy/test-00000-of-00001.parquet",
+    "piqa_valid.jsonl": "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid.jsonl",
+    "piqa_valid-labels.lst": "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid-labels.lst",
+    "lambada_test.jsonl": "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl",
+}
+for name, url in SRC.items():
+    p = os.path.join(d, name)
+    if not os.path.exists(p):
+        print("download", url, flush=True)
+        urllib.request.urlretrieve(url, p + ".part")
+        os.replace(p + ".part", p)
+
 esc = lambda s: s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
 def out(name, rows):
     with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as f:

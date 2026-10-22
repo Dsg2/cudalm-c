@@ -6,17 +6,18 @@
  * (with the rest of the environment) as the model config models\<name>.bin.env.
  * The child runs in its own process group. Ctrl+C during Train writes models\<name>.bin.stop (clean save+exit at
  * the next 20-iter check -- never a hard kill of a CUDA process); for other commands it is forwarded as Ctrl+Break,
- * i.e. what plain CLI Ctrl+C does. Working dir is set to the exe dir. */
+ * i.e. what plain CLI Ctrl+C does. Working dir is set to the exe dir. The child's output is shown live and
+ * also saved to logs\<command>-<model>-<time>.log. */
 #ifdef _WIN32
 #include <conio.h>
 
-enum { F_TEXT, F_MODEL, F_DATA, F_FILE, F_CHOICE, F_DIR, F_PATH, F_TOKD, F_OPT, F_ENV, F_MEM };
-/* arg: choices "a|b" (F_CHOICE), the --flag (F_OPT) or the env var (F_ENV).
+enum { F_TEXT, F_MODEL, F_DATA, F_FILE, F_CHOICE, F_DIR, F_PATH, F_TOKD, F_OPT, F_ENV, F_MEM, F_FLAG };
+/* arg: choices "a|b" (F_CHOICE), the --flag (F_OPT, F_FLAG = valueless, passed when 1) or the env var (F_ENV).
  * vis: 0 always, 1 ngram only, 2 engram only, 3 any memory. ext: "a|b" choices, a file glob, or F_PATH suffixes ".a;.b".
  * F_DATA = corpus picker, F_TOKD = tokenizer/corpus picker, F_DIR / F_PATH = folder / file-or-folder browser. */
 typedef struct { const char*label,*def; int kind; const char*arg; int vis; const char*ext; const char*help; } TFld;   /* help: '\n' = next line */
 #define T_NF 26
-typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int grp; } TCmd;   /* run: help on [ Run ]; grp 1 = Data tools */
+typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int grp; } TCmd;   /* run: help on [ Run ]; grp 1 = Data tools, 2 = Diagnostics */
 #define T_TEXTIN ".jsonl;.json;.txt"
 #define T_PRESETS "nano|micro|m1|m3|m6|m8|m16|m32|m70|m50|m64e|m220e|a8m|a8m9|s8x|s8w"
 static const TCmd T_CMDS[]={
@@ -24,9 +25,19 @@ static const TCmd T_CMDS[]={
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT}}},
  {"run","Generate","sample one continuation of a prompt",
   {{"model","",F_MODEL},{"prompt","Once upon a time",F_TEXT},{"tokens","120",F_TEXT},{"temp","0.8",F_TEXT},{"top-k","40",F_TEXT}}},
- {"chatbench","Chatbench","fixed chat prompts, N samples each (feed the output to judgerun.bat)",
+ {"serve","Serve","HTTP /completion server for the model (used by agentenv)",
+  {{"model","",F_MODEL},{"port","8090",F_TEXT,0,0,0,"TCP port. Stop the server with Ctrl+C."}},
+  "Run: load the model and serve until Ctrl+C."},
+ {"chatbench","Chatbench","fixed chat prompts, N samples each (the saved log is the input for judgerun.bat)",
   {{"model","",F_MODEL},{"bench file","chatbench.txt",F_FILE},{"gen tokens","128",F_TEXT},{"temp","0.7",F_TEXT},
    {"top-p","0.9",F_TEXT},{"rep pen","1.15",F_TEXT},{"samples","4",F_TEXT},{"ctx T","256",F_TEXT}}},
+ {"lmeval","LM eval","zero-shot HellaSwag / ARC-Easy / PIQA / LAMBADA on the full sets",
+  {{"model","",F_MODEL},
+   {"tasks","all",F_CHOICE,"all|hellaswag|arc_easy|piqa|lambada",0,0,"all = the four tasks; Enter -> type a value for a comma list (e.g. arc_easy,piqa)\n"
+    "or a .tsv path. Task files live in bench\\ (CUDALM_BENCH_DIR); missing ones are downloaded once (python + pyarrow)."},
+   {"items","0",F_TEXT,0,0,0,"0 = every item; N = only the first N of each task (quick check)."},
+   {"max ctx","1024",F_TEXT,0,0,0,"Longest sequence scored (capped at the model's context); longer LAMBADA passages are cut from the left."}},
+  "Run: acc / acc_norm (+-std err) per task, LAMBADA greedy last-word acc + ppl. FP8 GEMMs are off (exact path).\n~25 s for a 10M model, ~2 min for 250M."},
  {"probe","Probe","one generation per line of a prompts file",
   {{"model","",F_MODEL},{"prompts file","",F_FILE},{"tokens","80",F_TEXT},{"temp","0",F_TEXT},{"top-k","1",F_TEXT},
    {"top-p","0",F_TEXT},{"rep pen","1",F_TEXT}}},
@@ -93,9 +104,17 @@ static const TCmd T_CMDS[]={
    {"target","tinylm",F_CHOICE,"tinylm|llama",0,0,"tinylm = exact GGUF for the tinylm C runtime (top-k MoE, ngram/engram kept).\n"
     "llama = stock llama.cpp (q8|fp16|f32 only): top-1 routing, ngram/engram dropped -> lossy."},
    {"out .gguf","",F_TEXT,0,0,0,"Blank = next to the model: <model>-<TYPE>.gguf (llama target: <model>-llama-<TYPE>.gguf)."},
-   {"ctx","",F_OPT,"--ctx",0,0,"llama target: context to advertise (default = the training window)."}}},
- {"qlmcheck","QLM check","distinct values per weight group",{{"model","",F_MODEL},{"group","128",F_TEXT}}},
- {"selftest","Selftest","GPU kernels vs CPU references",{{0}}},
+   {"ctx","",F_OPT,"--ctx",0,0,"llama target: context to advertise (default = the training window)."},
+   {"ng f32","0",F_FLAG,"--ng-f32",0,"0|1","1 = keep an fp32 engram table fp32 in the GGUF (default 0: exported as q4)."}}},
+ /* ---- Diagnostics (grp 2) ---- */
+ {"qlmcheck","QLM check","distinct values per weight group (proves a QLM model really holds 4-bit weights)",
+  {{"model","",F_MODEL},{"group","128",F_TEXT}},0,2},
+ {"selftest","Selftest","GPU kernels vs CPU references",{{0}},0,2},
+ {"decheck","Decode check","incremental decoder logits vs the full forward (2 slots, different prefixes)",
+  {{"model","",F_MODEL},{"tokens","200",F_TEXT},{"top-k","40",F_TEXT}},0,2},
+ {"tokcheck","Tokenizer check","re-encode the docs of a token file and compare with the stored tokens",
+  {{"model","",F_MODEL},{"tokens file","",F_PATH,0,0,".bin;.u16","uint16 token file made with this model's tokenizer, e.g. a corpus's val.bin."},
+   {"max docs","1000000",F_TEXT},{"encoder","new",F_CHOICE,"new|old",0,0,"old = the pre-18b whole-string BPE (for comparison)."}},0,2},
  /* ---- Data tools (grp 1): text -> tokenizer -> corpus; all CPU ---- */
  {"data fetch","Download text","Hugging Face blend -> .jsonl text (resumable; runs prep\\fetch.py: python + pyarrow)",
   {{"profile","v3pre",F_CHOICE,"v3pre|v3sft|v3chat|web|code|math|cosmopedia|chat|tools",0,0,
@@ -165,8 +184,20 @@ static const TCmd T_CMDS[]={
      "map to one id, so they share engram table rows."},
    {"out file","",F_TEXT,0,0,0,"Output .bin (empty = canon.bin inside the tokenizer folder)."}},
   "Run: write one uint16 per token. Train tokenizer already writes canon.bin.",1},
+ {"data weights","Loss weights","train.w per-token loss weights for a corpus (CUDALM_TOKW=1 trains with it)",
+  {{"corpus","",F_DATA,0,0,0,"A corpus encoded from the rows file in order with val % = 0 and dedup = 0 (doc k = row k)."},
+   {"rows","",F_PATH,0,0,".jsonl","jsonl rows: \"w\" = per-doc weight (GRPO advantage), or \"a0\"/\"tl\"/\"tp\" teacher log-probs\n"
+    "(on-policy distillation, agentenv tscore)."}},
+  "Run: write <corpus>\\train.w (int8 per token).",1},
 };
 #define T_NCMD (int)(sizeof(T_CMDS)/sizeof(T_CMDS[0]))
+/* positional fields the CLI requires (by form title): Run refuses while one is empty */
+static const struct { const char*title; int n; } T_REQ[]={
+ {"Train",2},{"Generate",1},{"Serve",1},{"Chatbench",2},{"LM eval",1},{"Probe",2},{"Eval",2},{"New model",2},{"Model info",1},
+ {"Bench",1},{"Grow",2},{"Quantize",2},{"Export GGUF",1},{"QLM check",1},{"Decode check",1},{"Tokenizer check",2},
+ {"Download text",2},{"Convert files",2},{"Train tokenizer",2},{"Build corpus",4},{"Mix corpora",6},{"Corpus info",1},
+ {"Canon map",1},{"Loss weights",2}};
+static int t_req(const TCmd*c){ for(size_t i=0;i<sizeof T_REQ/sizeof T_REQ[0];i++) if(!strcmp(T_REQ[i].title,c->title)) return T_REQ[i].n; return 0; }
 enum { K_UP=1072, K_DOWN=1080, K_LEFT=1075, K_RIGHT=1077, K_PGUP=1073, K_PGDN=1081, K_HOME=1071, K_END=1079, K_F5=1063, K_DEL=1083 };
 #define T_MAXL 512
 #define T_INFO 220
@@ -247,11 +278,14 @@ static int t_list_dirs(int tok){
     }
     return n;
 }
+/* glob in the exe dir and in bench\ (bench files are listed as bench\name) */
 static int t_list_glob(const char*glob){
-    WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(glob,&fd); int n=0;
-    if(h!=INVALID_HANDLE_VALUE){ do{ if(n<T_MAXL && !(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)){
-        snprintf(t_items[n],260,"%s",fd.cFileName); snprintf(t_info[n],T_INFO,"%8.1f KB",fd.nFileSizeLow/1024.0); n++; } }
-        while(FindNextFileA(h,&fd)); FindClose(h); }
+    int n=0;
+    for(int d=0;d<2;d++){ char pat[400]; snprintf(pat,sizeof pat,"%s%s",d?"bench\\":"",glob);
+        WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+        if(h!=INVALID_HANDLE_VALUE){ do{ if(n<T_MAXL && !(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)){
+            snprintf(t_items[n],260,"%s%s",d?"bench\\":"",fd.cFileName); snprintf(t_info[n],T_INFO,"%8.1f KB",fd.nFileSizeLow/1024.0); n++; } }
+            while(FindNextFileA(h,&fd)); FindClose(h); } }
     return n;
 }
 /* picker with a leading "type it" entry; writes the choice into val */
@@ -315,7 +349,7 @@ static void t_choice_items(const char*ch, int*n){
 }
 static const char* t_choices(const TFld*f){
     if(f->kind==F_CHOICE) return f->arg;
-    return (f->kind==F_ENV||f->kind==F_MEM)&&f->ext&&strchr(f->ext,'|') ? f->ext : NULL; }
+    return (f->kind==F_ENV||f->kind==F_MEM||f->kind==F_FLAG)&&f->ext&&strchr(f->ext,'|') ? f->ext : NULL; }
 
 /* Windows argv quoting (CommandLineToArgvW / MSVC CRT rules) */
 static void t_quote(char*o, size_t cap, const char*a){
@@ -348,21 +382,38 @@ static int t_cmdline(const TCmd*c, char vals[][T_MAXL], char*o, size_t cap, char
     char exe[MAX_PATH], cw[64]; GetModuleFileNameA(0,exe,sizeof exe); o[0]=0; t_quote(o,cap,exe);
     snprintf(cw,sizeof cw,"%s",c->cmd); for(char*w=strtok(cw," ");w;w=strtok(NULL," ")) t_quote(o,cap,w);
     int last=-1; for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind<F_OPT && vals[i][0]) last=i;
+    for(int i=0,r=t_req(c);i<T_NF&&c->f[i].label&&r>0;i++) if(c->f[i].kind<F_OPT){
+        if(!vals[i][0]){ snprintf(err,ecap,"'%s' is required",c->f[i].label); return 0; } r--; }
     for(int i=0;i<=last;i++){ if(c->f[i].kind>=F_OPT) continue;
         if(!vals[i][0]){ snprintf(err,ecap,"'%s' is empty but a later field is set",c->f[i].label); return 0; }
         t_quote(o,cap,vals[i]); }
     for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_OPT && vals[i][0]){ t_quote(o,cap,c->f[i].arg); t_quote(o,cap,vals[i]); }
+    for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_FLAG && !strcmp(vals[i],"1")) t_quote(o,cap,c->f[i].arg);
     return 1;
 }
-static void t_spawn(const char*cl, const char*stop){
+/* runs cl with stdout+stderr piped back here: shown live and copied to logs\<tag>-<time>.log
+ * (LMTUI_CHILD makes the child's stdout unbuffered so the pipe stays live) */
+static void t_spawn(const char*cl, const char*stop, const char*tag){
     printf("\x1b[2J\x1b[H\x1b[1;36m> %s\x1b[0m\n\n",cl); fflush(stdout);
+    char lp[600]; SYSTEMTIME tm; GetLocalTime(&tm); CreateDirectoryA("logs",NULL);
+    snprintf(lp,sizeof lp,"logs\\%s-%04d%02d%02d-%02d%02d%02d.log",tag,tm.wYear,tm.wMonth,tm.wDay,tm.wHour,tm.wMinute,tm.wSecond);
+    for(char*p=lp+5;*p;p++) if(strchr(" /\\:*?\"<>|",*p)) *p='_';
+    FILE*lf=fopen(lp,"wb"); if(lf) fprintf(lf,"> %s\n\n",cl);
+    SECURITY_ATTRIBUTES sa={sizeof sa,NULL,TRUE}; HANDLE rd=NULL,wr=NULL;
+    if(!CreatePipe(&rd,&wr,&sa,0)) rd=wr=NULL; else SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);
     STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si;
+    if(wr){ si.dwFlags=STARTF_USESTDHANDLES; si.hStdInput=GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput=si.hStdError=wr; }
     char buf[8192]; snprintf(buf,sizeof buf,"%s",cl); DWORD t0=GetTickCount(); DWORD code=0;
-    snprintf(t_stop,sizeof t_stop,"%s",stop?stop:"");
-    if(!CreateProcessA(NULL,buf,NULL,NULL,FALSE,CREATE_NEW_PROCESS_GROUP,NULL,NULL,&si,&pi)) printf("CreateProcess failed (%lu)\n",GetLastError());
-    else { t_child=pi.dwProcessId; WaitForSingleObject(pi.hProcess,INFINITE); t_child=0;
+    snprintf(t_stop,sizeof t_stop,"%s",stop?stop:""); lm_setenv("LMTUI_CHILD","1");
+    if(!CreateProcessA(NULL,buf,NULL,NULL,TRUE,CREATE_NEW_PROCESS_GROUP,NULL,NULL,&si,&pi)) printf("CreateProcess failed (%lu)\n",GetLastError());
+    else { t_child=pi.dwProcessId; if(wr){ CloseHandle(wr); wr=NULL; }
+        if(rd){ HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); char b[4096]; DWORD n,w;
+            while(ReadFile(rd,b,sizeof b,&n,NULL)&&n){ WriteFile(ho,b,n,&w,NULL); if(lf){ fwrite(b,1,n,lf); fflush(lf); } } }
+        WaitForSingleObject(pi.hProcess,INFINITE); t_child=0;
         GetExitCodeProcess(pi.hProcess,&code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
-    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  press any key\n",code?31:32,code,(GetTickCount()-t0)/1000.0);
+    lm_setenv("LMTUI_CHILD",""); if(wr) CloseHandle(wr); if(rd) CloseHandle(rd);
+    if(lf){ fprintf(lf,"\n[exit %lu, %.1f s]\n",code,(GetTickCount()-t0)/1000.0); fclose(lf); }
+    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  \x1b[2mlog: %s\\%s\x1b[0m  press any key\n",code?31:32,code,(GetTickCount()-t0)/1000.0,exe_dir(),lp);
     while(_kbhit()) _getch(); t_key();
 }
 
@@ -414,7 +465,9 @@ static void t_form(const TCmd*c){
     if(!init[ci]){ int envmem=getenv("CUDALM_NGRAM")||getenv("CUDALM_ENGRAM");
         for(int i=0;i<nf;i++){ const TFld*f=&c->f[i]; const char*e=f->kind==F_ENV?getenv(f->arg):NULL;
             if(e&&*e&&!strncmp(f->arg,"NGRAM_",6)) envmem=1;
-            snprintf(vals[ci][i],T_MAXL,"%s",e&&*e?e:f->def); }
+            snprintf(vals[ci][i],T_MAXL,"%s",e&&*e?e:f->def);
+            if(f->kind==F_FILE && f->def[0] && !d_exists(f->def)){ char b[300]; snprintf(b,sizeof b,"bench\\%s",f->def);
+                if(d_exists(b)) snprintf(vals[ci][i],T_MAXL,"%s",b); } }
         for(int i=0;i<nf;i++) if(c->f[i].kind==F_MEM && envmem){   /* a loaded profile decides the mode */
             MemCfg m; mem_from_env(&m,64); snprintf(vals[ci][i],T_MAXL,"%s",mem_name(m.mode)); }
         init[ci]=1; }
@@ -428,7 +481,7 @@ static void t_form(const TCmd*c){
         for(int j=0;j<nv;j++){ const TFld*f=&c->f[vis[j]]; const char*v=vals[ci][vis[j]];
             printf("%s %-14s\x1b[0m %s",j==sel?"\x1b[7m>":" ",f->label,v[0]?v:"\x1b[2m-\x1b[0m");
             if(f->kind==F_ENV) printf("   \x1b[2m%s%s\x1b[0m",f->arg,t_choices(f)?"  <- ->":"");
-            else if(f->kind==F_MEM) printf("   \x1b[2m<- ->\x1b[0m");
+            else if(f->kind==F_MEM||f->kind==F_FLAG) printf("   \x1b[2m<- ->\x1b[0m");
             printf("\n"); }
         if(mode>=0 || c->run) t_help(sel<nv?&c->f[vis[sel]]:NULL,sel<nv?vals[ci][vis[sel]]:"",c->run);
         printf("\n%s [ Run ]\x1b[0m\n\n\x1b[2m%s\x1b[0m\n",sel==nv?"\x1b[7m>":" ",ok?cl:err);
@@ -441,7 +494,9 @@ static void t_form(const TCmd*c){
         else if(k==K_F5 || (k==13 && sel==nv)){
             if(!ok){ snprintf(msg,sizeof msg,"%s",err); continue; }
             char sp[1100]=""; if(!strcmp(c->cmd,"train")){ model_path(vals[ci][0],sp,sizeof sp-5); strcat(sp,".stop"); }
-            t_form_env(c,vals[ci]); t_spawn(cl,sp[0]?sp:NULL); t_env_pop(); }
+            char tag[200]; snprintf(tag,sizeof tag,"%s%s%.80s",c->cmd,nf&&vals[ci][0][0]?"-":"",nf?vals[ci][0]:"");
+            for(char*p=tag;*p;p++) if(*p==' ') *p='-';
+            t_form_env(c,vals[ci]); t_spawn(cl,sp[0]?sp:NULL,tag); t_env_pop(); }
         else if(sel<nv){
             const TFld*f=&c->f[vis[sel]]; char*v=vals[ci][vis[sel]]; const char*ch=t_choices(f); int n;
             if(k==K_DEL) v[0]=0;
@@ -542,15 +597,24 @@ static void t_model_cfg(void){
     snprintf(ttl,sizeof ttl,"config %s  (applied by every command on this model; the environment overrides)",mp);
     t_reg(&t_st,ttl); }
 
-static void t_data_menu(void){
+static void t_group_menu(int grp){
     int sel=0;
     for(;;){ int n=0, ids[T_NCMD];
-        for(int i=0;i<T_NCMD;i++) if(T_CMDS[i].grp==1){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
-        char r[2048]; data_roots(r,sizeof r);
-        snprintf(t_items[n],260,"(data roots)"); snprintf(t_info[n++],T_INFO,"%.200s",r);
-        int s=t_pick("Data tools   order: Download / Convert text -> (Train tokenizer) -> Build corpus -> (Mix) -> Corpus info -> Train",
-                     "Up/Down  Enter open  Esc back   bare names = folders under the data roots (CUDALM_DATA_ROOTS)",n,sel);
-        if(s<0) return; sel=s; if(s<n-1) t_form(&T_CMDS[ids[s]]); } }
+        for(int i=0;i<T_NCMD;i++) if(T_CMDS[i].grp==grp){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
+        int nc=n;
+        if(grp==1){ char r[2048]; data_roots(r,sizeof r); snprintf(t_items[n],260,"(data roots)"); snprintf(t_info[n++],T_INFO,"%.200s",r); }
+        int s=grp==1?t_pick("Data tools   order: Download / Convert text -> (Train tokenizer) -> Build corpus -> (Mix) -> Corpus info -> Train",
+                     "Up/Down  Enter open  Esc back   bare names = folders under the data roots (CUDALM_DATA_ROOTS)",n,sel)
+                    :t_pick("Diagnostics   correctness checks for kernels, decoder, tokenizer and QLM weights",NULL,n,sel);
+        if(s<0) return; sel=s; if(s<nc) t_form(&T_CMDS[ids[s]]); } }
+/* tuicheck [model]: every form's command line from its defaults (model fields = model), no console needed */
+static int tui_check(const char*model){
+    static char vals[T_NF][T_MAXL];
+    for(int ci=0;ci<T_NCMD;ci++){ const TCmd*c=&T_CMDS[ci]; char cl[4096],err[200];
+        for(int i=0;i<T_NF&&c->f[i].label;i++) snprintf(vals[i],T_MAXL,"%s",c->f[i].kind==F_MODEL&&model?model:c->f[i].def);
+        int ok=t_cmdline(c,vals,cl,sizeof cl,err,sizeof err);
+        printf("%-16s %s\n",c->title,ok?cl:err); }
+    return 0; }
 static int tui_main(void){
     HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); DWORD m=0;
     if(!GetConsoleMode(ho,&m) || !SetConsoleMode(ho,m|0x0004)) return -1;  /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */
@@ -560,7 +624,8 @@ static int tui_main(void){
         int n=0, ids[T_NCMD];
         for(int i=0;i<T_NCMD;i++) if(!T_CMDS[i].grp){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
         int nc=n;
-        snprintf(t_items[n],260,"Data tools..."); snprintf(t_info[n++],T_INFO,"download text, train a tokenizer, build / mix / inspect corpora");
+        snprintf(t_items[n],260,"Data tools..."); snprintf(t_info[n++],T_INFO,"download text, train a tokenizer, build / mix / inspect corpora, loss weights");
+        snprintf(t_items[n],260,"Diagnostics..."); snprintf(t_info[n++],T_INFO,"selftest, decode check, tokenizer check, QLM check");
         snprintf(t_items[n],260,"Model config"); snprintf(t_info[n++],T_INFO,"edit a model's saved settings (models\\<name>.bin.env)");
         snprintf(t_items[n],260,"Environment / profile"); snprintf(t_info[n++],T_INFO,"all CUDALM_* QLM_* NGRAM_* settings for the commands");
         snprintf(t_items[n],260,"Quit"); t_info[n++][0]=0;
@@ -568,8 +633,9 @@ static int tui_main(void){
         if(s<0 || s==n-1){ printf("\x1b[2J\x1b[H"); return 0; }
         sel=s;
         if(s<nc) t_form(&T_CMDS[ids[s]]);
-        else if(s==nc) t_data_menu();
-        else if(s==nc+1) t_model_cfg();
+        else if(s==nc) t_group_menu(1);
+        else if(s==nc+1) t_group_menu(2);
+        else if(s==nc+2) t_model_cfg();
         else { t_st.file=0; t_reg(&t_st,"Environment (inherited by every command; saved into a model's config by new/train)"); }
     }
 }
