@@ -7,8 +7,30 @@
  * Encoding is token-exact with the HF ByteLevel BPE (GPT-2 regex split, then merge ranks) -- the teachtok port.
  * Bare names resolve against the data roots: CUDALM_DATA_ROOTS, default <exe>\data;<exe>\prep\data plus the lines
  * of <exe>\data_roots.txt; new outputs go to the root with the most free space. */
-#ifdef _WIN32
+/* GPT-2 pre-tokenizer split: portable, needed by every build (tok_encode in cudalm.cu uses it for
+ * prompts and the SFT loss-mask markers); the rest of this file is the Windows-only data toolchain. */
 #include "uniclass.h"
+static int d_inr(const unsigned (*r)[2],int n,unsigned c){ int lo=0,hi=n-1;
+    while(lo<=hi){ int m=(lo+hi)/2; if(c<r[m][0]) hi=m-1; else if(c>r[m][1]) lo=m+1; else return 1; } return 0; }
+static int d_isW(unsigned c){ return (c>=9&&c<=13)||c==32||c==0x85||c==0xA0||c==0x1680||(c>=0x2000&&c<=0x200A)||c==0x2028||c==0x2029||c==0x202F||c==0x205F||c==0x3000; }
+static int d_cls(unsigned c){ if(d_isW(c)) return 0;
+    if(c<128) return ((c|32)>='a'&&(c|32)<='z')?1:(c>='0'&&c<='9')?2:3;
+    return d_inr(UNI_L,sizeof UNI_L/8,c)?1:d_inr(UNI_N,sizeof UNI_N/8,c)?2:3; }
+/* GPT-2 ByteLevel regex split ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+); cp/off hold n+1 */
+static void d_split(const unsigned char*s,int n,unsigned*cp,int*off,DPieceFn f,void*ctx){
+    int k=0;
+    for(int i=0;i<n;){ unsigned c=s[i]; int l=c<0x80?1:c<0xE0?2:c<0xF0?3:4; if(i+l>n) l=n-i;
+        unsigned v=l==1?c:l==2?c&31:l==3?c&15:c&7; for(int j=1;j<l;j++) v=v<<6|(s[i+j]&63);
+        off[k]=i; cp[k++]=v; i+=l; }
+    off[k]=n;
+    for(int i=0;i<k;){ int j=i+1; unsigned c=cp[i];
+        if(c=='\''&&i+1<k){ unsigned a=cp[i+1],b=i+2<k?cp[i+2]:0;
+            if(a=='s'||a=='t'||a=='m'||a=='d') j=i+2; else if((a=='r'&&b=='e')||(a=='v'&&b=='e')||(a=='l'&&b=='l')) j=i+3; }
+        if(j==i+1){ int st=(c==' '&&i+1<k&&!d_isW(cp[i+1]))?i+1:i, t=d_cls(cp[st]);
+            if(t){ j=st+1; while(j<k&&d_cls(cp[j])==t) j++; }
+            else { j=i+1; while(j<k&&d_isW(cp[j])) j++; if(j<k&&j-i>=2) j--; } }
+        f(ctx,s+off[i],off[j]-off[i]); i=j; } }
+#ifdef _WIN32
 #pragma comment(lib,"normaliz.lib")
 
 static void data_roots(char*o,size_t cap){ const char*e=getenv("CUDALM_DATA_ROOTS");
@@ -226,26 +248,6 @@ static DTok* dtok_load(const char*dir){
     for(int m=0;m<t->nm;m++){ int a,c,nw; if(!rd(&r,&a,4)||!rd(&r,&c,4)||!rd(&r,&nw,4)) break;
         uint64_t k=(uint64_t)a*t->V+c; size_t i=dt_slot(t,k); if(t->mrank[i]<0){ t->mkey[i]=k; t->mrank[i]=m; t->mnew[i]=nw; } }
     return t; }
-static int d_inr(const unsigned (*r)[2],int n,unsigned c){ int lo=0,hi=n-1;
-    while(lo<=hi){ int m=(lo+hi)/2; if(c<r[m][0]) hi=m-1; else if(c>r[m][1]) lo=m+1; else return 1; } return 0; }
-static int d_isW(unsigned c){ return (c>=9&&c<=13)||c==32||c==0x85||c==0xA0||c==0x1680||(c>=0x2000&&c<=0x200A)||c==0x2028||c==0x2029||c==0x202F||c==0x205F||c==0x3000; }
-static int d_cls(unsigned c){ if(d_isW(c)) return 0;
-    if(c<128) return ((c|32)>='a'&&(c|32)<='z')?1:(c>='0'&&c<='9')?2:3;
-    return d_inr(UNI_L,sizeof UNI_L/8,c)?1:d_inr(UNI_N,sizeof UNI_N/8,c)?2:3; }
-/* GPT-2 ByteLevel regex split ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+); cp/off hold n+1 */
-static void d_split(const unsigned char*s,int n,unsigned*cp,int*off,DPieceFn f,void*ctx){
-    int k=0;
-    for(int i=0;i<n;){ unsigned c=s[i]; int l=c<0x80?1:c<0xE0?2:c<0xF0?3:4; if(i+l>n) l=n-i;
-        unsigned v=l==1?c:l==2?c&31:l==3?c&15:c&7; for(int j=1;j<l;j++) v=v<<6|(s[i+j]&63);
-        off[k]=i; cp[k++]=v; i+=l; }
-    off[k]=n;
-    for(int i=0;i<k;){ int j=i+1; unsigned c=cp[i];
-        if(c=='\''&&i+1<k){ unsigned a=cp[i+1],b=i+2<k?cp[i+2]:0;
-            if(a=='s'||a=='t'||a=='m'||a=='d') j=i+2; else if((a=='r'&&b=='e')||(a=='v'&&b=='e')||(a=='l'&&b=='l')) j=i+3; }
-        if(j==i+1){ int st=(c==' '&&i+1<k&&!d_isW(cp[i+1]))?i+1:i, t=d_cls(cp[st]);
-            if(t){ j=st+1; while(j<k&&d_cls(cp[j])==t) j++; }
-            else { j=i+1; while(j<k&&d_isW(cp[j])) j++; if(j<k&&j-i>=2) j--; } }
-        f(ctx,s+off[i],off[j]-off[i]); i=j; } }
 static const char* d_memstr(const char*h,size_t n,const char*nd,size_t m){
     if(n<m) return NULL; const char*e=h+n-m;
     for(const char*p=h;p<=e;p++){ p=(const char*)memchr(p,nd[0],e-p+1); if(!p) return NULL; if(!memcmp(p,nd,m)) return p; }

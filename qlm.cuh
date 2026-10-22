@@ -701,7 +701,7 @@ static double qlm_state_bytes(const Qlm*q){ return qlm_total_bytes(q); }
  * tail was zeros, because fclose() only flushes to the OS, not to disk. */
 static int qlm_save(const Qlm*q, const char*path, int iter){
     char tmp[1300]; snprintf(tmp,sizeof tmp,"%s.tmp",path);
-    FILE*f=fopen(tmp,"wb"); if(!f) return 0;
+    FILE*f=fopen(tmp,"wb"); if(!f){ save_abort(NULL,tmp); return 0; }
     int hdr[6]={q->dmax,q->group,q->adam,q->nspan,q->packed,iter};
     unsigned long long nq=q->nq, ng=q->ngrp, nf=q->nfloat;
     unsigned long long nd=qd_bytes(nq,q->packed);
@@ -725,11 +725,16 @@ static int qlm_save(const Qlm*q, const char*path, int iter){
           && fwrite(hd,1,nd,f)==nd && fwrite(hr,1,nq,f)==nq
           && fwrite(hm,1,nq,f)==nq && (q->adam ? fwrite(hv,1,nq,f)==nq : 1)
           && fwrite(hs,4,ng,f)==ng && fwrite(hms,4,ng,f)==ng && (q->adam ? fwrite(hvs,4,ng,f)==ng : 1);
-    if(ok){ fflush(f); _commit(_fileno(f)); }
-    fclose(f);
+    /* trailer: each span's frozen reference scale. In rel mode the digit step is
+     * lr*128/sref, so re-deriving sref from the trained weights on resume would
+     * silently rescale every matrix's step. Readers that predate it stop before it. */
+    if(ok){ int ns=q->nspan; ok = fwrite("SREF",1,4,f)==4 && fwrite(&ns,4,1,f)==1;
+        for(int i=0;ok&&i<ns;i++) ok = fwrite(&q->spanH[i].sref,4,1,f)==1; }
+    /* then the grad norm the fused path clips the NEXT step with */
+    if(ok) ok = fwrite("PGN1",1,4,f)==4 && fwrite(&g_prev_gn,4,1,f)==1;
     free(hd);free(hr);free(hm);free(hv);free(hs);free(hms);free(hvs);free(hM);free(hV);
-    if(!ok){ remove(tmp); return 0; }
-    return MoveFileExA(tmp,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)?1:0;
+    if(!ok){ save_abort(f,tmp); return 0; }
+    return save_commit(f,tmp,path);
 }
 
 static int qlm_load(Qlm*q, const char*path, int*iter){
@@ -754,8 +759,19 @@ static int qlm_load(Qlm*q, const char*path, int*iter){
           && fread(hd,1,nd,f)==nd && fread(hr,1,nq,f)==nq
           && fread(hm,1,nq,f)==nq && (q->adam ? fread(hv,1,nq,f)==nq : 1)
           && fread(hs,4,ng,f)==ng && fread(hms,4,ng,f)==ng && (q->adam ? fread(hvs,4,ng,f)==ng : 1);
+    float *sr=NULL; int have_sref=0;
+    if(ok){ char tm[4]; int ns=0;
+        if(fread(tm,1,4,f)==4 && !memcmp(tm,"SREF",4) && fread(&ns,4,1,f)==1 && ns==q->nspan){
+            sr=(float*)malloc((size_t)ns*4); have_sref = sr && fread(sr,4,(size_t)ns,f)==(size_t)ns; }
+        float pg; if(have_sref && fread(tm,1,4,f)==4 && !memcmp(tm,"PGN1",4) && fread(&pg,4,1,f)==1 && pg>0.0f && isfinite(pg)) g_prev_gn=pg; }
     fclose(f);
     if(ok){
+        if(have_sref){
+            for(int i=0;i<q->nspan;i++) q->spanH[i].sref=sr[i];
+            cudaMemcpy(q->spanD,q->spanH,(size_t)q->nspan*sizeof(QSpanD),cudaMemcpyHostToDevice);
+        } else
+            fprintf(stderr,"[qlm] %s has no reference-scale record (written before it existed): sref is\n"
+                           "      re-derived from the current weights, so the matrix step size changes at this resume\n",path);
         cudaMemcpy(q->Mc,hM,nf*2,cudaMemcpyHostToDevice);
         cudaMemcpy(q->Vc,hV,nf*2,cudaMemcpyHostToDevice);
         cudaMemcpy(q->d,hd,nd,cudaMemcpyHostToDevice);
@@ -766,7 +782,7 @@ static int qlm_load(Qlm*q, const char*path, int*iter){
         cudaMemcpy(q->m8s,hms,ng*4,cudaMemcpyHostToDevice);
         if(q->adam) cudaMemcpy(q->v8s,hvs,ng*4,cudaMemcpyHostToDevice);
     }
-    free(hd);free(hr);free(hm);free(hv);free(hs);free(hms);free(hvs);free(hM);free(hV);
+    free(hd);free(hr);free(hm);free(hv);free(hs);free(hms);free(hvs);free(hM);free(hV);free(sr);
     return ok;
 }
 

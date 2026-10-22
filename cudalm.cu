@@ -63,6 +63,7 @@
   #include <unistd.h>           /* fsync, readlink, fileno */
   #include <fcntl.h>            /* open, for the directory fsync */
   #include <sys/stat.h>         /* mkdir */
+  #include <sys/statvfs.h>      /* disk_low */
   #include <sys/types.h>
   #include <sys/wait.h>         /* WEXITSTATUS */
 #endif
@@ -91,6 +92,36 @@
   #define lm_fseek64(f,o,w) fseeko((f),(off_t)(o),(w))
   #define lm_ftell64(f)     (long long)ftello(f)
 #endif
+/* file helpers for the training loop (stop file, *_itN snapshots, disk-full wait) */
+static int lm_exists(const char*p){
+#ifdef _WIN32
+    return GetFileAttributesA(p)!=INVALID_FILE_ATTRIBUTES;
+#else
+    return access(p,F_OK)==0;
+#endif
+}
+static void lm_sleep_ms(unsigned ms){
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep((useconds_t)ms*1000u);
+#endif
+}
+/* 1 on success; overwrites dst */
+static int lm_copyfile(const char*src,const char*dst){
+#ifdef _WIN32
+    return CopyFileA(src,dst,FALSE)!=0;
+#else
+    FILE*a=fopen(src,"rb"); if(!a) return 0;
+    FILE*b=fopen(dst,"wb"); if(!b){ fclose(a); return 0; }
+    static char buf[1<<20]; size_t n; int ok=1;
+    while((n=fread(buf,1,sizeof buf,a))>0) if(fwrite(buf,1,n,b)!=n){ ok=0; break; }
+    if(ferror(a)) ok=0;
+    fclose(a); if(fclose(b)!=0) ok=0;
+    if(!ok) remove(dst);
+    return ok;
+#endif
+}
 
 #define CH_ROWS 2048      /* lm_head/CE row chunk (caps the logits buffer) */
 /* Timesteps handled per attention-backward launch. Caps launch duration so it
@@ -218,6 +249,7 @@ static size_t param_count(const Cfg*c){ Off o; return calc_offsets(c,&o); }
 static Off g_goff; static int g_fused=0; static size_t g_gsize=0;
 static const Off *g_og=NULL;
 static float g_prev_gn=1.0f;
+static float *g_fgs=NULL;   /* fused path: device [clip multiplier, norm] from g_prev_gn, for the float-span/side AdamW */
 static float g_fused_lr=0.0f; static int g_fused_t=1;
 static float *g_gnpart=NULL;                 /* 64 floats per layer */
 static size_t g_layer_g0=0, g_layer_gn=0;
@@ -396,10 +428,35 @@ static FILE* save_open(const char*path,char*tmp,size_t tn){
     FILE*f=fopen(tmp,"wb"); if(!f){fprintf(stderr,"write %s\n",tmp);exit(1);}
     return f;
 }
+/* Checkpoint batch: between save_begin() and save_end() every save_commit only
+ * flushes, fsyncs and closes its .tmp; save_end() renames them all only if every
+ * file in the set was written, else deletes them. A full disk mid-save therefore
+ * keeps the whole previous set instead of mixing iterations across files. */
+#define SV_MAX 16
+static int g_sv_batch=0, g_sv_fail=0, g_sv_n=0; static char g_sv_tmp[SV_MAX][1300], g_sv_dst[SV_MAX][1200];
+static int save_rename(const char*tmp,const char*path);
+static void save_begin(void){ g_sv_batch=1; g_sv_fail=0; g_sv_n=0; }
+/* a writer that gives up on its own (failed fwrite it checked) */
+static void save_abort(FILE*f,const char*tmp){ if(f) fclose(f); remove(tmp); if(g_sv_batch) g_sv_fail=1; }
+static int save_end(void){
+    int ok=!g_sv_fail; g_sv_batch=0;
+    for(int i=0;i<g_sv_n;i++){
+        if(!ok){ remove(g_sv_tmp[i]); continue; }
+        if(!save_rename(g_sv_tmp[i],g_sv_dst[i])){ fprintf(stderr,"rename %s FAILED\n",g_sv_tmp[i]); ok=0; } }
+    g_sv_n=0; return ok; }
 static int save_commit(FILE*f,const char*tmp,const char*path){
-    if(fflush(f)!=0){ fclose(f); return 0; }
-    if(lm_fsync(f)!=0){ fclose(f); return 0; }            /* fsync: to the platter */
-    if(fclose(f)!=0) return 0;
+    /* ferror: a large fwrite that hits a full disk can leave the stdio buffer empty,
+     * after which fflush, fsync and fclose all succeed on a truncated file */
+    int ok = !ferror(f) && fflush(f)==0 && !ferror(f) && lm_fsync(f)==0;   /* fsync: to the platter */
+    if(fclose(f)!=0) ok=0;
+    if(!ok){ remove(tmp); if(g_sv_batch) g_sv_fail=1; return 0; }
+    if(g_sv_batch){
+        if(g_sv_fail||g_sv_n>=SV_MAX){ remove(tmp); g_sv_fail=1; return 0; }
+        snprintf(g_sv_tmp[g_sv_n],sizeof g_sv_tmp[0],"%s",tmp); snprintf(g_sv_dst[g_sv_n],sizeof g_sv_dst[0],"%s",path);
+        g_sv_n++; return 1; }
+    return save_rename(tmp,path);
+}
+static int save_rename(const char*tmp,const char*path){
 #ifdef _WIN32
     /* MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH = atomic swap on NTFS */
     return MoveFileExA(tmp,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
@@ -610,8 +667,16 @@ static inline int nblk(size_t n,int t){ return (int)((n+t-1)/t); }
  *      so a regression is visible before it is fatal.
  * ------------------------------------------------------------------------ */
 /* a save that runs out of disk truncates the last good checkpoint */
+#ifdef _WIN32
 static int disk_low(const char*p){ char r[4]={p[0],':','\\',0}; ULARGE_INTEGER f;
     return p[1]==':'&&GetDiskFreeSpaceExA(r,&f,0,0)&&f.QuadPart<(3ull<<30); }
+#else
+static int disk_low(const char*p){ char d[1200]; snprintf(d,sizeof d,"%s",p);
+    char*s=strrchr(d,'/'); if(s) *s=0; else snprintf(d,sizeof d,".");
+    /* a filesystem that reports no capacity (some FUSE/pseudo mounts) counts as unknown, not full */
+    struct statvfs v; if(statvfs(d[0]?d:"/",&v)!=0 || !v.f_blocks || !v.f_frsize) return 0;
+    return (unsigned long long)v.f_bavail*v.f_frsize<(3ull<<30); }
+#endif
 static double wall(void){
 #ifdef _WIN32
     LARGE_INTEGER f,c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
@@ -2496,11 +2561,16 @@ __global__ void k_sqsum(const float*G,size_t n,float*part){
     if(threadIdx.x==0) part[blockIdx.x]=ls[0];
 }
 /* S2: finish the clip on the device, same summation order as the old host code.
- * gs[0] = clip multiplier (1 when gn<=1, exact), gs[1] = gn. */
-__global__ void k_gnorm(const float*part,float*gs){
-    double ss=0; for(int i=0;i<64;i++) ss+=part[i];
-    float gn=(float)sqrt(ss); gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn;
+ * gs[0] = clip multiplier (1 when gn<=1, exact), gs[1] = gn. part = G's 64 partials, then
+ * nside more slices of 64 (side parameters): they join the norm when clip_side is set, and a
+ * non-finite side sum makes gn NaN either way so the step is skipped. */
+__global__ void k_gnorm(const float*part,int nside,int clip_side,float*gs){
+    double ss=0,sd=0; for(int i=0;i<64;i++) ss+=part[i];
+    for(int i=64;i<64*(1+nside);i++) sd+=part[i];
+    float gn=(float)sqrt(clip_side?ss+sd:ss); if(!isfinite(sd)) gn=__int_as_float(0x7fc00000);
+    gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn;
 }
+__global__ void k_clipmul(float*gs,float gn){ gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn; }
 #else
 #define CPUK_PART 2
 #include "cpu_kern.h"
@@ -3376,6 +3446,7 @@ static int mb_S(void){ int k=g_topk<1?1:g_topk; if(k>gC.n_exp)k=gC.n_exp; return
 static float* mbias(int l){
     if(g_mbias_u<=0&&!g_mbias_ld) return NULL;
     size_t ls=(size_t)mb_S()*gC.n_exp;
+    if(!ls) return NULL;                     /* dense model: no router, and no zero-byte allocations */
     if(!g_mbiasD){ size_t n=(size_t)gC.L*ls; ck(cudaHostAlloc((void**)&g_mbiasH,n*4,0),"mbias pin"); memset(g_mbiasH,0,n*4); g_mbiasD=(float*)dmalloc(n*4);
         ck(cudaMemset(g_mbiasD,0,n*4),"mbias z"); }
     return g_mbiasD+(size_t)l*ls;
@@ -3656,16 +3727,27 @@ __global__ void k_rlse(const float*rt,float*lse,int N,int E){
     float s=0; for(int e=0;e<E;e++) s+=expf(r[e]-mx); lse[n]=mx+logf(s); }
 __global__ void k_zl_bwd(float*drt,const float*pr,const float*lse,int N,int E,float c){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<(size_t)N*E) drt[i]+=c*lse[i/E]*pr[i]; }
+#else
+#define CPUK_PART 12
+#include "cpu_kern.h"
+#endif
+/* 1/N over every routed token (masked ones included: the router still sees them), as in
+ * ST-MoE and as the load-balance aux loss here; not the CE's masked denominator */
 static void zl_fwd(GA*a,int l,int N,int E){
     if(g_zl<=0||!a->tr) return;
     size_t need=(size_t)gC.L*N; if(need>g_zlc){ if(g_zlse) cudaFree(g_zlse); g_zlse=(float*)dmalloc(need*4); g_zlc=need; }
     KL(k_rlse,nblk(N,TPB),TPB)(a->rt,g_zlse+(size_t)l*N,N,E); }
 static void zl_bwd(GA*a,int l,int N,int E){
     if(g_zl>0&&a->tr) KL(k_zl_bwd,nblk((size_t)N*E,TPB),TPB)(a->drt,a->rprobs[l],g_zlse+(size_t)l*N,N,E,2.f*g_zl/N); }
-#else
-static void zl_fwd(GA*,int,int,int){}
-static void zl_bwd(GA*,int,int,int){}
-#endif
+/* the z-loss of the last training forward, sum over sparse layers of c*mean(lse^2):
+ * the CE loss in the log line does not include it */
+static double zl_value(int N){
+    if(g_zl<=0||!g_zlse||g_zlc<(size_t)gC.L*N) return 0.0;
+    size_t n=(size_t)gC.L*N; float*h=(float*)malloc(n*4);
+    ck(cudaMemcpy(h,g_zlse,n*4,cudaMemcpyDeviceToHost),"zl d2h");
+    double z=0; for(int l=0;l<gC.L;l++){ if(!lyT(&gC,l)) continue;
+        double s=0; for(int i=0;i<N;i++){ double v=h[(size_t)l*N+i]; s+=v*v; } z+=g_zl*s/N; }
+    free(h); return z; }
 static void moe_forward(const float*P,const Off*o,GA*a,int l,float*out,int N){
 #define KF(s) if(g_prof>1) kchk(s,l)
     int D=gC.D,F=gC.F,E=lyE(&gC,l), isP=lyT(&gC,l)==2;
@@ -3849,7 +3931,8 @@ static void moe_backward(const float*P,float*G,const Off*o,GA*a,int l,int N){
             mg_atb(a->ap+(size_t)off[e]*F,a->dyp+(size_t)off[e]*D,G+og->w2[l]+(size_t)e*F*D,ne,F,D);
             mg_abt(a->dyp+(size_t)off[e]*D,P+rd->w2[l]+(size_t)e*F*D,a->dap+(size_t)off[e]*F,ne,D,F); } mg_flush(); kchk("bm w2 gemms",l);
         }
-        if(v4) KL(k_swiglu_bwd4,nblk((size_t)N*F/4,TPB),TPB)((const float4*)gp,(const float4*)up,(const float4*)a->dap,
+        /* nr, not N: a capacity-padded pass (MOE_SB) has E*cap > N rows */
+        if(v4) KL(k_swiglu_bwd4,nblk((size_t)nr*F/4,TPB),TPB)((const float4*)gp,(const float4*)up,(const float4*)a->dap,
                                                             (float4*)a->dgp,(float4*)a->dup,(size_t)nr*F/4);
         else KL(k_swiglu_bwd,nblk((size_t)N*F,TPB),TPB)(gp,up,a->dap,a->dgp,a->dup,(size_t)N*F);
         kchk("bm swiglu",l);
@@ -3916,6 +3999,9 @@ static void moe_backward(const float*P,float*G,const Off*o,GA*a,int l,int N){
  * equals the baseline; any divergence thereafter is the n-gram learning. No
  * checkpoint persistence yet -- this stage only proves the train-time pipeline. */
 static int   g_ngram_on=0;
+/* clip multiplier [mult, norm] for every parameter outside P/G (tables, projections, canon, shared
+ * expert, attention gate); set each step by gpu_adam (or the fused tail), NULL = unclipped */
+static const float *g_side_gs=NULL;
 static int   g_ng_R=0, g_ng_De=0, g_ng_order=2;
 static int   g_ng_fh[4];   /* NGR1 header of the table being loaded for inference */
 static float *g_ng=0, *g_ngG=0;      /* table + its grad (R*De) */
@@ -3985,7 +4071,7 @@ __global__ void k_ng_q4_step(float*P,const float*Gc,
                              const int*touched_gi,int group,int dmax,
                              float lr,float b1,float b2,float wd,float sref,
                              float inv_bc1,float inv_sqrt_bc2,
-                             unsigned long long t,unsigned long long nt){
+                             unsigned long long t,unsigned long long nt,const float*gs){
     int gi=touched_gi[blockIdx.x];
     unsigned long long j0=(unsigned long long)gi*group;      /* span starts at 0 */
     int n=(int)min((unsigned long long)group, nt - j0);
@@ -4000,7 +4086,7 @@ __global__ void k_ng_q4_step(float*P,const float*Gc,
     float mn=0.0f, rv=0.0f;
     if(j<n){
         unsigned long long qi=qi0+j, k=pof+j;
-        float gr=Gc[(size_t)blockIdx.x*group + j];
+        float gr=Gc[(size_t)blockIdx.x*group + j]*(gs?gs[0]:1.0f);
         float mv=(float)m8[qi]*ms_old;
         float sv=qv_dec((float)v8[qi],vs_old), vv=sv*sv;
         mn=b1*mv+(1.0f-b1)*gr;
@@ -4252,22 +4338,22 @@ static void ng_tbl_step(float lr,int t){
         if(g_ng_Gt) KL(k_ng_q4_step,(unsigned)g_ng_Gt,g_ngq_grp,g_ngq_grp)(
             g_ng,g_ngGc,g_ngq_d,g_ngq_r,g_ngq_s,g_ngq_m8,g_ngq_ms,g_ngq_v8,g_ngq_vs,
             g_ng_tgiD,g_ngq_grp,g_ngq_dmax,lr,b1,b2,wd,g_ngq_spH.sref,inv_bc1,inv_sqrt_bc2,
-            (unsigned long long)t,nt);
+            (unsigned long long)t,nt,g_side_gs);
     } else if(g_ng_q4){
         float inv_bc1=1.0f/bc1, inv_sqrt_bc2=1.0f/sqrtf(bc2);
         qlm_step_launch(g_ng,g_ngG,g_ngq_d,g_ngq_r,g_ngq_s,g_ngq_m8,g_ngq_ms,g_ngq_v8,g_ngq_vs,
-            g_ngq_spD,1,g_ngq_grp,g_ngq_dmax,lr,b1,b2,wd,1.0f,NULL,inv_bc1,inv_sqrt_bc2,
+            g_ngq_spD,1,g_ngq_grp,g_ngq_dmax,lr,b1,b2,wd,1.0f,g_side_gs,inv_bc1,inv_sqrt_bc2,
             0,(unsigned long long)t,1,(long long*)0,1,0,(int)g_ngq_ngrp);
     } else {
         KL(k_adamw,nblk(nt,TPB),TPB)(g_ng,g_ngG,g_ngM,g_ngV,nt,lr,b1,b2,wd,bc1,bc2,
-                                      (const float*)0,(size_t)0,(size_t)0,0,MU_OFF);
+                                      (const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
     }
 }
 static void ngram_update(float lr,int t){
     float b1=0.9f,b2=0.95f,wd=0.0f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
     size_t nw=(size_t)g_ng_De*gC.D;
     KL(k_adamw,nblk(nw,TPB),TPB)(g_ngW,g_ngWG,g_ngWM,g_ngWV,nw,lr,b1,b2,wd,bc1,bc2,
-                                  (const float*)0,(size_t)0,(size_t)0,0,MU_OFF);
+                                  (const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
     ng_tbl_step(lr,t);
     kchk("ng adam",-1);
 }
@@ -4379,9 +4465,9 @@ static void t1_update(float lr,int t){
     x1_update(lr,t);
     float b1=0.9f,b2=0.95f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
     if(g_attg){ size_t n=(size_t)gC.L*gC.D*gC.D;
-        KL(k_adamw,nblk(n,TPB),TPB)(g_Wg,g_WgG,g_WgM,g_WgV,n,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF); }
+        KL(k_adamw,nblk(n,TPB),TPB)(g_Wg,g_WgG,g_WgM,g_WgV,n,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs); }
     if(g_ngram_on&&g_ng_gate){ size_t n=(size_t)g_ng_De*gC.D;
-        KL(k_adamw,nblk(n,TPB),TPB)(g_ngWk,g_ngWkG,g_ngWkM,g_ngWkV,n,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF); }
+        KL(k_adamw,nblk(n,TPB),TPB)(g_ngWk,g_ngWkG,g_ngWkM,g_ngWkV,n,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs); }
     if(g_attg||g_ng_gate) kchk("t1 adam",-1);
 }
 static int t1_rw(FILE*f,void*dev,size_t by,int wr){
@@ -4700,7 +4786,7 @@ static void engram_backward(GA*a,const int*tokG,int N,int l){
     if(P==g_egp) eg_scatter(N);
 }
 static void eg_adam(float*p,float*g,bf16*m,bf16*v,size_t n,float lr,float bc1,float bc2){
-    KL(k_adamw,nblk(n,TPB),TPB)(p,g,m,v,n,lr,0.9f,0.95f,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF); }
+    KL(k_adamw,nblk(n,TPB),TPB)(p,g,m,v,n,lr,0.9f,0.95f,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs); }
 static void engram_update(float lr,int t){
     float bc1=1.0f-powf(0.9f,(float)t),bc2=1.0f-powf(0.95f,(float)t);
     size_t nw=(size_t)g_eg_S*g_ng_De*gC.D, D=gC.D;
@@ -5073,9 +5159,9 @@ static void shared_bwd(GA*a,int l,int N){
 static void x1_update(float lr,int t){
     if(!g_xn) return;
     float b1=0.9f,b2=0.95f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
-    if(g_xcn) KL(k_adamw,nblk(g_xcn,TPB),TPB)(g_xP,g_xG,g_xM,g_xV,g_xcn,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF);
+    if(g_xcn) KL(k_adamw,nblk(g_xcn,TPB),TPB)(g_xP,g_xG,g_xM,g_xV,g_xcn,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
     size_t ns=g_xn-g_xcn;
-    if(ns) KL(k_adamw,nblk(ns,TPB),TPB)(g_xP+g_xcn,g_xG+g_xcn,g_xM+g_xcn,g_xV+g_xcn,ns,lr,b1,b2,0.1f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF);
+    if(ns) KL(k_adamw,nblk(ns,TPB),TPB)(g_xP+g_xcn,g_xG+g_xcn,g_xM+g_xcn,g_xV+g_xcn,ns,lr,b1,b2,0.1f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
     kchk("x1 adam",-1);
 }
 /* sidecar <optpath>.x1: header validates the layout; P then M,V */
@@ -5588,7 +5674,7 @@ static void qlm_fused_layer(float*P,float*G,const Off*o,const Off*og,int l){
     for(int i=0;i<nf;i++){
         size_t cs=(size_t)qlm_fs_cs(q,po[i]);
         KL(k_adamw,nblk(nn[i],TPB),TPB)(P+po[i],G+go2[i],q->Mc+cs,q->Vc+cs,
-                                         nn[i],lr,b1,b2,wdf_of(wd),bc1,bc2,NULL,0,0,0,MU_OFF);
+                                         nn[i],lr,b1,b2,wdf_of(wd),bc1,bc2,NULL,0,0,0,MU_OFF,g_fgs);
     }
     kchk("qlm fused layer",l);
     if(diag_l){
@@ -5620,7 +5706,7 @@ static void qlm_fused_tail(float*P,float*G,const Off*o,const Off*og){
     for(int i=0;i<nf;i++){
         size_t cs=(size_t)qlm_fs_cs(q,po[i]);
         KL(k_adamw,nblk(nn[i],TPB),TPB)(P+po[i],G+go2[i],q->Mc+cs,q->Vc+cs,
-                                         nn[i],lr,b1,b2,i<2?wdf_of(wd):wd,bc1,bc2,NULL,0,0,0,MU_OFF);
+                                         nn[i],lr,b1,b2,i<2?wdf_of(wd):wd,bc1,bc2,NULL,0,0,0,MU_OFF,g_fgs);
     }
     kchk("qlm fused tail",-1);
     if(getenv("CUDALM_QLM_DIAG") && (g_fused_t%20)==1){
@@ -5629,10 +5715,14 @@ static void qlm_fused_tail(float*P,float*G,const Off*o,const Off*og){
                g_fused_t,g_prev_gn,100.0*(double)h[0]/(double)QQ.nq,h[3]);
         cudaMemset(QQ.statD,0,4*8);
     }
-    /* close out this step's grad norm; it clips the NEXT step */
-    { int nsl=64*gC.L; float*ph=(float*)malloc(nsl*4);
+    /* close out this step's grad norm; it clips the NEXT step. emb / nf / mtp live outside
+     * the layer slices, so their squares are summed here (the non-fused norm has them too) */
+    { static float*tp=NULL; if(!tp) tp=(float*)dmalloc((size_t)64*(2+16)*4);
+      int nt=0; for(int i=0;i<nf;i++){ KL(k_sqsum,64,TPB)(G+go2[i],nn[i],tp+64*nt); nt++; }
+      int nsl=64*gC.L; float*ph=(float*)malloc((size_t)(nsl+64*nt)*4);
       ck(cudaMemcpy(ph,g_gnpart,nsl*4,cudaMemcpyDeviceToHost),"fused sqsum d2h");
-      double ss=0; for(int i=0;i<nsl;i++) ss+=ph[i]; free(ph);
+      ck(cudaMemcpy(ph+nsl,tp,(size_t)64*nt*4,cudaMemcpyDeviceToHost),"fused tail sqsum d2h");
+      double ss=0; for(int i=0;i<nsl+64*nt;i++) ss+=ph[i]; free(ph);
       g_prev_gn=(float)sqrt(ss); }
 }
 
@@ -5821,14 +5911,78 @@ static void gpu_muon(float*P,float*G,float lr){
     }
     kchk("muon",-1);
 }
+/* sidecar <optpath>.mu: Muon's fp32 momentum. The .opt file holds only the AdamW moments,
+ * so without it every resume of a CUDALM_MUON=1 run restarted the momentum at zero. */
+static void mu_save(const char*optpath,int it,size_t np){
+    if(!g_muon||g_qlm_on||!gMuM) return;
+    char path[1200],tmp[1300]; snprintf(path,sizeof path,"%s.mu",optpath);
+    float*h=(float*)malloc(np*4); if(!h){ if(g_sv_batch) g_sv_fail=1; fprintf(stderr,"[muon] momentum save FAILED: out of host memory\n"); return; }
+    ck(cudaMemcpy(h,gMuM,np*4,cudaMemcpyDeviceToHost),"mu d2h");
+    FILE*f=save_open(path,tmp,sizeof tmp); unsigned long long n=np;
+    int ok=fwrite("MUM1",1,4,f)==4&&fwrite(&it,4,1,f)==1&&fwrite(&n,8,1,f)==1&&fwrite(h,4,np,f)==np;
+    free(h);
+    if(!ok){ save_abort(f,tmp); fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); return; }
+    if(!save_commit(f,tmp,path)) fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); }
+static void mu_load(const char*optpath,size_t np,int start_iter){
+    if(!g_muon||g_qlm_on) return;
+    char path[1200]; snprintf(path,sizeof path,"%s.mu",optpath);
+    FILE*f=fopen(path,"rb"); if(!f){ printf("[muon] no %s - momentum starts at zero\n",path); return; }
+    char m[4]; int it=0; unsigned long long n=0;
+    if(fread(m,1,4,f)!=4||memcmp(m,"MUM1",4)||fread(&it,4,1,f)!=1||fread(&n,8,1,f)!=1||n!=(unsigned long long)np){
+        fclose(f); fprintf(stderr,"[muon] %s: bad header or size - momentum starts at zero\n",path); return; }
+    if(it!=start_iter){ fclose(f);   /* e.g. a stretch trained without Muon, or a failed save */
+        fprintf(stderr,"[muon] %s is from iter %d but the optimizer state is from %d - momentum starts at zero\n",path,it,start_iter); return; }
+    float*h=(float*)malloc(np*4); int ok=h&&fread(h,4,np,f)==np; fclose(f);
+    if(ok){ if(!gMuM) muon_alloc(np); ck(cudaMemcpy(gMuM,h,np*4,cudaMemcpyHostToDevice),"mu h2d");
+            printf("[muon] loaded momentum %s (iter %d)\n",path,it); }
+    else fprintf(stderr,"[muon] truncated %s - momentum starts at zero\n",path);
+    free(h); }
 
 /* returns 0 (nothing updated) when the grad norm is NaN/Inf: NaN>1 is false,
  * so the clip alone would pass it straight into the weights. */
 static float g_gn=0;
+/* Gradients of the parameters outside P/G: n-gram/engram table and projections, canon +
+ * shared expert, attention gate. Their sum of squares joins the clip norm and their AdamW
+ * steps take the same multiplier (g_side_gs), so one global norm covers every trainable
+ * parameter. CUDALM_CLIP_SIDE=0: the norm covers G only, as before; the multiplier and the
+ * NaN check still apply to them. */
+#define SIDE_MAX 48
+static int g_clip_side=1;
+static int side_grads(const float**p,size_t*n){
+    int k=0; size_t D=(size_t)gC.D;
+#define SG(ptr,cnt) do{ if((ptr)&&(cnt)>0&&k<SIDE_MAX){ p[k]=(ptr); n[k]=(size_t)(cnt); k++; } }while(0)
+    if(g_ngram_on||g_eg_on){
+        if(g_ng_q4fold) SG(g_ngGc,(size_t)g_ng_Gt*g_ngq_grp); else SG(g_ngG,(size_t)g_ng_R*g_ng_De); }
+    if(g_ngram_on){ SG(g_ngWG,(size_t)g_ng_De*D); if(g_ng_gate) SG(g_ngWkG,(size_t)g_ng_De*D); }
+    if(g_eg_on){ size_t nw=(size_t)g_eg_S*g_ng_De*D;
+        for(int i=0;i<g_eg_np;i++){ EgP*E=&g_egp[i]; SG(E->WvG,nw); if(g_eg_gate) SG(E->WkG,nw);
+            if(g_eg_conv){ SG(E->nwG,D); SG(E->KG,D*4); } } }
+    if(g_xn) SG(g_xG,g_xn);
+    if(g_attg) SG(g_WgG,(size_t)gC.L*D*D);
+#undef SG
+    return k; }
+/* fused QLM path: every update of a step (quantized layers, their float spans, the emb/nf
+ * tail, the side parameters) is clipped with the PREVIOUS step's norm; call before the
+ * backward, since the layers step inside it */
+static void fused_side_clip(void){
+    if(!g_fgs) g_fgs=(float*)dmalloc(2*4);
+    KL(k_clipmul,1,1)(g_fgs,g_prev_gn); g_side_gs=g_fgs; }
+/* fused path: this step's side-gradient sum of squares, folded into g_prev_gn by the caller */
+static float *g_fsq=NULL;
+static double fused_side_sq(void){
+    const float*sp[SIDE_MAX]; size_t sn[SIDE_MAX]; int ns=side_grads(sp,sn); if(!ns) return 0.0;
+    if(!g_fsq) g_fsq=(float*)dmalloc((size_t)64*SIDE_MAX*4);
+    for(int i=0;i<ns;i++) KL(k_sqsum,64,TPB)(sp[i],sn[i],g_fsq+64*i);
+    static float h[64*SIDE_MAX]; ck(cudaMemcpy(h,g_fsq,(size_t)64*ns*4,cudaMemcpyDeviceToHost),"side sq d2h");
+    double sd=0; for(int i=0;i<64*ns;i++) sd+=h[i]; return sd; }
 static int gpu_adam(float*P,float*G,bf16*M,bf16*V,size_t np,float lr,int t){
-    if(!gPart) gPart=(float*)dmalloc(66*4);
-    float*gs=gPart+64;
-    KL(k_sqsum,64,TPB)(G,np,gPart); KL(k_gnorm,1,1)(gPart,gs); kchk("adam sqsum",-1);
+    if(!gPart) gPart=(float*)dmalloc(((size_t)64*(1+SIDE_MAX)+2)*4);
+    float*gs=gPart+64*(1+SIDE_MAX);
+    const float*sp[SIDE_MAX]; size_t sn[SIDE_MAX]; int ns=side_grads(sp,sn);
+    KL(k_sqsum,64,TPB)(G,np,gPart);
+    for(int i=0;i<ns;i++) KL(k_sqsum,64,TPB)(sp[i],sn[i],gPart+64*(1+i));
+    KL(k_gnorm,1,1)(gPart,ns,g_clip_side,gs); kchk("adam sqsum",-1);
+    g_side_gs=gs;
     ck(cudaMemcpy(&g_gn,gs+1,4,cudaMemcpyDeviceToHost),"gn d2h");
     if(!isfinite(g_gn)) return 0;
     /* Muon reads G itself, so it still needs the scaled copy */
@@ -5923,8 +6077,13 @@ static float g_lrmul=1.0f;
 typedef struct { void*d; size_t n; } LrsBuf;
 static LrsBuf g_lrsb[128]; static int g_lrsn=0; static size_t g_lrs_mbn=0;
 static void lrs_add(void*d,size_t n){ if(d&&n){ g_lrsb[g_lrsn].d=d; g_lrsb[g_lrsn++].n=n; } }
-static size_t lrs_setup(const float*P,size_t np){
-    g_lrsn=0; lrs_add((void*)P,np*4);
+static size_t lrs_setup(const float*P,size_t np,bf16*M,bf16*V){
+    g_lrsn=0; lrs_add((void*)P,(g_pscratch?g_psize:np)*4);   /* PSCRATCH: P is the compact layout */
+    /* the trial arms run real optimizer steps: without QLM the full-size moments
+     * (and Muon's momentum) are trainable state too, or every probe leaks 4 arms of
+     * moment updates into the main run */
+    if(!g_qlm_on){ lrs_add(M,np*2); lrs_add(V,np*2);
+        if(g_muon){ if(!gMuM) muon_alloc(np); lrs_add(gMuM,np*4); } }
     if(g_qlm_on){ Qlm*q=&QQ; lrs_add(q->Mc,q->nfloat*2); lrs_add(q->Vc,q->nfloat*2); lrs_add(q->d,qd_bytes(q->nq,q->packed));
         lrs_add(q->r,q->nq); lrs_add(q->m8,q->nq); lrs_add(q->v8,q->adam?q->nq:0);
         lrs_add(q->s,q->ngrp*4); lrs_add(q->m8s,q->ngrp*4); lrs_add(q->v8s,q->adam?q->ngrp*4:0); }
@@ -5938,17 +6097,23 @@ static size_t lrs_setup(const float*P,size_t np){
     if(g_attg){ size_t n=(size_t)gC.L*gC.D*gC.D; lrs_add(g_Wg,n*4); lrs_add(g_WgM,n*2); lrs_add(g_WgV,n*2); }
     if(g_xn){ lrs_add(g_xP,g_xn*4); lrs_add(g_xM,g_xn*2); lrs_add(g_xV,g_xn*2); }
     g_lrs_mbn=0; if(mbias(0)){ g_lrs_mbn=(size_t)gC.L*mb_S()*gC.n_exp*4; lrs_add(g_mbiasD,g_lrs_mbn); }
-    size_t t=sizeof(Qlm)+g_lrs_mbn; for(int i=0;i<g_lrsn;i++) t+=g_lrsb[i].n; return t;
+    size_t t=sizeof(Qlm)+g_lrs_mbn+sizeof(float)*2; for(int i=0;i<g_lrsn;i++) t+=g_lrsb[i].n; return t;
 }
 static void lrs_snap(uint8_t*b){
     ck(cudaDeviceSynchronize(),"lrs sync");
     for(int i=0;i<g_lrsn;i++){ ck(cudaMemcpy(b,g_lrsb[i].d,g_lrsb[i].n,cudaMemcpyDeviceToHost),"lrs d2h"); b+=g_lrsb[i].n; }
-    memcpy(b,&QQ,sizeof(Qlm)); b+=sizeof(Qlm); if(g_lrs_mbn) memcpy(b,g_mbiasH,g_lrs_mbn);
+    memcpy(b,&QQ,sizeof(Qlm)); b+=sizeof(Qlm); if(g_lrs_mbn) memcpy(b,g_mbiasH,g_lrs_mbn); b+=g_lrs_mbn;
+#ifndef CUDALM_CPU
+    ck(cudaMemcpyFromSymbol(b,d_opd,sizeof(float)*2),"lrs opd");   /* TOKW=2 auto-baseline accumulators */
+#endif
 }
 static void lrs_restore(const uint8_t*b){
     ck(cudaDeviceSynchronize(),"lrs sync");
     for(int i=0;i<g_lrsn;i++){ ck(cudaMemcpy(g_lrsb[i].d,b,g_lrsb[i].n,cudaMemcpyHostToDevice),"lrs h2d"); b+=g_lrsb[i].n; }
-    memcpy(&QQ,b,sizeof(Qlm)); b+=sizeof(Qlm); if(g_lrs_mbn) memcpy(g_mbiasH,b,g_lrs_mbn);
+    memcpy(&QQ,b,sizeof(Qlm)); b+=sizeof(Qlm); if(g_lrs_mbn) memcpy(g_mbiasH,b,g_lrs_mbn); b+=g_lrs_mbn;
+#ifndef CUDALM_CPU
+    ck(cudaMemcpyToSymbol(d_opd,b,sizeof(float)*2),"lrs opd");
+#endif
     if((g_ngram_on||g_eg_on)&&g_ng_q4){ KL(k_qlm_render,(unsigned)g_ngq_ngrp,g_ngq_grp)(g_ng,g_ngq_d,g_ngq_s,g_ngq_spD,1,g_ngq_grp,1,0); kchk("lrs render",-1); }
     ck(cudaDeviceSynchronize(),"lrs sync");
 }
@@ -6043,6 +6208,12 @@ static void cuda_init(void){
 static void preflight(float*P,float*G,const Off*o,GA*a,const int*tokG,const int*tgtG,
                       bf16*M,bf16*Vv,size_t np){
     if(getenv("CUDALM_NO_PREFLIGHT")) return;
+    /* lr=0 keeps the weights fixed, but the probe still advances the moments (AdamW, QLM,
+     * Muon), the router bias and g_prev_gn: snapshot and restore all of it, or every
+     * session start (each resume) would add one stray optimizer step */
+    size_t psz=lrs_setup(P,np,M,Vv); uint8_t*psnap=(uint8_t*)malloc(psz);
+    if(!psnap){ fprintf(stderr,"[preflight] skipped: no host memory for the %.0f MB state snapshot\n",psz/1e6); return; }
+    lrs_snap(psnap); float pgn=g_prev_gn;
     int save=g_debug; g_debug=1; g_maxms=0; strcpy(g_maxwhat,"(none)");
     cudaDeviceSynchronize(); g_tprev=wall();
     gpu_forward(P,o,a,tokG);
@@ -6052,6 +6223,7 @@ static void preflight(float*P,float*G,const Off*o,GA*a,const int*tokG,const int*
     else        gpu_adam(P,G,M,Vv,np,0.0f,1);
     cudaDeviceSynchronize();
     g_debug=save;
+    lrs_restore(psnap); free(psnap); g_prev_gn=pgn;
     double frac=g_maxms/(g_tdr*1000.0);
     printf("[preflight] slowest kernel: %s %.1f ms (%.0f%% of the %.0fs TDR budget)\n",
            g_maxwhat,g_maxms,100.0*frac,g_tdr);
@@ -6093,6 +6265,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_UNIPOOL","0","model","at new: one expert pool shared by all layers",0},
  {"CUDALM_TOPK","2","moe","experts routed per token (1..8)",0},
  {"CUDALM_ROUTER_Z","0","moe","router z-loss coef (ST-MoE uses 1e-3)",0},
+ {"CUDALM_CLIP_SIDE","1","optim","clip norm includes ngram/engram/canon/gate grads (0 = G only)",0},
  {"CUDALM_TOPK_L","","moe","per-layer top-k, e.g. 1,2,2,2",0},
  {"CUDALM_MOE_AUX","0.03","moe","load-balance aux loss weight",0},
  {"CUDALM_MOE_AUX_L","0","moe","per-layer aux on top of pool aux",0},
@@ -6719,7 +6892,7 @@ static void cmd_run(int argc,char**argv){
            c.tmpl==2?"chatml":(c.tmpl==1?"alpaca":"raw"), temp, topk);
     printf("------------------------------------------------------------\n%s",fmt); fflush(stdout);
     int greedy=(topk<=1||temp<=1e-4f), stopid=chat_stop_id(&c,tk);
-    double t0=(double)clock()/CLOCKS_PER_SEC; int produced=0;
+    double t0=wall(); int produced=0;
     for(int step=0;step<n;step++){
         int ctx=slen<c.T?slen:c.T, off=slen-ctx;
         for(int j=0;j<c.T;j++) padded[j]= j<ctx? seq[off+j]:0;
@@ -6747,7 +6920,7 @@ static void cmd_run(int argc,char**argv){
         tok_print(tk,nxt); fflush(stdout); produced++;
         if(slen<cap) seq[slen++]=nxt; else { memmove(seq,seq+1,(cap-1)*sizeof(int)); seq[cap-1]=nxt; }
     }
-    double dt=(double)clock()/CLOCKS_PER_SEC-t0;
+    double dt=wall()-t0;
     printf("\n------------------------------------------------------------\n[cudalm] %d tok in %.2fs (%.1f tok/s)\n",
            produced,dt,dt>0?produced/dt:0.0);
 }
@@ -7241,7 +7414,8 @@ static void cmd_train(int argc,char**argv){
     int start_iter=0;
     if(!g_qlm_on){
       bf16*mh=(bf16*)calloc(np,2),*vh=(bf16*)calloc(np,2); start_iter=opt_load(optpath,mh,vh,np);
-      if(start_iter>0){ ck(cudaMemcpy(M,mh,np*2,cudaMemcpyHostToDevice),"M h2d"); ck(cudaMemcpy(Vv,vh,np*2,cudaMemcpyHostToDevice),"V h2d"); }
+      if(start_iter>0){ ck(cudaMemcpy(M,mh,np*2,cudaMemcpyHostToDevice),"M h2d"); ck(cudaMemcpy(Vv,vh,np*2,cudaMemcpyHostToDevice),"V h2d");
+                        mu_load(optpath,np,start_iter); }
       free(mh);free(vh); }
     /* CUDALM_QLM=1 replaces the fp32 master weights on every 2D weight matrix
      * with an int8 digit + int8 residual + per-group scale, updated by Integer
@@ -7376,7 +7550,7 @@ static void cmd_train(int argc,char**argv){
      * `iters`, which after an early exit would tell the next session the run had
      * finished and it would do nothing. */
     double tmax=0; { const char*e=getenv("CUDALM_MAX_SECONDS"); if(e){ double v=atof(e); if(v>0) tmax=v; } }
-    double t0=(double)clock()/CLOCKS_PER_SEC;   /* tok/s reporting */
+    double t0=wall();   /* tok/s reporting */
     double tstart=wall();                       /* session wall clock */
     int stop_it=iters;
     if(tmax>0) printf("[cudalm train] will stop cleanly after %.0fs\n",tmax);
@@ -7442,7 +7616,7 @@ static void cmd_train(int argc,char**argv){
         { size_t s; uint8_t*b=read_file(p,&s); if(b){ lv=(uint16_t*)b; nlv=s/2; } else { lv=tr; nlv=ntr; printf("[lrs] no val.bin, scoring on train.bin\n"); } }
         lvst=(size_t*)malloc(sizeof(size_t)*lrs_vb*B);
         { uint64_t s=0xA11CE5ULL; for(int i=0;i<lrs_vb*B;i++) lvst[i]=(size_t)(pm_mix(&s)%(uint64_t)(nlv-(size_t)c.T-2)); }
-        lsz=lrs_setup(P,np); lsnap=(uint8_t*)malloc(lsz); lgood=(uint8_t*)malloc(lsz);
+        lsz=lrs_setup(P,np,M,Vv); lsnap=(uint8_t*)malloc(lsz); lgood=(uint8_t*)malloc(lsz);
         if(!lsnap||!lgood){ fprintf(stderr,"[lrs] OOM for 2 x %.2f GB host snapshots\n",lsz/1e9); exit(1); }
         FILE*f=fopen(lrsp,"rb"); if(f){ if(fscanf(f,"%f %lf",&g_lrmul,&lrs_best)!=2){ g_lrmul=1; lrs_best=1e30; } fclose(f); }
         printf("[lrs] on: every %d iters, %d-iter arms, %d val batches, eps %.4f | snapshot %.2f GB | lrmul %.3f best %.4f\n",
@@ -7492,6 +7666,27 @@ static void cmd_train(int argc,char**argv){
                it,v0,v[0],v[1],v[2],v[3],old,g_lrmul,lr_at(it,iters,lr,warmup,g_wsd,g_wsd_decay)*g_lrmul,wall()-tw);
         fflush(stdout); lrs_save();
     };
+    /* one checkpoint set (model + every optimizer sidecar), committed all-or-nothing */
+    auto save_all=[&](int done)->int{
+        ck(cudaDeviceSynchronize(),"sync");
+        if(g_pscratch) qlm_gather_full(&QQ,&c,&o,&g_poff,P,Ph);
+        else ck(cudaMemcpy(Ph,P,np*4,cudaMemcpyDeviceToHost),"P d2h");
+        save_begin();
+        model_save_bundle(mpath,&c,Ph,np,tok_blob,tok_len);
+        if(!g_qlm_on){
+            bf16*mh=(bf16*)malloc(np*2),*vh=(bf16*)malloc(np*2);
+            ck(cudaMemcpy(mh,M,np*2,cudaMemcpyDeviceToHost),"M d2h");
+            ck(cudaMemcpy(vh,Vv,np*2,cudaMemcpyDeviceToHost),"V d2h");
+            opt_save(optpath,done,mh,vh,np); mu_save(optpath,done,np);
+            free(mh);free(vh);
+        } else { char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(&QQ,qp,done); }
+        if(g_ngram_on) ngram_save(optpath,done);
+        if(g_eg_on) engram_save(optpath,done);
+        t1_save(optpath,done);
+        int ok=save_end();
+        if(ok) lrs_save();
+        else { printf("[ckpt] save FAILED - the previous checkpoint set is kept\n"); fflush(stdout); }
+        return ok; };
     /* divergence auto-stop: 50 logged losses (1000 iters) window */
     float dv_thr=0.3f; { const char*e=getenv("CUDALM_DIVSTOP"); if(e) dv_thr=(float)atof(e); }
     double dvw[50]; int dvn=0,nanw[50]={0},nanc=0; double dv_best=1e30;
@@ -7508,28 +7703,34 @@ static void cmd_train(int argc,char**argv){
         ck(cudaEventRecord(upev[it&1],0),"upev");
         gpu_forward(P,&o,a,tokG);
         g_fused_lr=cur; g_fused_t=it+1;
+        if(g_fused) fused_side_clip();       /* the layers step inside the backward */
         gpu_backward(P,G,&o,a,tokG,tgtG);
         int ok=1;
-        if(g_fused) qlm_fused_tail(P,G,g_pscratch?&g_poff:&o,&g_goff);
+        if(g_fused){ double sd=fused_side_sq();
+            qlm_fused_tail(P,G,g_pscratch?&g_poff:&o,&g_goff);
+            if(g_clip_side&&isfinite(sd)) g_prev_gn=(float)sqrt((double)g_prev_gn*g_prev_gn+sd);
+            g_gn=g_prev_gn; ok=isfinite(sd)&&isfinite(g_gn); }   /* the layers are already applied: !ok skips the side updates */
         else        ok=gpu_adam(P,G,M,Vv,np,cur,it+1);
         if(ok){ nskip=0;
             if(g_ngram_on) ngram_update(cur,it+1);
             if(g_eg_on) engram_update(cur,it+1);
             t1_update(cur,it+1);
         } else {
-            printf("[nan] iter %d grad norm %g - step skipped (%d in a row)\n",it,g_gn,++nskip); fflush(stdout);
+            printf("[nan] iter %d grad norm %g - %s (%d in a row)\n",it,g_gn,
+                   g_fused?"side-parameter updates skipped (fused layers already stepped)":"step skipped",++nskip); fflush(stdout);
             if(nskip>=20){ printf("[nan] %d non-finite steps in a row - aborting, last ckpt is intact\n",nskip); fflush(stdout); exit(3); }
         }
         if(it%20==0){ ck(cudaDeviceSynchronize(),"sync");
             ck(cudaMemcpy(lossh,a->lossb,(size_t)N*4,cudaMemcpyDeviceToHost),"loss d2h");
             /* masked positions carry loss 0, so divide by what actually counted */
             double L=0; for(int i=0;i<N;i++)L+=lossh[i]; L/=ntrain;
-            double dt=(double)clock()/CLOCKS_PER_SEC-t0;
+            double dt=wall()-t0;
             printf("iter %5d (ep %.2f) | loss %.4f | lr %.2e | gn %.2f | %.0fs | %.0f tok/s",
                    it,(double)it/spe,L,cur,g_gn,dt, it>start_iter?(double)N*(it-start_iter)/dt:0.0);
             /* trainable fraction: the one number that shows masking is doing
              * something sane. ~100% means no chat data in the window (all prose);
              * near 0% would mean the markers are not matching at all. */
+            if(g_zl>0) printf(" | zl %.4f", zl_value(N));
             if(mask_on) printf(" | train %.0f%%", 100.0*ntrain/N);
 #ifndef CUDALM_CPU
             if(g_tokw==2){ float o[2]={0,0},z[2]={0,0}; cudaMemcpyFromSymbol(o,d_opd,8); cudaMemcpyToSymbol(d_opd,z,8);
@@ -7546,52 +7747,41 @@ static void cmd_train(int argc,char**argv){
                         fflush(stdout); exit(5); } } } }
         if(it>start_iter && it%save_every==0 && !nskip && disk_low(mpath)){
             printf("[ckpt] SKIPPED @ iter %d: under 3 GB free\n",it); fflush(stdout); }
-        else if(it>start_iter && it%save_every==0 && !nskip){ ck(cudaDeviceSynchronize(),"sync");
-            if(g_pscratch) qlm_gather_full(&QQ,&c,&o,&g_poff,P,Ph);
-            else ck(cudaMemcpy(Ph,P,np*4,cudaMemcpyDeviceToHost),"P d2h");
-            model_save_bundle(mpath,&c,Ph,np,tok_blob,tok_len);
-            if(!g_qlm_on){
-                bf16*mh=(bf16*)malloc(np*2),*vh=(bf16*)malloc(np*2);
-                ck(cudaMemcpy(mh,M,np*2,cudaMemcpyDeviceToHost),"M d2h");
-                ck(cudaMemcpy(vh,Vv,np*2,cudaMemcpyDeviceToHost),"V d2h");
-                opt_save(optpath,it,mh,vh,np);
-                free(mh);free(vh);
-            } else { char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(&QQ,qp,it); }
-            if(g_ngram_on) ngram_save(optpath,it);
-            if(g_eg_on) engram_save(optpath,it);
-            t1_save(optpath,it);
-            lrs_save();
-            printf("[ckpt] saved %s @ iter %d\n",mpath,it); fflush(stdout);
+        else if(it>start_iter && it%save_every==0 && !nskip){
+            /* step `it` is already applied: record it+1 as "done up to", exactly as the
+             * post-loop save records stop_it, or a resume would train iteration `it` twice */
+            int done=it+1;
+            if(save_all(done)){
+            printf("[ckpt] saved %s @ iter %d (resumes at %d)\n",mpath,it,done); fflush(stdout);
             if(keep_every>0&&it%keep_every==0){
-                const char*sfx[7]={"",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1"}; char s[1200],d[1300]; int nk=0;
-                for(int i=0;i<7;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
+                /* ".opt" = the AdamW moments of a CUDALM_QLM=0 run, ".opt.mu" its Muon momentum */
+                const char*sfx[9]={"",".opt",".opt.mu",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1"}; char s[1200],d[1300]; int nk=0;
+                for(int i=0;i<9;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
                     const char*dot=strrchr(mpath,'.'); int bl=dot?(int)(dot-mpath):(int)strlen(mpath);
                     snprintf(d,sizeof d,"%.*s_it%d%s%s",bl,mpath,it,dot?dot:"",sfx[i]);
-                    if(CopyFileA(s,d,FALSE)) nk++; }
-                printf("[keep] %d files copied as *_it%d\n",nk,it); fflush(stdout); } }
+                    if(lm_copyfile(s,d)) nk++; }
+                printf("[keep] %d files copied as *_it%d\n",nk,it); fflush(stdout); } } }
         if(tmax>0 && (wall()-tstart)>=tmax){          /* checked after the save */
             stop_it=it+1;
             printf("[cudalm train] CUDALM_MAX_SECONDS (%.0fs) reached at iter %d - stopping cleanly\n",tmax,it);
             fflush(stdout); break; }
-        if(it%20==0&&GetFileAttributesA(stopp)!=INVALID_FILE_ATTRIBUTES){
-            stop_it=it+1; DeleteFileA(stopp);
+        if(it%20==0&&lm_exists(stopp)){
+            stop_it=it+1; remove(stopp);
             printf("[cudalm train] %s found at iter %d - stopping cleanly\n",stopp,it); fflush(stdout); break; }
     }
-    for(int w=0;disk_low(mpath);w++){ if(w%10==0){ printf("[ckpt] under 3 GB free - waiting to save %s\n",mpath); fflush(stdout); } Sleep(60000); }
-    ck(cudaDeviceSynchronize(),"sync");
-    if(g_pscratch) qlm_gather_full(&QQ,&c,&o,&g_poff,P,Ph);
-    else ck(cudaMemcpy(Ph,P,np*4,cudaMemcpyDeviceToHost),"P d2h");
-    model_save_bundle(mpath,&c,Ph,np,tok_blob,tok_len);
-    if(!g_qlm_on){
-        bf16*mh=(bf16*)malloc(np*2),*vh=(bf16*)malloc(np*2);
-        ck(cudaMemcpy(mh,M,np*2,cudaMemcpyDeviceToHost),"M d2h");
-        ck(cudaMemcpy(vh,Vv,np*2,cudaMemcpyDeviceToHost),"V d2h");
-        opt_save(optpath,stop_it,mh,vh,np);
-        free(mh);free(vh);
-    } else { char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(&QQ,qp,stop_it); }
-    if(g_ngram_on) ngram_save(optpath,stop_it);
-    if(g_eg_on) engram_save(optpath,stop_it);
-    t1_save(optpath,stop_it); lrs_save();
+    /* wait for space; a .stop file or CUDALM_MAX_SECONDS ends the wait. The checkpoint set is
+     * committed all-or-nothing, so trying it on a nearly full disk keeps the previous set if it fails */
+    { int why=0;
+      for(int s=0;disk_low(mpath);s++){
+          if(lm_exists(stopp)){ why=1; remove(stopp); break; }
+          if(tmax>0&&(wall()-tstart)>=tmax){ why=2; break; }
+          if(s%600==0){ printf("[ckpt] under 3 GB free - waiting to save %s (create %s to try anyway)\n",mpath,stopp); fflush(stdout); }
+          lm_sleep_ms(1000); }
+      if(why){ printf("[ckpt] under 3 GB free - trying the save anyway (%s)\n",why==1?"stop file":"CUDALM_MAX_SECONDS"); fflush(stdout); } }
+    /* fused QLM applies each layer's update inside the backward, so a non-finite step is already in
+     * the weights: never let it overwrite the last good checkpoint */
+    if(g_fused&&nskip) printf("[ckpt] NOT saved: the last %d step(s) were non-finite and fused QLM had already applied them - previous checkpoint kept\n",nskip);
+    else save_all(stop_it);
     if(stop_it<iters) printf("[cudalm train] paused at iter %d of %d -> %s (resume by re-running)\n",stop_it,iters,mpath);
     else              printf("[cudalm train] done -> %s\n", mpath);
     if(g_sb_n) printf("[cudalm] MoE load max/avg per pass: mean %.2f recent %.2f max %.2f (%ld passes, %ld SB fallbacks)\n",g_sb_r/g_sb_n,g_sb_ema,g_sb_rmax,g_sb_n,g_sb_fb);
@@ -7659,7 +7849,7 @@ static void cmd_probe(int argc,char**argv){
            argv[2],modelT,c.T, c.tmpl==2?"chatml":(c.tmpl==1?"alpaca":"raw"),temp,topk,topp,rep);
     printf("================================================================\n");
     char*p=(char*)fbuf, *end=(char*)fbuf+flen;
-    int nq=0; double t0=(double)clock()/CLOCKS_PER_SEC; int gentot=0;
+    int nq=0; double t0=wall(); int gentot=0;
     while(p<end){
         char*nl=p; while(nl<end && *nl!='\n') nl++;
         int len=(int)(nl-p); while(len>0 && (p[len-1]=='\r'||p[len-1]==' ')) len--;
@@ -7690,7 +7880,7 @@ static void cmd_probe(int argc,char**argv){
         }
         printf("\n"); fflush(stdout);
     }
-    double dt=(double)clock()/CLOCKS_PER_SEC-t0;
+    double dt=wall()-t0;
     printf("\n================================================================\n");
     printf("%d prompts, %d tokens generated in %.1fs (%.1f tok/s)\n", nq, gentot, dt, dt>0?gentot/dt:0.0);
 }
@@ -7911,7 +8101,7 @@ static void cmd_chatbench(int argc,char**argv){
     g_rng=12345;
     printf("[chatbench] %s | %d items | T=%d B=%d | gen %d tok, %s temp=%.2f topp=%.2f rep=%.2f nsamp=%d stop=%d\n",
            argv[2],ni,T,B,ngen,greedy?"greedy":"sample",temp,topp,rep,nsamp,stopid);
-    double t0=(double)clock()/CLOCKS_PER_SEC;
+    double t0=wall();
     /* ---------------- M: likelihood multiple choice ---------------- */
     int nseq=0; for(int i=0;i<ni;i++) if(it[i].type=='M') nseq+=it[i].nf;
     if(nseq){
@@ -8011,7 +8201,7 @@ static void cmd_chatbench(int argc,char**argv){
             s_len/R,s_d2/R,s_r4/R,100.0/K);
         printf("[chatbench] %d tokens generated\n",gentot);
     }
-    printf("[chatbench] done in %.1fs\n",(double)clock()/CLOCKS_PER_SEC-t0);
+    printf("[chatbench] done in %.1fs\n",wall()-t0);
 }
 
 /* ===================== bench ============================================ */
@@ -8048,10 +8238,10 @@ static void cmd_bench(int argc,char**argv){
     ck(cudaMemcpy(tgtG,tgt,(size_t)N*4,cudaMemcpyHostToDevice),"h2d");
     for(int w=0;w<3;w++){ gpu_forward(P,&o,a,tokG); gpu_backward(P,G,&o,a,tokG,tgtG); gpu_adam(P,G,M,Vv,np,1e-4f,w+1); }
     ck(cudaDeviceSynchronize(),"warmup");
-    double t0=(double)clock()/CLOCKS_PER_SEC;
+    double t0=wall();
     for(int i=0;i<iters;i++){ gpu_forward(P,&o,a,tokG); gpu_backward(P,G,&o,a,tokG,tgtG); gpu_adam(P,G,M,Vv,np,1e-4f,i+1); }
     ck(cudaDeviceSynchronize(),"bench");
-    double dt=(double)clock()/CLOCKS_PER_SEC-t0;
+    double dt=wall()-t0;
     double toks=(double)N*iters;
     double flops=6.0*np*toks;
     size_t fr=0,tt=0; cudaMemGetInfo(&fr,&tt);
@@ -8898,6 +9088,26 @@ static void cmd_selftest(void){
         g_topk=tk1; g_moe_stash=st0; g_mbias_u=mu; }
 #endif
     }
+    /* ---- router z-loss: drt += 2c/N*lse*softmax against central differences of c*mean_n lse_n^2 ---- */
+    { int N=37,E=8; float c=0.01f; size_t ne=(size_t)N*E;
+      float*hr=(float*)malloc(ne*4),*hp=(float*)malloc(ne*4),*hg=(float*)malloc(ne*4),*fd=(float*)malloc(ne*4);
+      for(size_t i=0;i<ne;i++) hr[i]=2.0f*rnd_normal();
+      for(int n=0;n<N;n++){ double mx=-1e30,s=0; for(int e=0;e<E;e++) mx=fmax(mx,(double)hr[n*E+e]);
+          for(int e=0;e<E;e++) s+=exp(hr[n*E+e]-mx);
+          for(int e=0;e<E;e++) hp[n*E+e]=(float)(exp(hr[n*E+e]-mx)/s); }
+      float*dr=(float*)dmalloc(ne*4),*dp=(float*)dmalloc(ne*4),*dl=(float*)dmalloc((size_t)N*4),*dg=dzero(ne);
+      cudaMemcpy(dr,hr,ne*4,cudaMemcpyHostToDevice); cudaMemcpy(dp,hp,ne*4,cudaMemcpyHostToDevice);
+      KL(k_rlse,nblk(N,TPB),TPB)(dr,dl,N,E); KL(k_zl_bwd,nblk(ne,TPB),TPB)(dg,dp,dl,N,E,2.f*c/N);
+      ck(cudaDeviceSynchronize(),"zl selftest"); cudaMemcpy(hg,dg,ne*4,cudaMemcpyDeviceToHost);
+      auto zf=[&](size_t i,double h)->double{ double z=0;
+          for(int n=0;n<N;n++){ double mx=-1e30,s=0;
+              for(int e=0;e<E;e++){ size_t k=(size_t)n*E+e; double v=hr[k]+(k==i?h:0.0); mx=v>mx?v:mx; }
+              for(int e=0;e<E;e++){ size_t k=(size_t)n*E+e; s+=exp(hr[k]+(k==i?h:0.0)-mx); }
+              double l=mx+log(s); z+=l*l; }
+          return c*z/N; };
+      for(size_t i=0;i<ne;i++) fd[i]=(float)((zf(i,1e-3)-zf(i,-1e-3))/2e-3);
+      ok &= check("router z-loss grad",relerr(hg,fd,ne),1e-3f);
+      cudaFree(dr); cudaFree(dp); cudaFree(dl); cudaFree(dg); free(hr); free(hp); free(hg); free(fd); }
     /* ---- qlm: integer weights + Integer AdamW ----------------------------
      * Every other kernel here is checked against a CPU reference; these must be
      * too, because the CPU/GPU agreement invariant is what keeps this project
@@ -9233,6 +9443,7 @@ int main(int argc,char**argv){
         if((v=getenv("CUDALM_MOE_SINK"))) g_moe_sink=atoi(v);
         if((v=getenv("CUDALM_MOE_AUX_L"))&&atof(v)>0) g_moe_auxL=(float)atof(v);
         if((v=getenv("CUDALM_ROUTER_Z"))) g_zl=(float)atof(v);
+        if((v=getenv("CUDALM_CLIP_SIDE"))) g_clip_side=atoi(v)!=0;
         if((v=getenv("CUDALM_MOE_AUX_LM"))) g_auxlm_n=parse_flist(v,g_auxlm,64);
         if((v=getenv("CUDALM_MOE_BIAS_LM"))) g_biaslm_n=parse_flist(v,g_biaslm,64);
         if((v=getenv("CUDALM_ROUTER_PRE"))&&atoi(v)){ g_rpre=1; printf("[moe] router reads the pre-injection residual\n"); }

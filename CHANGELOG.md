@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-10-22
+
+Add chatbench v2 benchmark file
+Add chatbench v2 benchmark file
+Add chatbench v2 benchmark file
+Add chatbench v2 benchmark file
+
 ## Unreleased - 2026-10-18
 
 - Add CUDALM_ROUTER_Z flag to enable router z-loss

@@ -138,7 +138,7 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 | `prep\fetch.py` | Hugging Face downloads and parquet/json → jsonl conversion (called by `cudalm data fetch`) |
 | `prep\legacy\` | Older Python corpus builders (numpy + `tokenizers`); kept for reference |
 | `runs\` | Reference recipe: `s8w2env.bat` (model env), `pretrain.bat`, `sft.bat` (chat SFT continuing a base model) |
-| `bench\chatbench.txt`, `chatbench.bat` | Chat benchmark: 118 multiple-choice + 24 open-generation prompts |
+| `bench\chatbench.txt`, `chatbench.bat`, `bench\chatbench_v2.txt` | Chat benchmark: 118 multiple-choice + 24 open-generation prompts (v2 expanded) |
 | `bench\judge.c`, `judgerun.bat` | Coherence judge: scores chatbench replies with any instruct GGUF via llama-server (`JUDGE_GGUF`, `LLAMA_SERVER`) |
 | `bench\gemmbench.cu` | MoE expert-GEMM micro-benchmark |
 | `teach\teachgen.c`, `teachrun.bat` | Synthetic teacher data from llama-server instances (`TEACHER_GGUF`, `LLAMA_SERVER`) |

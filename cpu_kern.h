@@ -511,10 +511,13 @@ __global__ void k_sqsum(const float*G,size_t n,float*part){
         for(size_t i=i0;i<i1;i++) s+=(double)G[i]*G[i];
         part[c]=(float)s; }
 }
-__global__ void k_gnorm(const float*part,float*gs){
-    double ss=0; for(int i=0;i<64;i++) ss+=part[i];
-    float gn=(float)sqrt(ss); gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn;
+__global__ void k_gnorm(const float*part,int nside,int clip_side,float*gs){
+    double ss=0,sd=0; for(int i=0;i<64;i++) ss+=part[i];
+    for(int i=64;i<64*(1+nside);i++) sd+=part[i];
+    float gn=(float)sqrt(clip_side?ss+sd:ss); if(!isfinite(sd)) gn=NAN;
+    gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn;
 }
+__global__ void k_clipmul(float*gs,float gn){ gs[0]=gn>1.0f?1.0f/gn:1.0f; gs[1]=gn; }
 #endif /* part 2 */
 
 /* ===================== part 3: AdamW (bf16 moments) ======================== */
@@ -590,7 +593,7 @@ __global__ void k_ng_scatter_compact(float*Gc,const int*key,const int*cidx,const
 __global__ void k_ng_q4_step(float*P,const float*Gc,signed char*d,signed char*r,float*s,signed char*m8,float*m8s,
                              unsigned char*v8,float*v8s,const int*touched_gi,int group,int dmax,
                              float lr,float b1,float b2,float wd,float sref,float inv_bc1,float inv_sqrt_bc2,
-                             unsigned long long t,unsigned long long nt){
+                             unsigned long long t,unsigned long long nt,const float*gs){
     int ng=(int)g_kgrid.x;
     #pragma omp parallel for schedule(static)
     for(int w=0;w<ng;w++){
@@ -600,7 +603,7 @@ __global__ void k_ng_q4_step(float*P,const float*Gc,signed char*d,signed char*r,
         float mn[256], rv[256], am=0, vm=0; signed char shd[256];
         for(int j=0;j<group;j++) shd[j]=0;
         for(int j=0;j<n;j++){ unsigned long long qi=qi0+j;
-            float gr=Gc[(size_t)w*group+j], mv=(float)m8[qi]*ms_old, sv=qv_dec((float)v8[qi],vs_old), vv=sv*sv;
+            float gr=Gc[(size_t)w*group+j]*(gs?gs[0]:1.0f), mv=(float)m8[qi]*ms_old, sv=qv_dec((float)v8[qi],vs_old), vv=sv*sv;
             mn[j]=b1*mv+(1.0f-b1)*gr; vv=b2*vv+(1.0f-b2)*gr*gr; rv[j]=sqrtf(vv);
             float veps=fmaxf(qv_dec(1.0f,vs_old),1e-8f), u=(mn[j]*inv_bc1)/(rv[j]*inv_sqrt_bc2+veps);
             u=fmaxf(-8.0f,fminf(8.0f,u)); rv[j]=qv_enc(rv[j]);
@@ -694,6 +697,20 @@ __global__ void k_eg_conv_dK(const float*dc,const float*y,float*KG,int N,int D,i
         for(int d=d0;d<d1;d++) for(int j=0;j<4;j++) KG[d*4+j]=s[d-d0][j]; }
 }
 #endif /* part 9 */
+
+/* ============== part 12: router z-loss ===================================== */
+#if CPUK_PART==12
+__global__ void k_rlse(const float*rt,float*lse,int N,int E){
+    #pragma omp parallel for schedule(static) if(N*E>=CPU_PMIN)
+    for(int n=0;n<N;n++){ const float*r=rt+(size_t)n*E; float mx=-1e30f; for(int e=0;e<E;e++) mx=fmaxf(mx,r[e]);
+        float s=0; for(int e=0;e<E;e++) s+=fexp(r[e]-mx); lse[n]=mx+logf(s); }
+}
+__global__ void k_zl_bwd(float*drt,const float*pr,const float*lse,int N,int E,float c){
+    size_t n=(size_t)N*E;
+    #pragma omp parallel for simd schedule(static) if(n>=CPU_PMIN)
+    for(long i=0;i<(long)n;i++) drt[i]+=c*lse[(size_t)i/E]*pr[i];
+}
+#endif /* part 12 */
 
 /* ============== part 10: Muon helpers ===================================== */
 #if CPUK_PART==10
