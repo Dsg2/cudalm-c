@@ -6329,6 +6329,9 @@ static const EnvReg g_envreg[]={
  {"CUDALM_QLM_NOREUSE","","qlm","disable buffer reuse",0},
  {"CUDALM_BATCH","auto","train","batch size",0},
  {"CUDALM_SAVE_EVERY","auto","train","checkpoint interval (>=10)",0},
+ {"CUDALM_BENCH_EVERY","0","train","lmeval the checkpoint every N steps (0 = off) -> <model>.bench.tsv",0},
+ {"CUDALM_BENCH_TASKS","","train","bench tasks (default hellaswag,arc_easy,arc_challenge,piqa,arithmark)",0},
+ {"CUDALM_BENCH_N","500","train","items per bench task (0 = all)",0},
  {"CUDALM_KEEP_EVERY","20000","train","keep *_itN snapshots every N (0 = off)",0},
  {"CUDALM_DIVSTOP","0.3","train","divergence stop threshold",0},
  {"CUDALM_MASK_PROMPT","1","train","chatml: loss on assistant tokens only",0},
@@ -7320,6 +7323,39 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
     "python3"; }
 #endif
 #include "data.cuh"
+/* CUDALM_BENCH_EVERY=N: every N steps of the stage, score the checkpoint just saved with `lmeval` in a
+ * child process (training waits; the time is left out of tok/s) and append a row to <model>.bench.tsv.
+ * CUDALM_BENCH_TASKS (default: the index tasks), CUDALM_BENCH_N items per task (default 500, 0 = all). */
+static double train_bench(const char*mpath,int it,double ep){
+    const char*ts=getenv("CUDALM_BENCH_TASKS"),*nn=getenv("CUDALM_BENCH_N"); double t=wall(),ix=NAN;
+    char cmd[3200],ln[600],res[800]="",tsv[1200],exe[1024]; int lo=0,sum=0;
+#ifdef _WIN32
+    GetModuleFileNameA(0,exe,sizeof exe);
+    snprintf(cmd,sizeof cmd,"\"\"%s\" lmeval \"%s\" %s %s 2>&1\"",exe,mpath,ts&&*ts?ts:"hellaswag,arc_easy,arc_challenge,piqa,arithmark",nn&&*nn?nn:"500");
+    FILE*p=_popen(cmd,"r");
+#else
+    snprintf(cmd,sizeof cmd,"/proc/%d/exe lmeval \"%s\" %s %s 2>&1",(int)getpid(),mpath,ts&&*ts?ts:"hellaswag,arc_easy,arc_challenge,piqa,arithmark",nn&&*nn?nn:"500");
+    FILE*p=popen(cmd,"r");
+#endif
+    (void)exe;
+    printf("[bench] iter %d (ep %.2f): lmeval on %s ...\n",it,ep,mpath); fflush(stdout);
+    if(!p){ printf("[bench] could not start lmeval - skipped\n"); return wall()-t; }
+    while(fgets(ln,sizeof ln,p)){ char tn[64]; const char*a=strstr(ln,"acc_norm"),*x=strstr(ln,"intelligence index ");
+        if(strstr(ln,"[lmeval] summary")) sum=1;
+        else if(sum&&a&&sscanf(ln," %63s",tn)==1) lo+=snprintf(res+lo,sizeof res-lo,"%s%s %.2f",lo?"  ":"",tn,atof(a+8));
+        else if(sum&&strstr(ln,"ppl")&&sscanf(ln," %63s",tn)==1) lo+=snprintf(res+lo,sizeof res-lo,"%s%s %.2f",lo?"  ":"",tn,atof(strstr(ln,"acc")+3));
+        if(x) ix=atof(x+19); }
+#ifdef _WIN32
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+    if(!lo){ printf("[bench] lmeval produced no scores (out of memory? missing bench files?) - skipped\n"); fflush(stdout); return wall()-t; }
+    printf("[bench] iter %d (ep %.2f): index %.2f | %s  (%.0fs)\n",it,ep,ix,res,wall()-t); fflush(stdout);
+    snprintf(tsv,sizeof tsv,"%s.bench.tsv",mpath); int nw=!lm_exists(tsv); FILE*f=fopen(tsv,"a");
+    if(f){ if(nw) fprintf(f,"iter\tepoch\tindex\tscores (acc_norm %%; lambada acc %%)\n");
+        fprintf(f,"%d\t%.3f\t%.2f\t%s\n",it,ep,ix,res); fclose(f); }
+    return wall()-t; }
 /* [nan] locator: per tensor, non-finite grad count, max|G| and max|P| (first few events only) */
 static void nan_where(const float*P,const float*G,const Off*o,size_t np){
     static int calls; if(++calls>3) return;
@@ -7344,7 +7380,9 @@ static void cmd_train(int argc,char**argv){
         "  epochs = passes over THIS corpus from now on (default 1). On a model that has been trained before, this starts\n"
         "  a new stage: warmup and LR schedule restart over the stage, sampling starts at epoch 0 of the corpus.\n"
         "  <name>.bin.run records the stage; re-running the same command after a stop resumes it instead of adding more.\n"
-        "  CUDALM_ITERS=N instead pins one schedule over iters 0..N of the model's whole life (old behaviour).\n"); exit(1); }
+        "  CUDALM_ITERS=N instead pins one schedule over iters 0..N of the model's whole life (old behaviour).\n"
+        "  CUDALM_BENCH_EVERY=N scores the checkpoint with lmeval every N steps (index tasks, CUDALM_BENCH_N items each)\n"
+        "  and appends to <name>.bin.bench.tsv.\n"); exit(1); }
     const char*name=argv[2],*ddir=argv[3]; float epochs=argc>4?(float)atof(argv[4]):1.0f;
     char mpath[1024],optpath[1100]; model_path(name,mpath,sizeof(mpath)); snprintf(optpath,sizeof(optpath),"%s.opt",mpath);
     FILE*ex=fopen(mpath,"rb"); if(!ex){ fprintf(stderr,"model '%s' not found.\n  create it: cudalm new %s <preset>\n",mpath,name); exit(1);} fclose(ex);
@@ -7617,6 +7655,9 @@ static void cmd_train(int argc,char**argv){
     double tmax=0; { const char*e=getenv("CUDALM_MAX_SECONDS"); if(e){ double v=atof(e); if(v>0) tmax=v; } }
     double t0=wall();   /* tok/s reporting */
     double tstart=wall();                       /* session wall clock */
+    int bench_every=0; { const char*e=getenv("CUDALM_BENCH_EVERY"); if(e) bench_every=atoi(e); }
+    int next_bench=bench_every>0?((start_iter-g_stage0)/bench_every+1)*bench_every:0;
+    if(bench_every>0) printf("[cudalm train] lmeval every %d steps at the next checkpoint (CUDALM_BENCH_EVERY) -> %s.bench.tsv\n",bench_every,mpath);
     int stop_it=iters;
     if(tmax>0) printf("[cudalm train] will stop cleanly after %.0fs\n",tmax);
     PermSampler pm; memset(&pm,0,sizeof(pm)); int perm_on=1, perm_base=0;
@@ -7819,6 +7860,8 @@ static void cmd_train(int argc,char**argv){
             int done=it+1;
             if(save_all(done)){
             printf("[ckpt] saved %s @ iter %d (resumes at %d)\n",mpath,it,done); fflush(stdout);
+            if(bench_every>0 && it-g_stage0>=next_bench){ t0+=train_bench(mpath,it,(double)(it-g_stage0)/spe);
+                next_bench=((it-g_stage0)/bench_every+1)*bench_every; }
             if(keep_every>0&&it%keep_every==0){
                 /* ".opt" = the AdamW moments of a CUDALM_QLM=0 run, ".opt.mu" its Muon momentum */
                 const char*sfx[9]={"",".opt",".opt.mu",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1"}; char s[1200],d[1300]; int nk=0;
@@ -7847,7 +7890,7 @@ static void cmd_train(int argc,char**argv){
     /* fused QLM applies each layer's update inside the backward, so a non-finite step is already in
      * the weights: never let it overwrite the last good checkpoint */
     if(g_fused&&nskip) printf("[ckpt] NOT saved: the last %d step(s) were non-finite and fused QLM had already applied them - previous checkpoint kept\n",nskip);
-    else save_all(stop_it);
+    else if(save_all(stop_it) && bench_every>0) train_bench(mpath,stop_it,(double)(stop_it-g_stage0)/spe);
     if(stop_it<iters) printf("[cudalm train] paused at iter %d of %d -> %s (resume by re-running)\n",stop_it,iters,mpath);
     else              printf("[cudalm train] done -> %s\n", mpath);
     if(g_sb_n) printf("[cudalm] MoE load max/avg per pass: mean %.2f recent %.2f max %.2f (%ld passes, %ld SB fallbacks)\n",g_sb_r/g_sb_n,g_sb_ema,g_sb_rmax,g_sb_n,g_sb_fb);

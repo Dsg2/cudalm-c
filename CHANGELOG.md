@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: document CUDALM_BENCH_EVERY, CUDALM_BENCH_TASKS, CUDALM_BENCH_N
+- cudalm.cu: add CUDALM_BENCH_* env vars, train_bench() function, and bench_every logic in cmd_train
+- tui.cuh: add bench every and bench items flags to train command
+
+## Unreleased - 2026-10-23
+
 - Add DSCALE and DSCALE_INV definitions to k_attn_fwd_tiled
 - Add g_dsc array and k_dsc_amax/k_dsc_set functions for adaptive scale
 - Replace DSCALE_INV with g_dsc[1] in dQ/dK/dV writes
