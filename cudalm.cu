@@ -8204,6 +8204,99 @@ static void cmd_chatbench(int argc,char**argv){
     printf("[chatbench] done in %.1fs\n",wall()-t0);
 }
 
+/* ===================== lmeval (HellaSwag / ARC-Easy / PIQA / LAMBADA) =====
+ * Zero-shot, lm-eval-harness prompt formats; lmeval_prep.py writes <dir>/<task>.tsv:
+ *   gold \t context \t cont0 \t cont1 ...      (\n \t \\ escaped)
+ * >1 continuation: acc = argmax sum logP, acc_norm = argmax logP/bytes.
+ * 1 continuation (LAMBADA): acc = every continuation token is the greedy argmax,
+ * ppl = exp(-mean logP). Sequences are [eot] context continuation, left-truncated
+ * to T; T = per-task pow2 >= longest, rows per forward = N/T (one GA, fixed N). */
+static void le_unescape(char*s){ char*w=s; for(char*r=s;*r;r++){ if(*r=='\\'&&r[1]){ r++; *w++=*r=='n'?'\n':*r=='t'?'\t':*r; } else *w++=*r; } *w=0; }
+static void cmd_lmeval(int argc,char**argv){
+    if(argc<3){ fprintf(stderr,"usage: cudalm lmeval <name|model.bin> [tasks|all] [n=all] [Tmax=1024]\n"
+        "  tasks: comma list of hellaswag,arc_easy,piqa,lambada (files $CUDALM_BENCH_DIR/<task>.tsv, default dir bench)\n"
+        "         or .tsv paths; n>0 scores only the first n items of each task\n"); exit(1); }
+    g_fp8gemm=0;    /* per-tensor FP8 scales see the whole batch (padding included): scores would depend on batching */
+    char path[1024]; model_path(argv[2],path,sizeof(path));
+    FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
+    Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk);
+    if(!tk){ fprintf(stderr,"model has no tokenizer (untrained?)\n"); exit(1); }
+    char tl[1024]; snprintf(tl,sizeof tl,"%s",argc>3&&strcmp(argv[3],"all")?argv[3]:"hellaswag,arc_easy,piqa,lambada");
+    int nmax=argc>4?atoi(argv[4]):0, Tm=64, Tq=argc>5?atoi(argv[5]):1024; if(Tq>c.T) Tq=c.T;
+    while(Tm*2<=Tq) Tm*=2;
+    const char*bd=getenv("CUDALM_BENCH_DIR"); if(!bd) bd="bench";
+    int N=Tm>16384?Tm:16384, D=c.D, V=c.V;
+    c.T=Tm; cfg_derive(&c); gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
+    size_t np=param_count(&c);
+    float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P h2d");
+    rope_tables(&c); GA*a=ga_new(N,1);
+    int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4),*tok=(int*)malloc((size_t)N*4),*tgt=(int*)malloc((size_t)N*4);
+    float*lp=(float*)malloc((size_t)N*4),*lg=(float*)malloc((size_t)CH_ROWS*V*4);
+    printf("[lmeval] %s | Tmax %d | %d tokens per forward | tasks %s\n",argv[2],Tm,N,tl);
+    char sum[16][200]; int ns=0; double t0=wall();
+    for(char*tn=tl,*tc; tn&&*tn; tn=tc){
+        tc=strchr(tn,','); if(tc) *tc++=0;
+        char fp[1200]; if(strstr(tn,".tsv")) snprintf(fp,sizeof fp,"%s",tn); else snprintf(fp,sizeof fp,"%s/%s.tsv",bd,tn);
+        size_t fl; char*fb=(char*)read_file(fp,&fl); if(!fb){ printf("[lmeval] %s: cannot read %s\n",tn,fp); continue; }
+        fb=(char*)realloc(fb,fl+1); fb[fl]=0;
+        int ni=0,ic=0,nq=0,qc=0,*gold=NULL,*nc=NULL,*q0=NULL,**sq=NULL,*ln=NULL,*st=NULL,*by=NULL,maxl=0,trunc=0;
+        for(char*l=fb,*nx; *l&&(nmax<=0||ni<nmax); l=nx){
+            char*nl=strchr(l,'\n'); nx=nl?nl+1:l+strlen(l); if(nl) *nl=0;
+            int k=(int)strlen(l); while(k>0&&l[k-1]=='\r') l[--k]=0;
+            char*f[18]; int nf=0; for(char*s=l; nf<18; ){ f[nf++]=s; char*t=strchr(s,'\t'); if(!t) break; *t=0; s=t+1; }
+            if(nf<3) continue;
+            for(int j=1;j<nf;j++) le_unescape(f[j]);
+            if(ni==ic){ ic=ic?2*ic:1024; gold=(int*)realloc(gold,4*ic); nc=(int*)realloc(nc,4*ic); q0=(int*)realloc(q0,4*ic); }
+            gold[ni]=atoi(f[0]); nc[ni]=nf-2; q0[ni]=nq;
+            int cn; int*ci=tok_encode(tk,f[1],&cn);
+            for(int j=2;j<nf;j++){
+                if(nq==qc){ qc=qc?2*qc:4096; sq=(int**)realloc(sq,sizeof(int*)*qc); ln=(int*)realloc(ln,4*qc); st=(int*)realloc(st,4*qc); by=(int*)realloc(by,4*qc); }
+                int kn; int*ki=tok_encode(tk,f[j],&kn); int L=1+cn+kn, s0=1+cn;
+                int*s=(int*)malloc(4*(size_t)L); s[0]=tk->eot; memcpy(s+1,ci,4*(size_t)cn); memcpy(s+s0,ki,4*(size_t)kn); free(ki);
+                if(L>Tm+1){ int d=L-(Tm+1); memmove(s,s+d,4*(size_t)(Tm+1)); L-=d; s0-=d; trunc++; if(s0<1) s0=1; }
+                sq[nq]=s; ln[nq]=L; st[nq]=s0; by[nq]=(int)strlen(f[j]); if(L>maxl) maxl=L; nq++; }
+            free(ci); ni++;
+        }
+        free(fb);
+        if(!ni){ printf("[lmeval] %s: no items\n",tn); continue; }
+        const char*ft=getenv("CUDALM_LMEVAL_T"); int T=ft&&atoi(ft)>64?atoi(ft):64;   /* floor, for padding checks */
+        while(T<maxl-1) T*=2; if(T>Tm) T=Tm; gC.T=T; int B=N/T; double tt=wall();
+        double*ll=(double*)malloc(8*nq); char*gr=(char*)calloc(nq,1); int greedy=1;
+        for(int i=0;i<ni;i++) if(nc[i]!=1){ greedy=0; break; }
+        for(int k0=0;k0<nq;k0+=B){
+            int nb=nq-k0<B?nq-k0:B;
+            memset(tok,0,(size_t)N*4); memset(tgt,0,(size_t)N*4);
+            for(int i=0;i<nb;i++){ const int*s=sq[k0+i]; for(int j=0;j<ln[k0+i]-1;j++){ tok[i*T+j]=s[j]; tgt[i*T+j]=s[j+1]; } }
+            ck(cudaMemcpy(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice),"tok h2d");
+            ck(cudaMemcpy(tgtG,tgt,(size_t)N*4,cudaMemcpyHostToDevice),"tgt h2d");
+            gpu_forward(P,&o,a,tokG); gpu_loss(P,&o,a,tgtG,N,lp);
+            for(int i=0;i<nb;i++){ int k=k0+i; double s=0; for(int j=st[k]-1;j<ln[k]-1;j++) s-=lp[i*T+j]; ll[k]=s; }
+            if(!greedy) continue;
+            for(int i0=0;i0<nb;){                   /* logits of continuation rows, <= CH_ROWS per pass */
+                int r=0,i1=i0; while(i1<nb&&r+ln[k0+i1]-st[k0+i1]<=CH_ROWS){ int k=k0+i1, m=ln[k]-st[k];
+                    g_abt(a->fn+((size_t)i1*T+st[k]-1)*D,P+o.emb,a->logits+(size_t)r*V,m,D,V); r+=m; i1++; }
+                if(i1==i0){ fprintf(stderr,"[lmeval] continuation longer than %d tokens\n",CH_ROWS); exit(1); }
+                ck(cudaMemcpy(lg,a->logits,(size_t)r*V*4,cudaMemcpyDeviceToHost),"logits d2h");
+                r=0; for(int i=i0;i<i1;i++){ int k=k0+i, ok=1;
+                    for(int j=st[k];j<ln[k];j++,r++){ const float*z=lg+(size_t)r*V; int bi=0; for(int v=1;v<V;v++) if(z[v]>z[bi]) bi=v; ok&=bi==sq[k][j]; }
+                    gr[k]=(char)ok; }
+                i0=i1; }
+        }
+        double A=0,AN=0,CH=0,LL=0;
+        for(int i=0;i<ni;i++){ int k=q0[i];
+            if(greedy){ A+=gr[k]; LL+=ll[k]; continue; }
+            int bs=0,bn=0; for(int j=1;j<nc[i];j++){ if(ll[k+j]>ll[k+bs]) bs=j; if(ll[k+j]/by[k+j]>ll[k+bn]/by[k+bn]) bn=j; }
+            A+=bs==gold[i]; AN+=bn==gold[i]; CH+=1.0/nc[i]; }
+        double p=A/ni,pn=AN/ni;
+        if(greedy) snprintf(sum[ns],200,"  %-10s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),T,wall()-tt,trunc?", truncated":"");
+        else snprintf(sum[ns],200,"  %-10s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   (T %d, %.1fs)",tn,ni,
+                      100*p,100*sqrt(p*(1-p)/ni),100*pn,100*sqrt(pn*(1-pn)/ni),100*CH/ni,T,wall()-tt);
+        printf("%s\n",sum[ns]); fflush(stdout); if(ns<15) ns++;
+        for(int k=0;k<nq;k++) free(sq[k]); free(sq); free(ln); free(st); free(by); free(gold); free(nc); free(q0); free(ll); free(gr);
+    }
+    printf("\n[lmeval] summary %s (%.1fs)\n",argv[2],wall()-t0); for(int i=0;i<ns;i++) printf("%s\n",sum[i]);
+}
+
 /* ===================== bench ============================================ */
 static void cmd_bench(int argc,char**argv){
     if(argc<3){ fprintf(stderr,
@@ -9471,7 +9564,8 @@ int main(int argc,char**argv){
         "  cudalm probe    <name> <prompts.txt> [ntok] [temp] [topk]\n"
         "  cudalm bench    <preset> [iters] [batch]\n"
         "  cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp] [T]\n"
-        "  cudalm grow     <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
+        "  cudalm lmeval   <name> [hellaswag,arc_easy,piqa,lambada|all] [n] [Tmax]\n"
+        "  cudalm grow    <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
         "  cudalm gguf     <name> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]\n"
         "  cudalm qlmcheck <name> [group]\n"
@@ -9486,6 +9580,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"eval"))     { cmd_eval(argc,argv);  return 0; }
     if(!strcmp(argv[1],"probe"))    { cmd_probe(argc,argv); return 0; }
     if(!strcmp(argv[1],"chatbench")){ cmd_chatbench(argc,argv); return 0; }
+    if(!strcmp(argv[1],"lmeval"))   { cmd_lmeval(argc,argv); return 0; }
     if(!strcmp(argv[1],"bench"))    { cmd_bench(argc,argv); return 0; }
     if(!strcmp(argv[1],"grow"))     { return cmd_grow(argc,argv); }
     if(!strcmp(argv[1],"quantize")) { return cmd_quantize(argc,argv); }

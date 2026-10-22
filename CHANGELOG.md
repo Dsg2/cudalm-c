@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-22
 
+- Add cudalm lmeval command to README.md
+- Create bench/lmeval_prep.py to convert HellaSwag, ARC-Easy, PIQA and LAMBADA parquet/jsonl files into cudalm lmeval .tsv files
+- Add cmd_lmeval function to cudalm.cu with zero-shot lm-eval-harness prompt handling
+
+## Unreleased - 2026-10-22
+
 Add chatbench v2 benchmark file
 Add chatbench v2 benchmark file
 Add chatbench v2 benchmark file
