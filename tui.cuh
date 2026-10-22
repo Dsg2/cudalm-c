@@ -33,7 +33,7 @@ static const TCmd T_CMDS[]={
    {"top-p","0.9",F_TEXT},{"rep pen","1.15",F_TEXT},{"samples","4",F_TEXT},{"ctx T","256",F_TEXT}}},
  {"lmeval","LM eval","zero-shot HellaSwag / ARC-Easy / PIQA / LAMBADA on the full sets",
   {{"model","",F_MODEL},
-   {"tasks","all",F_CHOICE,"all|hellaswag|arc_easy|piqa|lambada",0,0,"all = the four tasks; Enter -> type a value for a comma list (e.g. arc_easy,piqa)\n"
+   {"tasks","all",F_CHOICE,"all|hellaswag|arc_easy|arc_challenge|piqa|lambada|arithmark",0,0,"all = the six tasks; Enter -> type a value for a comma list (e.g. arc_easy,piqa)\n"
     "or a .tsv path. Task files live in bench\\ (CUDALM_BENCH_DIR); missing ones are downloaded once (python + pyarrow)."},
    {"items","0",F_TEXT,0,0,0,"0 = every item; N = only the first N of each task (quick check)."},
    {"max ctx","1024",F_TEXT,0,0,0,"Longest sequence scored (capped at the model's context); longer LAMBADA passages are cut from the left."}},

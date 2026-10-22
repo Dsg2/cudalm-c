@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-22
 
+- README.md: update lmeval command line and benchmark table
+- bench/lmeval_prep.py: add arcc_test.parquet and arithmark-3.jsonl sources
+- cudalm.cu: extend lmeval tasks list and usage help
+- tui.cuh: update lmeval tasks choice values
+
+## Unreleased - 2026-10-22
+
 - Change g_asn_ev initialization from NULL to 0 in moe_perm
 - Update cmd_bench to print "system RAM" or "VRAM" instead of hardcoded value
 - Add GPU build-only message for "decheck" command in main

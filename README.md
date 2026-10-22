@@ -86,7 +86,7 @@ cudalm train     <name> <corpus> [epochs]
 cudalm eval      <name> <corpus> [batches] [batch_size]
 cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]
 cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp]
-cudalm lmeval    <name> [hellaswag,arc_easy,piqa,lambada|all] [n] [Tmax]
+cudalm lmeval    <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>
@@ -145,7 +145,7 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 | `runs\` | Reference recipe: `s8w2env.bat` (model env), `pretrain.bat`, `sft.bat` (chat SFT continuing a base model) |
 | `bench\chatbench.txt`, `chatbench.bat`, `bench\chatbench_v2.txt` | Chat benchmark: 118 multiple-choice + 24 open-generation prompts (v2 expanded) |
 | `bench\judge.c`, `judgerun.bat` | Coherence judge: scores chatbench replies with any instruct GGUF via llama-server (`JUDGE_GGUF`, `LLAMA_SERVER`) |
-| `bench\lmeval_prep.py` | Converts HellaSwag (val), ARC-Easy (test), PIQA (val) and LAMBADA (OpenAI test) into the `cudalm lmeval` .tsv files (lm-eval-harness prompts); `cudalm lmeval` reads them from `CUDALM_BENCH_DIR` (default `<exe dir>\bench`) and runs it to download + convert them when a task file is missing |
+| `bench\lmeval_prep.py` | Converts HellaSwag (val), ARC-Easy and ARC-Challenge (test), PIQA (val), LAMBADA (OpenAI test) and ArithMark 3.0 (AxiomicLabs, 1000 arithmetic word problems) into the `cudalm lmeval` .tsv files (lm-eval-harness prompts); `cudalm lmeval` reads them from `CUDALM_BENCH_DIR` (default `<exe dir>\bench`) and runs it to download + convert them when a task file is missing |
 | `bench\gemmbench.cu` | MoE expert-GEMM micro-benchmark |
 | `teach\teachgen.c`, `teachrun.bat` | Synthetic teacher data from llama-server instances (`TEACHER_GGUF`, `LLAMA_SERVER`) |
 | `teach\teachtok.c` | Teacher jsonl → train/val token bins with the model's tokenizer (special tokens matched literally) |

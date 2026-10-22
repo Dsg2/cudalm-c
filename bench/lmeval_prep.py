@@ -9,6 +9,8 @@ os.makedirs(d, exist_ok=True)
 SRC = {
     "hs_val.parquet": "https://huggingface.co/datasets/Rowan/hellaswag/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet",
     "arce_test.parquet": "https://huggingface.co/datasets/allenai/ai2_arc/resolve/main/ARC-Easy/test-00000-of-00001.parquet",
+    "arcc_test.parquet": "https://huggingface.co/datasets/allenai/ai2_arc/resolve/main/ARC-Challenge/test-00000-of-00001.parquet",
+    "arithmark-3.jsonl": "https://huggingface.co/datasets/AxiomicLabs/Arithmark-3.0/resolve/main/arithmark-3.jsonl",
     "piqa_valid.jsonl": "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid.jsonl",
     "piqa_valid-labels.lst": "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid-labels.lst",
     "lambada_test.jsonl": "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl",
@@ -35,11 +37,18 @@ for r in pq.read_table(os.path.join(d, "hs_val.parquet")).to_pylist():
     rows.append((int(r["label"]), hs_pre(r["activity_label"] + ": " + ctx), [" " + hs_pre(e) for e in r["endings"]]))
 out("hellaswag.tsv", rows)
 
-rows = []
-for r in pq.read_table(os.path.join(d, "arce_test.parquet")).to_pylist():
-    lab = r["choices"]["label"]
-    rows.append((lab.index(r["answerKey"]), "Question: " + r["question"] + "\nAnswer:", [" " + t for t in r["choices"]["text"]]))
-out("arc_easy.tsv", rows)
+for src, name in (("arce_test.parquet", "arc_easy.tsv"), ("arcc_test.parquet", "arc_challenge.tsv")):
+    rows = []
+    for r in pq.read_table(os.path.join(d, src)).to_pylist():
+        lab = r["choices"]["label"]
+        rows.append((lab.index(r["answerKey"]), "Question: " + r["question"] + "\nAnswer:", [" " + t for t in r["choices"]["text"]]))
+    out(name, rows)
+
+rows = []   # ArithMark 3.0: unfinished word problem + 4 endings (leading space kept), as its bencharithmark-3.py scores it
+for ln in open(os.path.join(d, "arithmark-3.jsonl"), encoding="utf-8"):
+    r = json.loads(ln)
+    rows.append((int(r["label"]), r["ctx"], r["endings"]))
+out("arithmark.tsv", rows)
 
 labs = open(os.path.join(d, "piqa_valid-labels.lst")).read().split()
 rows = []

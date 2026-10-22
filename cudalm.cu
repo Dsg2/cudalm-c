@@ -8216,14 +8216,14 @@ static void cmd_chatbench(int argc,char**argv){
 static void le_unescape(char*s){ char*w=s; for(char*r=s;*r;r++){ if(*r=='\\'&&r[1]){ r++; *w++=*r=='n'?'\n':*r=='t'?'\t':*r; } else *w++=*r; } *w=0; }
 static void cmd_lmeval(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: cudalm lmeval <name|model.bin> [tasks|all] [n=all] [Tmax=1024]\n"
-        "  tasks: comma list of hellaswag,arc_easy,piqa,lambada (files $CUDALM_BENCH_DIR/<task>.tsv, default dir bench)\n"
+        "  tasks: comma list of hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark (files $CUDALM_BENCH_DIR/<task>.tsv, default dir bench)\n"
         "         or .tsv paths; n>0 scores only the first n items of each task\n"); exit(1); }
     g_fp8gemm=0;    /* per-tensor FP8 scales see the whole batch (padding included): scores would depend on batching */
     char path[1024]; model_path(argv[2],path,sizeof(path));
     FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
     Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk);
     if(!tk){ fprintf(stderr,"model has no tokenizer (untrained?)\n"); exit(1); }
-    char tl[1024]; snprintf(tl,sizeof tl,"%s",argc>3&&strcmp(argv[3],"all")?argv[3]:"hellaswag,arc_easy,piqa,lambada");
+    char tl[1024]; snprintf(tl,sizeof tl,"%s",argc>3&&strcmp(argv[3],"all")?argv[3]:"hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark");
     int nmax=argc>4?atoi(argv[4]):0, Tm=64, Tq=argc>5?atoi(argv[5]):1024; if(Tq>c.T) Tq=c.T;
     while(Tm*2<=Tq) Tm*=2;
     char bdd[1100]; const char*bd=getenv("CUDALM_BENCH_DIR");
@@ -8301,8 +8301,8 @@ static void cmd_lmeval(int argc,char**argv){
             int bs=0,bn=0; for(int j=1;j<nc[i];j++){ if(ll[k+j]>ll[k+bs]) bs=j; if(ll[k+j]/by[k+j]>ll[k+bn]/by[k+bn]) bn=j; }
             A+=bs==gold[i]; AN+=bn==gold[i]; CH+=1.0/nc[i]; }
         double p=A/ni,pn=AN/ni;
-        if(greedy) snprintf(sum[ns],200,"  %-10s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),T,wall()-tt,trunc?", truncated":"");
-        else snprintf(sum[ns],200,"  %-10s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   (T %d, %.1fs)",tn,ni,
+        if(greedy) snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),T,wall()-tt,trunc?", truncated":"");
+        else snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   (T %d, %.1fs)",tn,ni,
                       100*p,100*sqrt(p*(1-p)/ni),100*pn,100*sqrt(pn*(1-pn)/ni),100*CH/ni,T,wall()-tt);
         printf("%s\n",sum[ns]); fflush(stdout); if(ns<15) ns++;
         for(int k=0;k<nq;k++) free(sq[k]); free(sq); free(ln); free(st); free(by); free(gold); free(nc); free(q0); free(ll); free(gr);
@@ -9613,7 +9613,7 @@ int main(int argc,char**argv){
         "  cudalm probe    <name> <prompts.txt> [ntok] [temp] [topk]\n"
         "  cudalm bench    <preset> [iters] [batch]\n"
         "  cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp] [T]\n"
-        "  cudalm lmeval   <name> [hellaswag,arc_easy,piqa,lambada|all] [n] [Tmax]\n"
+        "  cudalm lmeval   <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]\n"
         "  cudalm grow    <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
         "  cudalm gguf     <name> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]\n"
