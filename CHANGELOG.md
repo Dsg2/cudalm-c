@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: add speed switches section
+- cudalm.cu: add cp.async tile prefetch support and CUDALM_* flags
+
+## Unreleased - 2026-10-23
+
 - README.md: document CUDALM_BENCH_EVERY, CUDALM_BENCH_TASKS, CUDALM_BENCH_N
 - cudalm.cu: add CUDALM_BENCH_* env vars, train_bench() function, and bench_every logic in cmd_train
 - tui.cuh: add bench every and bench items flags to train command

@@ -185,3 +185,12 @@ fp16/f32 keep floats; a quantized model exports as its own type.
   decays over the last 40% of the SFT steps. `<base_iters>` is the base run's final iteration.
 - **Measuring SFT:** use `bench\chatbench.bat` (accuracy) and `bench\judgerun.bat` (coherence). Validation loss alone
   is a poor guide.
+- **Speed switches:** each of these is on by default and has an off switch for A/B runs. On a 5060 Ti, LS-Micro (top-1) went from
+  254k to 294k tok/s and s8w (top-2) from 108k to about 120k.
+  - `CUDALM_TOP1_OLD=1`: runs top-1 on its old fp32 path. By default top-1 runs as top-K with K=1, which uses bf16 fused experts.
+  - `CUDALM_MOE_GPERM=0`: builds the expert permutation on the host. By default the GPU builds it with the same stable order.
+  - `CUDALM_MOE_MERGE=0`: runs the top-2 passes separately. By default they run as one grouped pass.
+  - `CUDALM_FA_CP=0`: turns off the cp.async tile prefetch in the FA2 attention kernels.
+  - `CUDALM_LRS_KEEP=0`: makes the LR scaler retrain the steps of the ×1.0 arm instead of keeping it.
+  - `CUDALM_CH_ROWS`: sets the head row chunk. It defaults to 2048; 8192 was slower.
+  - `CUDALM_NOSYNC`: on by default on Linux.
