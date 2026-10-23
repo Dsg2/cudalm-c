@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-23
 
+- Add template parsing and rendering functions to data.cuh
+- Add data peek command to data.cuh
+- Update data.cuh hf_rows usage to support template
+- Add --template flag to fetch.py and update its usage
+- Update README.md with template documentation and examples
+
+## Unreleased - 2026-10-23
+
 - Add hf_* CLI commands and fetch.py profile handler for HF datasets
 - Add WinINet-based d_http for Hugging Face HTTP calls
 - Update data.cuh d_walk to skip sources.json metadata

@@ -700,18 +700,61 @@ static int hf_default(const HfSplit*s,int n){                      /* same pick 
 static int hf_rows(const char*repo,const char*cfg,const char*split,DBuf*b){
     char e[400],c[200],sp[120],u[1000]; d_urlenc(repo,e,sizeof e); d_urlenc(cfg,c,sizeof c); d_urlenc(split,sp,sizeof sp);
     snprintf(u,sizeof u,HF_DS "/first-rows?dataset=%s&config=%s&split=%s",e,c,sp); return d_http(u,b); }
-/* which columns fetch.py's auto parser would use (its auto_doc order); string columns go to cols (cap 32) */
-static const char* hf_detect(const char*rj,char cols[][64],int*nc){
-    static char how[160]; how[0]=0; *nc=0; int has[16]={0}; const char*K[]={"text","messages","conversations","conversation","instruction","prompt","question",
-        "output","response","answer","content","code","markdown","body"}; const char*v=jget(rj,"features");
-    if(v) for(const char*x=jfirst(v);x;x=jnext(x)){ char nm[64]; d_jstr(jget(x,"name"),nm,sizeof nm); const char*t=jget(x,"type"); char dt[32]=""; if(t&&*t=='{') d_jstr(jget(t,"dtype"),dt,sizeof dt);
-        int str=!strcmp(dt,"string")||!strcmp(dt,"large_string"); if(str&&*nc<32) snprintf(cols[(*nc)++],64,"%s",nm);
-        for(int k=0;k<14;k++) if(!strcmp(nm,K[k])) has[k]=k>=1&&k<4?1:str; }
-    if(has[0]) return "text column 'text'";
-    for(int k=1;k<4;k++) if(has[k]){ snprintf(how,sizeof how,"chat turns in '%s'",K[k]); return how; }
-    if((has[4]||has[5]||has[6])&&(has[7]||has[8]||has[9])) return "instruction / answer pairs (rendered as chat)";
-    for(int k=10;k<14;k++) if(has[k]){ snprintf(how,sizeof how,"text column '%s'",K[k]); return how; }
+/* ---------------- templates: which columns become the document (twin of fetch.py parse_tpl / tpl_doc) ----------------
+ * text=a+b | chat=col | user=q+ctx,assistant=a  (+ system=col, tools=col); "a" alone = text=a; empty = auto-detect */
+static const char*TPL_K[6]={"text","chat","user","assistant","system","tools"};
+typedef struct { char c[6][8][64]; int n[6]; } DTpl;
+static int tpl_parse(const char*s,DTpl*t,char*err,size_t ecap){
+    memset(t,0,sizeof *t); err[0]=0; char b[1024]; snprintf(b,sizeof b,"%s",s?s:"");
+    for(char*p=b,*e;p&&*p;p=e){ e=strchr(p,','); if(e) *e++=0; char*v=strchr(p,'='); int k=0;
+        if(v){ *v++=0; while(*p==' ') p++; for(char*q=p+strlen(p);q>p&&q[-1]==' ';) *--q=0;
+            for(k=0;k<6&&strcmp(TPL_K[k],p);k++); if(k==6){ snprintf(err,ecap,"unknown template key '%s' (text chat user assistant system tools)",p); return 0; } }
+        else v=p;
+        for(char*c=v,*f;c&&*c;c=f){ f=strchr(c,'+'); if(f) *f++=0; while(*c==' ') c++; for(char*q=c+strlen(c);q>c&&q[-1]==' ';) *--q=0;
+            if(*c&&t->n[k]<8) snprintf(t->c[k][t->n[k]++],64,"%s",c); } }
+    if(!t->n[2]!=!t->n[3]){ snprintf(err,ecap,"user= and assistant= go together"); return 0; }
+    return 1; }
+static void tpl_fmt(const DTpl*t,char*o,size_t cap){ size_t n=0; o[0]=0;
+    for(int k=0;k<6;k++) if(t->n[k]&&n<cap){ n+=snprintf(o+n,cap-n,"%s%s=",n?",":"",TPL_K[k]);
+        for(int i=0;i<t->n[k]&&n<cap;i++) n+=snprintf(o+n,cap-n,"%s%s",i?"+":"",t->c[k][i]); } }
+static void d_jput(DBuf*o,const char*s,size_t n){ db_put(o,"\"",1);
+    for(size_t i=0;i<n;i++){ unsigned char c=(unsigned char)s[i]; char x[8];
+        if(c=='"'||c=='\\'){ x[0]='\\'; x[1]=(char)c; db_put(o,x,2); } else if(c<32){ snprintf(x,sizeof x,"\\u%04x",c); db_s(o,x); } else db_put(o,&s[i],1); }
+    db_put(o,"\"",1); }
+static void tpl_cell(const char*row,const DTpl*t,int k,DBuf*o){   /* those columns as one string, blank-line separated */
+    o->n=0; db_s(o,"");
+    for(int i=0;i<t->n[k];i++){ const char*v=jget(row,t->c[k][i]); if(!v||*v=='n') continue; DBuf x={0}; jval(v,&x);
+        const char*s=x.p?x.p:""; size_t n=x.n; d_trim(&s,&n); if(n){ if(o->n) db_s(o,"\n\n"); db_put(o,s,n); } free(x.p); } }
+static void tpl_obj(const char*row,const DTpl*t,DBuf*o){           /* row -> the object d_doc renders as fetch.py would */
+    DBuf c={0}; o->n=0; db_s(o,"{");
+    if(t->n[0]){ tpl_cell(row,t,0,&c); db_s(o,"\"text\":"); d_jput(o,c.p,c.n); }
+    else { int f=0;
+        if(t->n[4]){ tpl_cell(row,t,4,&c); if(c.n){ db_s(o,"\"system\":"); d_jput(o,c.p,c.n); f=1; } }
+        if(t->n[5]){ tpl_cell(row,t,5,&c); if(c.n){ db_s(o,f?",\"tools\":":"\"tools\":"); d_jput(o,c.p,c.n); f=1; } }
+        db_s(o,f?",\"messages\":":"\"messages\":");
+        if(t->n[1]){ const char*v=jget(row,t->c[1][0]); const char*e=v?jskip(v):NULL; if(e) db_put(o,v,e-v); else db_s(o,"[]"); }
+        else if(t->n[2]){ db_s(o,"[{\"role\":\"user\",\"content\":"); tpl_cell(row,t,2,&c); d_jput(o,c.p,c.n);
+            db_s(o,"},{\"role\":\"assistant\",\"content\":"); tpl_cell(row,t,3,&c); d_jput(o,c.p,c.n); db_s(o,"}]"); }
+        else db_s(o,"[]"); }
+    db_s(o,"}"); free(c.p); }
+static int tpl_render(const char*row,const char*tpl,DWs*w,const char**txt,size_t*n){   /* 0 = this row gives no document */
+    char cat[96],e[200]; DTpl t; if(!tpl||!*tpl) return d_doc(row,w,txt,n,cat,sizeof cat);
+    if(!tpl_parse(tpl,&t,e,sizeof e)) return 0; static DBuf ob; tpl_obj(row,&t,&ob); return d_doc(ob.p,w,txt,n,cat,sizeof cat); }
+static const char* tpl_auto(const char*row){                       /* what auto-detect picks for this row (d_doc order) */
+    static char how[160]; const char*v=jget(row,"text"); if(v&&*v=='"') return "text column 'text'";
+    static const char*ck[]={"messages","conversations","conversation"},*qk[]={"instruction","prompt","question"},*ak[]={"output","response","answer"},
+        *tk[]={"content","code","markdown","body"};
+    for(int k=0;k<3;k++) if(jget(row,ck[k])){ snprintf(how,sizeof how,"chat turns in '%s'",ck[k]); return how; }
+    for(int q=0;q<3;q++) if((v=jget(row,qk[q]))&&*v=='"') for(int a=0;a<3;a++) if((v=jget(row,ak[a]))&&*v=='"'){
+        snprintf(how,sizeof how,"prompt '%s' + answer '%s'",qk[q],ak[a]); return how; }
+    for(int k=0;k<4;k++) if((v=jget(row,tk[k]))&&*v=='"'){ snprintf(how,sizeof how,"text column '%s'",tk[k]); return how; }
     return NULL; }
+static int d_cols(const char*row,char nm[][64],char*kind,int cap){  /* column names + kinds: s text, l list, o object, n other */
+    int n=0; for(const char*k=jfirst(row);k&&*k=='"'&&n<cap;k=jobj_next(k)){ const char*v=jobj_val(k); if(!v) break; d_jstr(k,nm[n],64);
+        kind[n++]=*v=='"'?'s':*v=='['?'l':*v=='{'?'o':'n'; } return n; }
+static const char* d_kname(char k){ return k=='s'?"text":k=='l'?"list":k=='o'?"object":"value"; }
+static const char* d_row(const char*rj,int i){ const char*v=jget(rj,"rows"); int r=0;
+    if(v) for(const char*x=jfirst(v);x;x=jnext(x),r++) if(r==i) return jget(x,"row"); return NULL; }
 static void hf_show_rows(const char*rj,int maxr,int w){             /* first rows: each column, one line, cut at w */
     const char*v=jget(rj,"rows"); int r=0;
     if(v) for(const char*x=jfirst(v);x&&r<maxr;x=jnext(x),r++){ const char*row=jget(x,"row"); if(!row) continue; printf("  \x1b[2mrow %d\x1b[0m\n",r);
@@ -720,6 +763,36 @@ static void hf_show_rows(const char*rj,int maxr,int w){             /* first row
             char*s=b.p?b.p:(char*)""; for(char*q=s;*q;q++) if(*q=='\n'||*q=='\r'||*q=='\t') *q=' ';
             int cut=0,lim=w; while(s[cut]&&lim>0){ if(((unsigned char)s[cut]&0xC0)!=0x80) lim--; cut++; } while(((unsigned char)s[cut]&0xC0)==0x80) cut++;
             printf("    \x1b[36m%-14.14s\x1b[0m %.*s%s\n",nm,cut,s,s[cut]?"...":""); free(b.p); } } }
+static int d_peek(const char*src,DBuf*rj,char*err,size_t ecap){   /* first rows -> rj ({"rows":[{"row":{..}}]}); 0 = error */
+    err[0]=0; rj->n=0; db_s(rj,"");
+    if(!_strnicmp(src,"hf:",3)){ char s[600],cfg[200]="",sp[120]=""; snprintf(s,sizeof s,"%s",src+3); char*a=strchr(s,'@'); if(a) *a=0;
+        char*c=strchr(s,':'); if(c){ *c++=0; char*d=strchr(c,':'); if(d){ *d++=0; snprintf(sp,sizeof sp,"%s",d); } snprintf(cfg,sizeof cfg,"%s",c); }
+        if(!cfg[0]||!sp[0]){ HfSplit h[256]; int part, n=hf_splits(s,h,256,&part,err,ecap); if(n<=0){ if(!err[0]) snprintf(err,ecap,"no splits"); return 0; }
+            int k=hf_default(h,n); if(!cfg[0]) snprintf(cfg,sizeof cfg,"%s",h[k].cfg); if(!sp[0]) snprintf(sp,sizeof sp,"%s",h[k].split); }
+        int st=hf_rows(s,cfg,sp,rj); if(st==200) return 1; d_jstr(jget(rj->p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,st?"HTTP %d":"no connection",st); return 0; }
+    char r[1200],cl[3000]; data_resolve(src,r,sizeof r); if(!d_exists(r)){ snprintf(err,ecap,"not found: %s",src); return 0; }
+    snprintf(cl,sizeof cl,"\"%s \"%s\\prep\\fetch.py\" peek \"%s\" 3 2>NUL\"",py_cmd(),exe_dir(),r);
+    FILE*f=_popen(cl,"rb"); if(!f){ snprintf(err,ecap,"cannot run python (%s)",py_cmd()); return 0; }
+    char b[16384]; size_t n; while((n=fread(b,1,sizeof b,f))>0) db_put(rj,b,n); _pclose(f);
+    if(jget(rj->p,"rows")) return 1; d_jstr(jget(rj->p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,"python gave no rows (%s; prep\\fetch.py present?)",py_cmd()); return 0; }
+static void d_peek_print(const char*rj,const char*tpl,int maxr){
+    const char*r0=d_row(rj,0); if(!r0){ printf("  (no rows)\n"); return; }
+    char nm[64][64],kd[64]; int nc=d_cols(r0,nm,kd,64); DWs w={0}; const char*how=tpl_auto(r0);
+    char fl[600]; d_jstr(jget(rj,"file"),fl,sizeof fl); if(fl[0]) printf("  file %s\n",fl);
+    printf("  columns:"); for(int i=0;i<nc;i++) printf(" %s (%s)",nm[i],d_kname(kd[i]));
+    printf("\n  template: %s\n",tpl&&*tpl?tpl:how?how:"auto finds nothing - give one (text=col, user=q,assistant=a, chat=col)");
+    for(int i=0;i<maxr;i++){ const char*r=d_row(rj,i); if(!r) break; const char*t; size_t n;
+        printf("\x1b[2m--- row %d ---\x1b[0m\n",i);
+        if(tpl_render(r,tpl,&w,&t,&n)) printf("%.*s%s\n",(int)(n>700?700:n),t,n>700?" ...":""); else printf("\x1b[31m(no document from this row)\x1b[0m\n"); } }
+static int cmd_data_peek(int argc,char**argv){
+    if(argc<4){ fprintf(stderr,"usage: cudalm data peek <file|folder|hf:user/dataset[:config[:split]]> [template]\n"
+        "  shows the columns and the first rows as the model will see them\n"
+        "  template: text=a+b | chat=col | user=q+ctx,assistant=a (+ system=col, tools=col); empty = auto-detect\n"); return 1; }
+    const char*tpl=argc>4?argv[4]:""; char t2[600]="", e[300]; const char*at=strchr(argv[3],'@');
+    if(!*tpl&&at&&!_strnicmp(argv[3],"hf:",3)){ snprintf(t2,sizeof t2,"%s",at+1); tpl=t2; }
+    DTpl t; if(*tpl&&!tpl_parse(tpl,&t,e,sizeof e)){ fprintf(stderr,"[peek] %s\n",e); return 1; }
+    DBuf rj={0}; if(!d_peek(argv[3],&rj,e,sizeof e)){ fprintf(stderr,"[peek] %s\n",e); free(rj.p); return 1; }
+    printf("%s\n",argv[3]); d_peek_print(rj.p,tpl,3); free(rj.p); return 0; }
 static void hf_name(const char*repo,const char*cfg,const char*split,char*o,size_t cap){   /* folder name: hf_<dataset>[_cfg][_split] */
     const char*b=strrchr(repo,'/'); b=b?b+1:repo; size_t n=snprintf(o,cap,"hf_%s",b);
     if(cfg&&*cfg&&strcmp(cfg,"default")) n+=snprintf(o+n,cap-n,"_%s",cfg); if(split&&*split&&strcmp(split,"train")) snprintf(o+n,cap-n,"_%s",split);
@@ -737,23 +810,28 @@ static int cmd_data_hf(int argc,char**argv){
             if(part) printf("note: the parquet conversion is partial (about the first 5 GB of each split)\n"); return 0; }
         int k=n?hf_default(sp,n):0; const char*cf=argc>5?argv[5]:n?sp[k].cfg:"default",*sl=argc>6?argv[6]:n?sp[k].split:"train";
         DBuf b={0}; int st=hf_rows(argv[4],cf,sl,&b); if(st!=200){ char e[300]; d_jstr(jget(b.p,"error"),e,sizeof e); fprintf(stderr,"[hf] rows: HTTP %d %s\n",st,e); free(b.p); return 1; }
-        char cols[32][64]; int nc; const char*how=hf_detect(b.p,cols,&nc);
-        printf("%s  config %s  split %s\n  string columns:",argv[4],cf,sl); for(int i=0;i<nc;i++) printf(" %s",cols[i]);
-        printf("\n  fetch reads: %s\n",how?how:"nothing automatically - add @<column> to the spec"); hf_show_rows(b.p,3,110); free(b.p); return 0; }
+        printf("%s  config %s  split %s   (spec hf:%s:%s:%s)\n",argv[4],cf,sl,argv[4],cf,sl); d_peek_print(b.p,argc>7?argv[7]:"",3); free(b.p); return 0; }
     fprintf(stderr,"usage: cudalm data hf search <query> [n=30]     datasets, most downloaded first\n"
                    "       cudalm data hf info <user/dataset>        configs and splits (rows, parquet size)\n"
-                   "       cudalm data hf rows <user/dataset> [config] [split]   columns, what fetch would read, first rows\n"
-                   "  download: cudalm data fetch hf:<user/dataset>[:config[:split]][@column] <out> [tokens]\n"); return 1; }
+                   "       cudalm data hf rows <user/dataset> [config] [split] [template]   columns + first rows as the model sees them\n"
+                   "  download: cudalm data fetch hf:<user/dataset>[:config[:split]] <out> [tokens] [--template T]\n"); return 1; }
 
 /* ---------------- fetch: prep\fetch.py (Hugging Face profiles, parquet/json conversion) ---------------- */
 static int cmd_data_fetch(int argc,char**argv){
-    if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url|hf:user/dataset[:config[:split]][@column]> <out> [target_tokens]   download\n"
-        "       cudalm data fetch <file|folder> <out> [category]       convert parquet/json/jsonl\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
+    const char*tpl=""; char*av[16]; int ac=0;                       /* --template T may sit anywhere */
+    for(int i=0;i<argc&&ac<16;i++){ if(!strcmp(argv[i],"--template")&&i+1<argc){ tpl=argv[++i]; continue; } av[ac++]=argv[i]; }
+    argc=ac; argv=av;
+    if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url|hf:user/dataset[:config[:split]]> <out> [target_tokens] [--template T]   download\n"
+        "       cudalm data fetch <file|folder> <out> [category] [--template T]       convert parquet/json/jsonl\n"
+        "  template: text=a+b | chat=col | user=q+ctx,assistant=a (+ system=col, tools=col); default auto-detect.\n"
+        "  Check one first: cudalm data peek <source> [template]\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
+    if(*tpl){ DTpl t; char e[200]; if(!tpl_parse(tpl,&t,e,sizeof e)){ fprintf(stderr,"[fetch] %s\n",e); return 1; } }
     char out[1200],src[1200],cl[4096]; data_outdir(argv[4],out,sizeof out); data_resolve(argv[3],src,sizeof src);
-    int conv=_strnicmp(argv[3],"http",4) && _strnicmp(argv[3],"hf:",3) && (!d_bare(argv[3])||strchr(argv[3],'.')) && d_exists(src);   /* bare word = profile */
+    int conv=_strnicmp(argv[3],"http",4) && _strnicmp(argv[3],"hf:",3) && (!d_bare(argv[3])||strchr(argv[3],'.')||d_isdir(src)) && d_exists(src);   /* other bare word = profile */
     char x[64]=""; if(argc>5) snprintf(x,sizeof x,"%s",argv[5]);
     if(!conv&&argc>5){ double t=d_count(argv[5]); if(t<=0){ fprintf(stderr,"[fetch] target tokens must be a number (suffixes k M B allowed)\n"); return 1; } snprintf(x,sizeof x,"%.0f",t); }
-    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x);
+    if(*tpl&&!x[0]&&!conv) snprintf(x,sizeof x,"1000000000");
+    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" \"%s\" \"%s\"",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x,tpl);
     return run_cmd(cl); }
 
 static int cmd_data_canon(int argc,char**argv){
@@ -813,12 +891,15 @@ static int cmd_data(int argc,char**argv){
     if(!strcmp(s,"weights"))   return cmd_data_weights(argc,argv);
     if(!strcmp(s,"fetch"))     return cmd_data_fetch(argc,argv);
     if(!strcmp(s,"hf"))        return cmd_data_hf(argc,argv);
+    if(!strcmp(s,"peek"))      return cmd_data_peek(argc,argv);
     char roots[2048]; data_roots(roots,sizeof roots);
     fprintf(stderr,
         "cudalm data - tokenizer and corpus tools (bare names resolve under the data roots)\n"
         "  cudalm data fetch     <profile|url|file|folder> <out> [tokens|category]  download / convert to .jsonl\n"
         "                        hf:<user/dataset>[:config[:split]][@column] downloads any Hugging Face dataset\n"
         "  cudalm data hf        search <query> | info <user/dataset> | rows <user/dataset> [config] [split]\n"
+        "  cudalm data peek      <file|folder|hf:spec> [template]   first rows as the model sees them\n"
+        "  template (fetch --template, peek): text=a+b | chat=col | user=q+ctx,assistant=a (+ system=col, tools=col)\n"
         "  cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]  train a byte-level BPE (+ canon.bin)\n"
         "  cudalm data encode    <new|append> <out> <inputs> <tokenizer> [val%%=1] [dedup=1] [follow=0]\n"
         "  cudalm data mix       <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...\n"

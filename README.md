@@ -138,11 +138,23 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
   - `content` / `code` / `markdown` / `body`.
 - **Mixing:** `cudalm data mix <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...` mixes encoded
   corpora that share a tokenizer. Token counts (fetch, mix) accept `k` / `M` / `B` suffixes (`500M`, `1B`).
-- **Any Hugging Face dataset:** `cudalm data fetch hf:<user/dataset>[:config[:split]][@column] <out> [tokens]` downloads
+- **Templates (which columns become the document):** `--template` on `data fetch` (hf:, URL and convert), the
+  `template` field in Download text / Convert files, and T in the Hugging Face preview.
+  | Template | Result |
+  | --- | --- |
+  | empty | auto-detect: `text`, chat `messages`/`conversations`, instruction/answer pairs, `content`/`code` |
+  | `text=title+body` | plain text, columns joined by a blank line (`col` alone = `text=col`) |
+  | `user=question+context,assistant=answer` | one `<\|user\|>` / `<\|assistant\|>` exchange; several columns are joined |
+  | `chat=conversation` | a list of turns (`role`/`content` or `from`/`value`) in any column |
+  | `+ system=col`, `tools=col` | added to a chat or user/assistant template |
+
+  `cudalm data peek <file|folder|hf:spec> [template]` prints the columns and the first rows exactly as the model will
+  see them. The TUI editor shows the same live, with keys T text, P prompt + answer, C chat, S system, O tools, A auto.
+- **Any Hugging Face dataset:** `cudalm data fetch hf:<user/dataset>[:config[:split]] <out> [tokens] [--template T]` downloads
   the hub's parquet files for that split, or the repo's own .parquet/.jsonl/.json files when the hub has no conversion.
   The config defaults to `default` and the split to `train`. Text is auto-detected the same way as Convert files:
   `text`, chat `messages`/`conversations`, instruction/answer pairs, or `content`/`code`/`markdown`/`body`.
-  `@column` reads one column instead.
+  `--template` (or `@template` at the end of the spec) picks the columns instead (see Templates).
   - `cudalm data hf search <query>`: lists matching datasets.
   - `cudalm data hf info <user/dataset>`: lists configs and splits with row counts and sizes.
   - `cudalm data hf rows <user/dataset> [config] [split]`: shows the columns, what fetch will read, and the first rows.

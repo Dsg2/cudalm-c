@@ -137,13 +137,20 @@ static const TCmd T_CMDS[]={
    {"out folder","text_v3pre",F_TEXT,0,0,0,"Folder for the text (<category>__<source>.jsonl). A bare name goes under the data root with the most free space.\n"
      "Run again with the same folder to resume an interrupted download."},
    {"tokens","1B",F_TEXT,0,0,0,"Roughly how many tokens of text to fetch (k / M / B suffixes; 1B ~ 4.6 GB of text), split by the profile's weights.\n"
-     "Get 10-20% more than you plan to train on."}},
+     "Get 10-20% more than you plan to train on."},
+   {"template","",F_OPT,"--template",0,0,"Which columns become each document. Enter opens the editor: the columns, and the first rows exactly as the model will see them.\n"
+     "Empty = auto (text, messages / conversations, instruction + output, content / code). Or type: text=a+b | chat=col |\n"
+     "user=q+ctx,assistant=a  (+ system=col, tools=col)."}},
   "Run: download and parse each source in turn (raw shards are deleted once parsed).\nNext: Build corpus with this folder as text (tokenizer v3tok), or Train tokenizer first for a new vocab.",1},
  {"data fetch","Convert files","parquet / json / jsonl from elsewhere -> plain .jsonl text (python + pyarrow)",
   {{"source","",F_PATH,0,0,".parquet;.json;.jsonl","A .parquet / .json / .jsonl file, or a folder (every such file inside, recursively).\n"
-     "Rows with messages / conversations become chats; otherwise the text / content / code column is used."},
+     "Rows with messages / conversations become chats; otherwise the text / content / code column is used.\n"
+     "Set template to choose the columns yourself (prompt + answer, several text columns, a system column...)."},
    {"out folder","converted",F_TEXT,0,0,0,"Folder for the converted .jsonl (one per input file). A bare name goes under a data root."},
-   {"category","",F_TEXT,0,0,0,"Category stored with every doc and shown in the corpus stats. Empty = the file name."}},
+   {"category","",F_TEXT,0,0,0,"Category stored with every doc and shown in the corpus stats. Empty = the file name."},
+   {"template","",F_OPT,"--template",0,0,"Which columns become each document. Enter opens the editor: the columns, and the first rows exactly as the model will see them.\n"
+     "Empty = auto (text, messages / conversations, instruction + output, content / code). Or type: text=a+b | chat=col |\n"
+     "user=q+ctx,assistant=a  (+ system=col, tools=col)."}},
   "Run: convert. .jsonl/.json that already has \"text\" or chat fields needs no conversion:\nBuild corpus reads it directly.",1},
  {"data tokenizer","Train tokenizer","byte-level BPE from your text -> tokenizer.json (HF) + tokenizer.bin + canon.bin",
   {{"out name","mytok",F_TEXT,0,0,0,"Folder for the new tokenizer (a bare name goes under the data root with most free space).\n"
@@ -553,6 +560,63 @@ static void t_help(const TFld*f, const char*v, const char*run){
             cf.win?" (windowed)":""); n++; }
     for(;n<3;n++) printf("\n"); }
 
+/* ---- template editor: which columns become the document, previewed exactly as the model will see it ---- */
+static void t_tplshow(const char*row,const char*tpl,int maxl){
+    static DWs w; const char*t; size_t n, i=0; int wd=t_cols()-4, l=0; if(wd<40) wd=40; if(maxl<3) maxl=3;
+    if(!tpl_render(row,tpl,&w,&t,&n)){ printf("  \x1b[31m(no document from this row with this template)\x1b[0m\n"); return; }
+    for(;i<n&&l<maxl;l++){ size_t e=i,c=i; int k=0; while(e<n&&t[e]!='\n') e++;
+        while(c<e&&k<wd){ if(((unsigned char)t[c]&0xC0)!=0x80) k++; c++; } while(c<e&&((unsigned char)t[c]&0xC0)==0x80) c++;
+        int mk=e-i>=4&&t[i]=='<'&&t[i+1]=='|'&&t[e-1]=='>';
+        printf("  %s%.*s%s\x1b[0m\n",mk?"\x1b[1;35m":"",(int)(c-i),t+i,c<e?"\x1b[2m...":""); i=e+1; }
+    if(i<n) printf("  \x1b[2m... %zu characters in all\x1b[0m\n",n); }
+static int t_pickcols(const char*ttl,char nm[][64],const char*kd,int nc,int strs,int multi,const char cur[][64],int ncur,char out[][64]){
+    int n=0, ix[64]; memset(t_mark,0,sizeof t_mark);
+    for(int i=0;i<nc;i++) if(!strs||kd[i]=='s'){ ix[n]=i; snprintf(t_items[n],260,"%s",nm[i]); snprintf(t_info[n],T_INFO,"%s",d_kname(kd[i]));
+        for(int j=0;j<ncur;j++) if(!strcmp(cur[j],nm[i])) t_mark[n]=1; n++; }
+    if(!n){ t_note("no %scolumns to pick",strs?"text ":""); return 0; }
+    t_multi=multi; int s=t_pick(ttl,multi?"Space mark several (joined with a blank line, in list order)   Enter use the marked ones (or the highlighted one)   Esc cancel"
+                                      :"Enter pick   Esc cancel",n,0); t_multi=0;
+    if(s<0) return 0; int m=0; if(multi) for(int i=0;i<n&&m<8;i++) if(t_mark[i]) snprintf(out[m++],64,"%s",nm[ix[i]]);
+    if(!m) snprintf(out[m++],64,"%s",nm[ix[s]]); return m; }
+static int t_colmap(const char*title,const char*rj,char*tpl,int cap){   /* 1 = accepted (tpl updated) */
+    int nr=0; while(nr<8&&d_row(rj,nr)) nr++; if(!nr){ t_note("no rows to preview"); return 0; }
+    DTpl t; char e[200], cur[1024]; if(!tpl_parse(tpl,&t,e,sizeof e)) memset(&t,0,sizeof t); int ri=0;
+    for(;;){ const char*row=d_row(rj,ri); char nm[64][64],kd[64]; int nc=d_cols(row,nm,kd,64), shown=nc<12?nc:12, wd=t_cols()-30; if(wd<20) wd=20;
+        tpl_fmt(&t,cur,sizeof cur); const char*how=tpl_auto(row);
+        t_head(title); printf("  \x1b[1mcolumns\x1b[0m  \x1b[2mrow %d of %d\x1b[0m\n",ri+1,nr);
+        for(int i=0;i<shown;i++){ DBuf x={0}; const char*v=jget(row,nm[i]); if(v) jval(v,&x); char*sv=x.p?x.p:(char*)"";
+            for(char*q=sv;*q;q++) if(*q=='\n'||*q=='\r'||*q=='\t') *q=' ';
+            int c=0,k=0; while(sv[c]&&k<wd){ if(((unsigned char)sv[c]&0xC0)!=0x80) k++; c++; } while(((unsigned char)sv[c]&0xC0)==0x80) c++;
+            printf("    \x1b[36m%-16.16s\x1b[0m \x1b[2m%-6s\x1b[0m %.*s%s\n",nm[i],d_kname(kd[i]),c,sv,sv[c]?"...":""); free(x.p); }
+        if(nc>shown) printf("    \x1b[2m+%d more\x1b[0m\n",nc-shown);
+        if(cur[0]) printf("\n  \x1b[1mtemplate\x1b[0m  %s\n",cur);
+        else printf("\n  \x1b[1mtemplate\x1b[0m  auto: %s\n",how?how:"\x1b[31mnothing recognised - pick columns with T / P / C\x1b[0m");
+        printf("\n  \x1b[2m--- what the model sees ---\x1b[0m\n"); t_tplshow(row,cur,t_rows()-shown-14);
+        printf("\x1b[%d;1H\x1b[2mT text  P prompt + answer  C chat column  S system  O tools  A auto  Left/Right row  Enter use  Esc cancel\x1b[0m",t_rows()); fflush(stdout);
+        int k=t_key();
+        if(k==27) return 0;
+        if(k==13){ snprintf(tpl,cap,"%s",cur); return 1; }
+        if(k==K_LEFT&&ri>0) ri--; else if(k==K_RIGHT&&ri<nr-1) ri++;
+        else if(k=='a'||k=='A') memset(&t,0,sizeof t);
+        else if(k=='t'||k=='T'){ char o[8][64]; int m=t_pickcols("text: the columns that make each document",nm,kd,nc,1,1,t.c[0],t.n[0],o);
+            if(m){ memset(&t,0,sizeof t); memcpy(t.c[0],o,sizeof o); t.n[0]=m; } }
+        else if(k=='p'||k=='P'){ char u[8][64],a[8][64]; int mu=t_pickcols("prompt (user turn): mark several to join them, e.g. question + context",nm,kd,nc,1,1,t.c[2],t.n[2],u); if(!mu) continue;
+            int ma=t_pickcols("answer (assistant turn)",nm,kd,nc,1,1,t.c[3],t.n[3],a); if(!ma) continue;
+            t.n[0]=t.n[1]=0; memcpy(t.c[2],u,sizeof u); t.n[2]=mu; memcpy(t.c[3],a,sizeof a); t.n[3]=ma; }
+        else if(k=='c'||k=='C'){ char o[8][64]; int m=t_pickcols("chat: the column holding the list of turns ({role, content} or {from, value})",nm,kd,nc,0,0,NULL,0,o);
+            if(m){ t.n[0]=t.n[2]=t.n[3]=0; snprintf(t.c[1][0],64,"%s",o[0]); t.n[1]=1; } }
+        else if(k=='s'||k=='S'||k=='o'||k=='O'){ int key=k=='s'||k=='S'?4:5;
+            if(t.n[key]){ t.n[key]=0; continue; }                   /* pressed again: remove */
+            if(!t.n[1]&&!t.n[2]){ t_note("system / tools go with a chat (C) or prompt + answer (P) template"); continue; }
+            char o[8][64]; int m=t_pickcols(key==4?"system prompt column":"tools column (non-text values are kept as JSON)",nm,kd,nc,0,0,NULL,0,o);
+            if(m){ snprintf(t.c[key][0],64,"%s",o[0]); t.n[key]=1; } } } }
+static void t_template(const TCmd*c,char V[][T_MAXL],char*v){       /* Enter on a template field: peek the source, open the editor */
+    const char*src=V[0]; if(!src[0]){ t_note("set '%s' first",c->f[0].label); return; }
+    if(t_is(c,"Download text")&&_strnicmp(src,"hf:",3)){ t_note("the editor needs an hf: source (Browse Hugging Face); for a URL type the template"); t_edit("template",v,T_MAXL); return; }
+    printf("\x1b[%d;1H\x1b[2K  reading the first rows...",t_rows()); fflush(stdout);
+    DBuf rj={0}; char e[300]; if(!d_peek(src,&rj,e,sizeof e)){ t_note("%s",e); t_edit("template",v,T_MAXL); free(rj.p); return; }
+    char ttl[700]; snprintf(ttl,sizeof ttl,"template for %s",src); t_colmap(ttl,rj.p,v,T_MAXL); free(rj.p); }
+
 /* ---- form values (kept per form for the session; other forms' results are handed in with t_set) ---- */
 static char t_vals[T_NCMD][T_NF][T_MAXL]; static int t_vinit[T_NCMD];
 static void t_form_init(int ci){
@@ -602,6 +666,9 @@ static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the
     for(size_t i=0;i<sizeof T_NUM/sizeof T_NUM[0];i++) if(t_is(c,T_NUM[i].t)){ int f=t_fi(ci,T_NUM[i].l); if(f<0||!v[f][0]) continue;
         char*e; double x=T_NUM[i].cnt?d_count(v[f]):strtod(v[f],&e); if(!T_NUM[i].cnt&&*e) x=-1;
         if(x<T_NUM[i].lo||x>T_NUM[i].hi) t_prob(draw,"'%s' must be a number from %g to %g%s",T_NUM[i].l,T_NUM[i].lo,T_NUM[i].hi,T_NUM[i].cnt?" (k / M / B suffixes ok)":""); }
+    { int f=t_fi(ci,"template"); DTpl tp; char te[200];
+        if(f>=0&&v[f][0]){ if(!tpl_parse(v[f],&tp,te,sizeof te)) t_prob(draw,"'template': %s",te);
+            else if(t_is(c,"Download text")&&_strnicmp(v[0],"hf:",3)&&_strnicmp(v[0],"http",4)) t_prob(draw,"'template' applies to hf: and URL sources, not the built-in profiles"); } }
     for(int i=0;i<T_NF&&c->f[i].label;i++){ const TFld*f=&c->f[i]; if(!v[i][0]||!t_vis(f,mode)||t_mixhide(c,v,i)) continue;
         if(f->kind==F_TOKD){ data_resolve(v[i],r,sizeof r);
             if(!t_tokhash(r)) t_prob(draw,"'%s': no tokenizer.bin in %s - Enter to pick one%s",f->label,r,t_is(c,"Build corpus")?", or make one with Train tokenizer":""); }
@@ -707,7 +774,8 @@ static void t_form(const TCmd*c){
                 for(int i=0;i<n;i++) if(!strcmp(t_items[i],v)) cur=i;
                 cur=(cur+(k==K_RIGHT?1:n-1))%n; snprintf(v,T_MAXL,"%s",t_items[cur]); }
             else if(k==13){
-                if(t_is(c,"Build corpus")&&vis[sel]==1){           /* new: a name to create; append: corpora with the same tokenizer */
+                if(f->kind==F_OPT&&f->arg&&!strcmp(f->arg,"--template")) t_template(c,V,v);
+                else if(t_is(c,"Build corpus")&&vis[sel]==1){           /* new: a name to create; append: corpora with the same tokenizer */
                     if(strcmp(V[0],"append")) t_choose(f->label,0,v,T_MAXL,1);
                     else { n=t_list_dirs(0); data_resolve(V[3],r,sizeof r); unsigned h=t_tokhash(r); if(h) n=t_keep_tok(n,h);
                         t_pv=t_corpus_pv; t_choose(f->label,n,v,T_MAXL,1); t_pv=0; } }
@@ -875,30 +943,29 @@ static void t_hf_pv(int sel){ const HfDs*d=&t_hfd[sel]; char a[32], s[400]; int 
     for(int l=0,o=0;l<3&&s[o];l++){ int e=o,c=0; while(s[e]&&c<w){ if(((unsigned char)s[e]&0xC0)!=0x80) c++; e++; } while(((unsigned char)s[e]&0xC0)==0x80) e++;
         printf("  %.*s\n",e-o,s+o); o=e; } }
 static void t_hf_open(const char*repo,const char*cfg,const char*split,long long bytes){
-    DBuf b={0}; char cols[32][64], col[64]="", a[32]; int nc=0, st=0; const char*how=NULL;
-    if(cfg[0]){ t_head(repo); printf("  loading the first rows...\n"); fflush(stdout); st=hf_rows(repo,cfg,split,&b); if(st==200) how=hf_detect(b.p,cols,&nc); }
+    DBuf b={0}; char tpl[T_MAXL]="", a[32]; int st=0; const char*r0=NULL;
+    if(cfg[0]){ t_head(repo); printf("  loading the first rows...\n"); fflush(stdout); st=hf_rows(repo,cfg,split,&b); if(st==200) r0=d_row(b.p,0); }
+    char ttl[400]; snprintf(ttl,sizeof ttl,"template for %s  %s / %s",repo,cfg,split);
     for(;;){
         t_head(repo); printf("  config \x1b[1m%s\x1b[0m   split \x1b[1m%s\x1b[0m",cfg[0]?cfg:"auto",split[0]?split:"auto");
         if(bytes>0) printf("   \x1b[2m%s of parquet, roughly %s tokens\x1b[0m",t_hb((double)bytes,a),t_hn(bytes*0.45,a+16)); printf("\n\n");
-        if(st!=200){ char e[300]=""; if(b.p) d_jstr(jget(b.p,"error"),e,sizeof e);
-            printf("  \x1b[33mno preview%s%s: the download uses the repo's own .parquet / .jsonl / .json files\x1b[0m\n",e[0]?" - ":"",e); }
-        else { printf("  fetch reads: ");
-            if(col[0]) printf("\x1b[1mcolumn '%s'\x1b[0m (chosen)\n",col); else if(how) printf("\x1b[1m%s\x1b[0m (auto)\n",how);
-            else printf("\x1b[31m%s\x1b[0m\n",nc?"no text column recognised - press C to choose one":"no text columns: this dataset cannot be used");
-            printf("\n"); hf_show_rows(b.p,3,t_cols()-24); }
-        printf("\x1b[%d;1H\x1b[2mEnter download this (fills in Download text)   %sEsc back\x1b[0m",t_rows(),nc?"C choose the text column   ":""); fflush(stdout);
+        if(!r0){ char e[300]=""; if(b.p) d_jstr(jget(b.p,"error"),e,sizeof e);
+            printf("  \x1b[33mno preview%s%s: the download uses the repo's own .parquet / .jsonl / .json files, auto-detected\x1b[0m\n",e[0]?" - ":"",e); }
+        else { char nm[64][64],kd[64]; int nc=d_cols(r0,nm,kd,64); const char*how=tpl_auto(r0);
+            hf_show_rows(b.p,1,t_cols()-24);
+            if(tpl[0]) printf("\n  \x1b[1mtemplate\x1b[0m  %s\n",tpl);
+            else printf("\n  \x1b[1mtemplate\x1b[0m  auto: %s\n",how?how:"\x1b[31mnothing recognised - press T to pick the columns\x1b[0m");
+            printf("\n  \x1b[2m--- what the model sees (row 0) ---\x1b[0m\n"); t_tplshow(r0,tpl,t_rows()-nc-14); }
+        printf("\x1b[%d;1H\x1b[2mEnter download this (fills in Download text)   %sEsc back\x1b[0m",t_rows(),r0?"T template: which columns, previewed   ":""); fflush(stdout);
         int k=t_key();
         if(k==27){ free(b.p); return; }
-        if((k=='c'||k=='C')&&nc){ int n=0; snprintf(t_items[n],260,"(auto)"); snprintf(t_info[n++],T_INFO,"%s",how?how:"nothing recognised");
-            for(int i=0;i<nc;i++){ snprintf(t_items[n],260,"%s",cols[i]); t_info[n++][0]=0; }
-            int s=t_pick("text column: its strings become the documents",NULL,n,0); if(s==0) col[0]=0; else if(s>0) snprintf(col,sizeof col,"%s",cols[s-1]); continue; }
+        if((k=='t'||k=='T')&&r0){ t_colmap(ttl,b.p,tpl,sizeof tpl); continue; }
         if(k!=13) continue;
-        if(st==200&&!how&&!col[0]){ t_note(nc?"no text column recognised: press C and pick one":"this dataset has no text columns (images, numbers...)"); continue; }
-        char spec[T_MAXL], nm[200], tk[32]; int n=snprintf(spec,sizeof spec,"hf:%s",repo);
-        if(cfg[0]) n+=snprintf(spec+n,sizeof spec-n,":%s:%s",cfg,split); if(col[0]) snprintf(spec+n,sizeof spec-n,"@%s",col);
+        if(r0){ static DWs w; const char*t; size_t n; if(!tpl_render(r0,tpl,&w,&t,&n)){ t_note("row 0 gives no document with this template: press T and pick the columns"); continue; } }
+        char spec[T_MAXL], nm[200], tk[32]; int n=snprintf(spec,sizeof spec,"hf:%s",repo); if(cfg[0]) snprintf(spec+n,sizeof spec-n,":%s:%s",cfg,split);
         hf_name(repo,cfg,split,nm,sizeof nm); double est=bytes>0?bytes*0.45*1.2:1e9; if(est>1e9) est=1e9; if(est<1e6) est=1e6;
         snprintf(tk,sizeof tk,"%.0fM",est/1e6);
-        t_set("Download text","profile",spec); t_set("Download text","out folder",nm); t_set("Download text","tokens",tk);
+        t_set("Download text","profile",spec); t_set("Download text","out folder",nm); t_set("Download text","tokens",tk); t_set("Download text","template",tpl);
         free(b.p); t_form(&T_CMDS[t_ci("Download text")]); return; } }
 static void t_hf_ds(const char*repo){
     static HfSplit sp[256]; int part; char err[300], a[32], b[32];

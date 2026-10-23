@@ -3,9 +3,16 @@ Writes plain .jsonl ({"text","cat","src"} per line, chat already rendered with t
 `cudalm data tokenizer` / `cudalm data encode` read directly.
 
   python fetch.py list                                   profiles and their sources
-  python fetch.py get <profile|url> <out> [tokens=1e9]   download (resumable) + parse; raw shards are deleted
-       profile hf:<user/dataset>[:config[:split]][@column]  any Hugging Face dataset (its parquet files)
-  python fetch.py convert <file|folder> <out> [cat]      parquet/json/jsonl -> jsonl (schema auto-detected)
+  python fetch.py get <profile|url> <out> [tokens=1e9] [template]   download (resumable) + parse; raw shards are deleted
+       profile hf:<user/dataset>[:config[:split]][@template]  any Hugging Face dataset (its parquet files)
+  python fetch.py convert <file|folder> <out> [cat] [template]      parquet/json/jsonl -> jsonl
+  python fetch.py peek <file|folder> [rows=3]                       first rows as JSON (for the TUI preview)
+
+template: which columns become the document (empty = auto-detect):
+  text=a+b                     plain text, columns joined by a blank line ("a" alone = text=a)
+  chat=col                     a list of turns ({role|from, content|value})
+  user=q+ctx,assistant=a       one prompt/answer exchange
+  + system=col, tools=col      optional, with chat= or user=/assistant=
 
 HF_TOKEN (env) is sent when set (needed for gated sets such as xlam60k).
 """
@@ -150,6 +157,36 @@ def p_xlam(p):
         d = render(turns)
         if d: yield d
 
+TPL_KEYS = ("text", "chat", "user", "assistant", "system", "tools")
+def parse_tpl(s):
+    m = {}
+    for part in filter(None, (s or "").split(",")):
+        k, eq, v = part.partition("=")
+        k, v = (k.strip(), v) if eq else ("text", k)
+        if k not in TPL_KEYS: sys.exit(f"template: unknown key {k!r} - use {' / '.join(TPL_KEYS)}")
+        m[k] = [c.strip() for c in v.split("+") if c.strip()]
+    if ("user" in m) != ("assistant" in m): sys.exit("template: user= and assistant= go together")
+    return m
+
+def cell(r, cols):                                                  # columns -> one string (non-strings as JSON)
+    return "\n\n".join(t for t in ((v if isinstance(v, str) else jtxt(v)).strip() for v in (r.get(c) for c in cols) if v is not None) if t)
+
+def tpl_doc(r, m):
+    if not isinstance(r, dict): return None
+    if "text" in m: return cell(r, m["text"]) or None
+    sysm, tools = cell(r, m.get("system", [])) or None, cell(r, m.get("tools", [])) or None
+    if "chat" in m: return render(conv_turns(r.get(m["chat"][0]), tools=tools, system=sysm))
+    if "user" in m: return render(conv_turns([], tools=tools, system=sysm) + [("user", cell(r, m["user"])), ("assistant", cell(r, m["assistant"]))])
+    return None
+
+def p_tpl(m):
+    cols = list(dict.fromkeys(c for v in m.values() for c in v))
+    def f(p):
+        for r in iter_rows(p, cols):
+            d = tpl_doc(r, m)
+            if d: yield d
+    return f
+
 def p_auto(p):
     for r in iter_rows(p):
         d = auto_doc(r)
@@ -214,10 +251,11 @@ def hf_json(url):
     if os.environ.get("HF_TOKEN"): h["Authorization"] = "Bearer " + os.environ["HF_TOKEN"]
     return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=60))
 
-def hf_source(spec):
-    """hf:<repo>[:config[:split]][@column] -> (name, urls, parser, licence). Files: the hub's parquet conversion
+def hf_source(spec, tpl=None):
+    """hf:<repo>[:config[:split]][@template] -> (name, urls, parser, licence). Files: the hub's parquet conversion
     (datasets-server), else the repo's own .parquet/.jsonl/.json files. Config 'default' and split 'train' when not given."""
     s, col = (spec[3:].rsplit("@", 1) + [None])[:2] if "@" in spec else (spec[3:], None)
+    tpl = tpl or col
     repo, cfg, split = (s.split(":") + [None, None])[:3]
     q = urllib.parse.quote(repo)
     try: files = hf_json(f"https://datasets-server.huggingface.co/parquet?dataset={q}")
@@ -240,12 +278,8 @@ def hf_source(spec):
     try: lic = next((t[8:] for t in hf_json(f"https://huggingface.co/api/datasets/{q}").get("tags", []) if t.startswith("license:")), "?")
     except Exception: pass
     name = re.sub(r"[^\w.-]", "_", repo.split("/")[-1] + (f"-{cfg}" if cfg and cfg != "default" else "") + (f"-{split}" if split and split != "train" else ""))
-    def p_one(p):                                                  # @column: that column as plain text
-        for r in iter_rows(p, [col]):
-            v = r.get(col); d = v.strip() if isinstance(v, str) else auto_doc({"messages": v}) if isinstance(v, list) else None
-            if d: yield d
-    print(f"[hf  ] {repo} config {cfg or '?'} split {split or '?'}: {len(urls)} file(s), reads {('column ' + col) if col else 'auto-detected text'}, licence {lic}", flush=True)
-    return name, urls, p_one if col else p_auto, f"{repo} ({lic})"
+    print(f"[hf  ] {repo} config {cfg or '?'} split {split or '?'}: {len(urls)} file(s), template {tpl or 'auto'}, licence {lic}", flush=True)
+    return name, urls, p_tpl(parse_tpl(tpl)) if tpl else p_auto, f"{repo} ({lic})"
 
 # ------------------------------ download ------------------------------------
 def download(url, dest, retries=6):
@@ -315,13 +349,14 @@ def get_source(out, cat, name, urls, parser, budget, state, save):
         if it[1]: rm(it[1])
     st["done"] = True; save(); open(path + ".done", "w").close(); return st   # .done lets `data encode ... follow=1` finish
 
-def cmd_get(spec, out, tokens):
+def cmd_get(spec, out, tokens, tpl=None):
     os.makedirs(out, exist_ok=True)
     if spec.startswith("http"):
         name = re.sub(r"[^\w.-]", "_", os.path.splitext(spec.rstrip("/").split("/")[-1].split("?")[0])[0])
-        prof = ("url", {"text": 1.0}, [("text", name)]); S[name] = ([spec], p_auto, spec)
+        prof = ("url", {"text": 1.0}, [("text", name)]); S[name] = ([spec], p_tpl(parse_tpl(tpl)) if tpl else p_auto, spec)
     elif spec.startswith("hf:"):
-        name, urls, parser, lic = hf_source(spec); S[name] = (urls, parser, lic); prof = (spec, {name: 1.0}, [(name, name)])
+        name, urls, parser, lic = hf_source(spec, tpl); S[name] = (urls, parser, lic); prof = (spec, {name: 1.0}, [(name, name)])
+    elif tpl: sys.exit("a template applies to hf: and URL sources, not to the built-in profiles")
     elif spec in P: prof = P[spec]
     else: sys.exit(f"unknown profile {spec!r} - run: fetch.py list")
     desc, w, srcs = prof
@@ -348,11 +383,13 @@ def cmd_get(spec, out, tokens):
     print(f"[done] {out}: {tot/1e6:.0f}M chars (~{tot/CPT/1e6:.0f}M tokens). Next: Build corpus with this folder as input.", flush=True)
 
 # ------------------------------ convert --------------------------------------
-def cmd_convert(src, out, cat=None):
+def cmd_convert(src, out, cat=None, tpl=None):
     os.makedirs(out, exist_ok=True)
     files = [src] if os.path.isfile(src) else sorted(os.path.join(dp, f) for dp, _, fs in os.walk(src) for f in fs
                                                       if f.endswith((".parquet", ".json", ".jsonl")))
     if not files: sys.exit(f"no .parquet/.json/.jsonl under {src}")
+    m = parse_tpl(tpl) if tpl else None
+    if m: print(f"[conv] template {tpl}", flush=True)
     for p in files:
         stem = os.path.splitext(os.path.basename(p))[0]; c = cat or stem.split("__")[0]
         dst = os.path.join(out, (stem if stem == c or stem.startswith(c + "__") else f"{c}__{stem}") + ".jsonl")
@@ -360,7 +397,7 @@ def cmd_convert(src, out, cat=None):
         n = ch = bad = 0; t0 = time.time()
         with open(dst + ".tmp", "w", encoding="utf-8", newline="\n") as f:
             for r in iter_rows(p):
-                d = auto_doc(r)
+                d = tpl_doc(r, m) if m else auto_doc(r)
                 if not d: bad += 1; continue
                 rc = r.get("cat") if not cat and isinstance(r.get("cat"), str) else c
                 f.write(json.dumps({"text": d, "cat": rc, "src": stem}, ensure_ascii=False) + "\n"); n += 1; ch += len(d)
@@ -375,10 +412,25 @@ def cmd_list():
         print(f"{k:11s} {d}")
         for c, s in srcs: print(f"{'':13s}{c:10s} {w[c]*100:4.0f}%  {s:14s} {S[s][2]}")
 
+def cmd_peek(src, n=3):
+    """first rows of the first file, shaped like datasets-server /first-rows ({"rows":[{"row":{...}}]})"""
+    files = [src] if os.path.isfile(src) else sorted(os.path.join(dp, f) for dp, _, fs in os.walk(src) for f in fs
+                                                      if f.endswith((".parquet", ".json", ".jsonl")) and f != "sources.json" and not f.startswith("_"))
+    try:
+        if not files: raise RuntimeError(f"no .parquet/.json/.jsonl under {src}")
+        rows = []
+        for r in iter_rows(files[0]):
+            if isinstance(r, dict): rows.append({"row": r})
+            if len(rows) >= n: break
+        o = {"file": files[0], "files": len(files), "rows": rows}
+    except Exception as e: o = {"error": f"{type(e).__name__}: {e}" + (" (pip install pyarrow)" if isinstance(e, ImportError) else "")}
+    sys.stdout.buffer.write(json.dumps(o, ensure_ascii=False, default=str).encode("utf-8")); sys.stdout.flush()
+
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if not a or a[0] not in ("list", "get", "convert"): print(__doc__); sys.exit(1)
+    if not a or a[0] not in ("list", "get", "convert", "peek"): print(__doc__); sys.exit(1)
     if a[0] == "list": cmd_list()
-    elif a[0] == "get" and len(a) >= 3: cmd_get(a[1], a[2], int(float(a[3])) if len(a) > 3 and a[3] else 1_000_000_000)
-    elif a[0] == "convert" and len(a) >= 3: cmd_convert(a[1], a[2], a[3] if len(a) > 3 and a[3] else None)
+    elif a[0] == "get" and len(a) >= 3: cmd_get(a[1], a[2], int(float(a[3])) if len(a) > 3 and a[3] else 1_000_000_000, a[4] if len(a) > 4 and a[4] else None)
+    elif a[0] == "convert" and len(a) >= 3: cmd_convert(a[1], a[2], a[3] if len(a) > 3 and a[3] else None, a[4] if len(a) > 4 and a[4] else None)
+    elif a[0] == "peek" and len(a) >= 2: cmd_peek(a[1], int(a[2]) if len(a) > 2 else 3)
     else: print(__doc__); sys.exit(1)
