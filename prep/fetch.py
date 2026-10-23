@@ -10,7 +10,9 @@ Writes plain .jsonl ({"text","cat","src"} per line, chat already rendered with t
 
 template: which columns become the document (empty = auto-detect):
   text=a+b                     plain text, columns joined by a blank line ("a" alone = text=a)
-  chat=col                     a list of turns ({role|from, content|value})
+  chat=col                     a list of turns ({role|from, content|value}), or a string rendered with a chat template
+                               (ChatML, Llama-3, Gemma, Mistral, MiniCPM, Alpaca, USER:/ASSISTANT:, Human:/Assistant:)
+Text that is a chat in ChatML / Llama-3 / Gemma / Mistral / MiniCPM form is converted to cudalm's markers too.
   user=q+ctx,assistant=a       one prompt/answer exchange
   + system=col, tools=col      optional, with chat= or user=/assistant=
 
@@ -21,9 +23,9 @@ import os, sys, json, time, re, threading, queue, urllib.request, urllib.error, 
 CPT, SLACK = 4.0, 1.15            # chars per token (v3 tokenizer, approx), over-fetch slack
 M = dict(system="<|system|>\n", tools="<|tools|>\n", user="<|user|>\n",
          assistant="<|assistant|>\n", call="<|call|>\n", result="<|result|>\n")
-ROLE = {"system": "system", "human": "user", "user": "user", "prompter": "user",
-        "gpt": "assistant", "assistant": "assistant", "chatgpt": "assistant",
-        "tool": "result", "observation": "result", "function_response": "result",
+ROLE = {"system": "system", "developer": "system", "human": "user", "user": "user", "prompter": "user",
+        "gpt": "assistant", "assistant": "assistant", "chatgpt": "assistant", "model": "assistant", "bot": "assistant", "ai": "assistant",
+        "tool": "result", "observation": "result", "function_response": "result", "function": "result", "ipython": "result",
         "function_call": "call", "tool_call": "call"}
 
 def render(turns):
@@ -38,15 +40,81 @@ def as_list(v):
 
 def jtxt(v): return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
 
+def ctext(v):                                                       # content given as [{type, text}, ...] parts -> joined text
+    if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+        return "\n".join(x["text"] for x in v if isinstance(x.get("text"), str))
+    return jtxt(v)
+
+# chats already rendered with another model's template -> turns (twin of data.cuh d_split_chat).
+# header templates: <open>ROLE<role-end>CONTENT<end>; marker templates: fixed marker -> role (ls = only at a line start).
+# The first STRICT of each are unambiguous special tokens, also tried on plain text; the rest only for chat columns.
+CHAT_HDR = (("ChatML", "<|im_start|>", "\n", "<|im_end|>"), ("Llama-3", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"),
+            ("Gemma", "<start_of_turn>", "\n", "<end_of_turn>"))
+CHAT_MK = (("MiniCPM", (("<用户>", "user", 0), ("<AI>", "assistant", 0))),
+           ("Mistral", (("[INST]", "user", 0), ("[/INST]", "assistant", 0), ("<<SYS>>", "system", 0), ("<</SYS>>", "user", 0))),
+           ("Alpaca", (("### Instruction:", "user", 1), ("### Input:", "user", 1), ("### Response:", "assistant", 1))),
+           ("USER:/ASSISTANT:", (("SYSTEM:", "system", 1), ("USER:", "user", 1), ("ASSISTANT:", "assistant", 1))),
+           ("Human:/Assistant:", (("Human:", "user", 1), ("Assistant:", "assistant", 1))))
+CHAT_STRICT = 2
+CHAT_JUNK = ("<|begin_of_text|>", "<|endoftext|>", "<s>", "</s>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>")
+
+def chat_fin(raw):                                                  # clean, drop empty, merge same-role neighbours
+    out = []
+    for r, c in raw:
+        for j in CHAT_JUNK: c = c.replace(j, "")
+        c = c.strip()
+        if not r or not c: continue
+        if out and out[-1][0] == r: out[-1] = (r, out[-1][1] + "\n\n" + c)
+        else: out.append((r, c))
+    rs = {r for r, _ in out}
+    return out if "user" in rs and "assistant" in rs else None
+
+def split_chat(s, strict):
+    """-> (template name, turns) or (None, None)"""
+    for name, op, rt, end in CHAT_HDR:
+        if op not in s: continue
+        raw, i = [], s.find(op)
+        while i >= 0:
+            j = s.find(rt, i + len(op))
+            if j < 0: break
+            k, nx = j + len(rt), s.find(op, j + len(rt))
+            e = s.find(end, k)
+            stop = min(x for x in (e, nx, len(s)) if x >= 0)
+            raw.append((ROLE.get(s[i + len(op):j].strip().lower()), s[k:stop])); i = nx
+        t = chat_fin(raw)
+        if t: return name, t
+    for name, mk in CHAT_MK[:CHAT_STRICT] if strict else CHAT_MK:
+        hits = []
+        for m, r, ls in mk:
+            i = s.find(m)
+            while i >= 0:
+                if not ls or i == 0 or s[i - 1] == "\n": hits.append((i, -len(m), m, r))
+                i = s.find(m, i + 1)
+        if not any(h[3] == "assistant" for h in hits): continue
+        hits.sort()
+        raw = [("system", s[:hits[0][0]])]
+        for n, (i, _, m, r) in enumerate(hits): raw.append((r, s[i + len(m):hits[n + 1][0] if n + 1 < len(hits) else len(s)]))
+        t = chat_fin(raw)
+        if t: return name, t
+    return None, None
+
+def text_doc(t):                                                    # plain text, unless it is a chat in a known template
+    t = (t or "").strip()
+    return (render(split_chat(t, True)[1] or []) or t) or None
+
 def conv_turns(convs, tools=None, system=None):
     turns = []
     if system: turns.append(("system", system))
     if tools: turns.append(("tools", jtxt(tools)))
-    for c in as_list(convs) or []:
+    lst = as_list(convs)
+    if not isinstance(lst, list):
+        if isinstance(convs, str): turns += split_chat(convs, False)[1] or []
+        return turns
+    for c in lst:
         if not isinstance(c, dict): continue
         r = ROLE.get((c.get("from") or c.get("role") or "").strip().lower())
         v = c.get("value") or c.get("content") or ""
-        if r and v: turns.append((r, jtxt(v)))
+        if r and v: turns.append((r, ctext(v)))
     return turns
 
 # ------------------------------ readers ------------------------------------
@@ -83,9 +151,12 @@ def iter_rows(p, cols=None):
 def auto_doc(r, minlen=1):
     """any row -> text: chat (messages/conversations [+tools/system]) or the first text-like column"""
     if not isinstance(r, dict): return None
-    if isinstance(r.get("text"), str): return r["text"].strip() or None
+    if isinstance(r.get("text"), str): return text_doc(r["text"])
     for k in ("messages", "conversations", "conversation"):
-        if r.get(k): return render(conv_turns(r[k], tools=r.get("tools"), system=r.get("system")))
+        if r.get(k):
+            d = render(conv_turns(r[k], tools=r.get("tools"), system=r.get("system")))
+            if d: return d
+            break
     fs = lambda ks: next((r[k].strip() for k in ks if isinstance(r.get(k), str) and r[k].strip()), None)
     q, a = fs(("instruction", "prompt", "question")), fs(("output", "response", "answer"))
     if q and a:                                                    # alpaca-style pair
@@ -94,6 +165,9 @@ def auto_doc(r, minlen=1):
     for k in ("content", "code", "markdown", "body"):
         v = r.get(k)
         if isinstance(v, str) and len(v.strip()) >= minlen: return v.strip()
+    for v in r.values():                                           # any column holding a chat in a special-token template
+        t = split_chat(v.strip(), True)[1] if isinstance(v, str) else None
+        if t: return render(t)
     return None
 
 # ------------------------------ parsers (profile sources) -------------------
@@ -173,7 +247,7 @@ def cell(r, cols):                                                  # columns ->
 
 def tpl_doc(r, m):
     if not isinstance(r, dict): return None
-    if "text" in m: return cell(r, m["text"]) or None
+    if "text" in m: return text_doc(cell(r, m["text"]))
     sysm, tools = cell(r, m.get("system", [])) or None, cell(r, m.get("tools", [])) or None
     if "chat" in m: return render(conv_turns(r.get(m["chat"][0]), tools=tools, system=sysm))
     if "user" in m: return render(conv_turns([], tools=tools, system=sysm) + [("user", cell(r, m["user"])), ("assistant", cell(r, m["assistant"]))])

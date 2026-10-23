@@ -165,8 +165,16 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
   | empty | auto-detect: `text`, chat `messages`/`conversations`, instruction/answer pairs, `content`/`code` |
   | `text=title+body` | plain text, columns joined by a blank line (`col` alone = `text=col`) |
   | `user=question+context,assistant=answer` | one `<\|user\|>` / `<\|assistant\|>` exchange; several columns are joined |
-  | `chat=conversation` | a list of turns (`role`/`content` or `from`/`value`) in any column |
+  | `chat=conversation` | a list of turns (`role`/`content` or `from`/`value`) in any column, or one string already rendered with a chat template (below) |
   | `+ system=col`, `tools=col` | added to a chat or user/assistant template |
+
+  **Chats rendered with another model's template** are split back into turns and re-rendered with cudalm's markers, so
+  prompt masking works. In any text (auto, `text=`): ChatML (`<|im_start|>`, e.g. Qwen, MiniCPM), Llama-3
+  (`<|start_header_id|>`), Gemma (`<start_of_turn>`), Mistral/Llama-2 (`[INST]`, `<<SYS>>`) and MiniCPM's older
+  `<用户>`/`<AI>`. In chat columns also Alpaca (`### Instruction:` / `### Response:`), `USER:`/`ASSISTANT:` and
+  `Human:`/`Assistant:` (line starts only). Text without a user and an assistant turn stays as it is. Roles `model`,
+  `bot`, `ai` count as assistant, `developer` as system; content given as `[{type, text}]` parts is joined. Peek names
+  the template it found, e.g. `chat (ChatML template) in 'text'`.
 
   `cudalm data peek <file|folder|hf:spec> [template]` prints the columns and the first rows exactly as the model will
   see them. The TUI editor shows the same live, with keys T text, P prompt + answer, C chat, S system, O tools, A auto.
