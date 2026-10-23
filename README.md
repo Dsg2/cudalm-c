@@ -127,6 +127,8 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
 
 ### Data
 
+- **Folders:** every run creates `models\`, `data\`, `bench\` and `logs\` next to the exe if they are missing. Models
+  are `models\<name>.bin` plus sidecars named after them (`.env`, `.opt*`, `.run`, `.bench.tsv`).
 - **Corpus names:** bare names resolve under the data roots: `<exe>\data`, `<exe>\prep\data`, and any extra folders
   listed one per line in `data_roots.txt` next to the exe. Set `CUDALM_DATA_ROOTS` (`;`-separated) to replace all of them.
 - **Input files:** `.jsonl`, `.json` or `.txt`. Accepted rows:

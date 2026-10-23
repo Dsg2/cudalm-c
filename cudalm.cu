@@ -3384,7 +3384,7 @@ static int moe_gperm(GA*a,int l,int N,int E,int Km,int K,float*out,int mrg=0){
     return 1;
 }
 #else
-static int g_gperm=0, g_moemrg=0, g_mrgL[64];
+static int g_gperm=0, g_moemrg=0, g_mrgL[64], g_facp=0;
 static int moe_gperm(GA*,int,int,int,int,int,float*,int=0){ return 0; }
 #endif
 static void moe_perm_all(GA*a,int l,int N,int E,int Km,int K,int sb,float*out){
@@ -9884,7 +9884,11 @@ static void cmd_selftest(void){
 
 #include "tui.cuh"
 
+/* the folders cudalm looks in beside the exe (models, data root, bench tasks, TUI logs); mkdir is a no-op if present */
+static void ensure_dirs(void){ static const char*sub[]={"models","data","bench","logs"}; char p[800];
+    for(int i=0;i<4;i++){ snprintf(p,sizeof p,"%.700s" PSEP "%s",exe_dir(),sub[i]); lm_mkdir(p); } }
 int main(int argc,char**argv){
+    ensure_dirs();
     if(getenv("LMTUI_CHILD")) setvbuf(stdout,NULL,_IONBF,0);     /* the TUI pipes our output: keep it live */
     if(argc>2 && strcmp(argv[1],"new") && strcmp(argv[1],"bench") && strcmp(argv[1],"data")) side_apply(argv[2]);   /* before any env is read */
 #ifdef _WIN32
