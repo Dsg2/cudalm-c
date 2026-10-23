@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: add documentation for chat template splitting and rendering
+- prep/fetch.py: add split_chat, text_doc, ctext functions and update conv_turns, auto_doc, tpl_doc
+
+## Unreleased - 2026-10-23
+
 - README.md: Add usage example for `cudalm data tokenizer-from`
 - cudalm.cu: Add `g_tokblob`/`g_tokblobl` globals and `tok_keep()` function
 - cudalm.cu: Update `model_load_full()` to call `tok_keep()` after tokenizer parse
