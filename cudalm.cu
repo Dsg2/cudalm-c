@@ -10008,7 +10008,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"info"))     { return cmd_info(argc,argv); }
     if(!strcmp(argv[1],"tokcheck")) { return cmd_tokcheck(argc,argv); }
 #ifdef _WIN32
-    if(!strcmp(argv[1],"tuicheck")) { return tui_check(argc>2?argv[2]:NULL); }
+    if(!strcmp(argv[1],"tuicheck")) { return tui_check(argc,argv); }
 #endif
 #ifndef CUDALM_CPU
     if(!strcmp(argv[1],"decheck"))  { return cmd_decheck(argc,argv); }

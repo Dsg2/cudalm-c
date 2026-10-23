@@ -49,6 +49,11 @@ static const char*d_base(const char*p){ for(const char*q=p;*q;q++) if(*q=='\\'||
 static long long d_fsize(const char*p){ WIN32_FILE_ATTRIBUTE_DATA a; if(!GetFileAttributesExA(p,GetFileExInfoStandard,&a)) return -1;
     return ((long long)a.nFileSizeHigh<<32)|a.nFileSizeLow; }
 static int d_ends(const char*s,const char*e){ size_t a=strlen(s),b=strlen(e); return a>=b && !_stricmp(s+a-b,e); }
+/* token / byte counts: plain numbers, 1e9, or a k / M / B (G) / T suffix (1B = 1e9); <0 if unparsable */
+static double d_count(const char*s){ char*e; double v=strtod(s,&e); if(e==s) return -1; while(*e==' ') e++;
+    switch(*e){ case 0: return v; case 'k': case 'K': v*=1e3; break; case 'm': case 'M': v*=1e6; break;
+        case 'b': case 'B': case 'g': case 'G': v*=1e9; break; case 't': case 'T': v*=1e12; break; default: return -1; }
+    return e[1]?-1:v; }
 static const char* data_resolve(const char*n,char*o,size_t cap){
     snprintf(o,cap,"%s",n); if(!*n||!d_bare(n)||d_isdir(n)) return o;
     char r[1024],p[1200]; for(int i=0;d_root(i,r,sizeof r);i++){ snprintf(p,sizeof p,"%s\\%s",r,n); if(d_isdir(p)){ snprintf(o,cap,"%s",p); break; } }
@@ -564,7 +569,8 @@ static int cmd_data_mix(int argc,char**argv){
         "  train_tokens 0 = as many as the weights allow without exceeding max_repeat on any corpus\n"); return 1; }
     char out[1200],p[1200]; data_outdir(argv[3],out,sizeof out);
     snprintf(p,sizeof p,"%s\\train.bin",out); if(d_exists(p)){ fprintf(stderr,"[mix] %s already holds a corpus - pick a new name\n",out); return 1; }
-    double total=atof(argv[4]), rep=atof(argv[5]), vtok=atof(argv[6]); if(rep<=0) rep=1;
+    double total=d_count(argv[4]), rep=atof(argv[5]), vtok=d_count(argv[6]); if(rep<=0) rep=1;
+    if(total<0||vtok<0){ fprintf(stderr,"[mix] train/val tokens must be numbers (suffixes k M B allowed)\n"); return 1; }
     int ns=(argc-7)/2; if(ns>16){ fprintf(stderr,"[mix] at most 16 corpora\n"); return 1; }
     char dir[16][1200]; double w[16],ws=0; DMap tr[16],va[16],tw[16]; DSpan*dd[16]; size_t nd[16]; DTok*t0=NULL; int anyw=0;
     for(int i=0;i<ns;i++){ data_resolve(argv[7+2*i],dir[i],sizeof dir[i]); w[i]=atof(argv[8+2*i]); ws+=w[i];
@@ -655,7 +661,9 @@ static int cmd_data_fetch(int argc,char**argv){
         "       cudalm data fetch <file|folder> <out> [category]       convert parquet/json/jsonl\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
     char out[1200],src[1200],cl[4096]; data_outdir(argv[4],out,sizeof out); data_resolve(argv[3],src,sizeof src);
     int conv=_strnicmp(argv[3],"http",4) && (!d_bare(argv[3])||strchr(argv[3],'.')) && d_exists(src);   /* bare word = profile */
-    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,argc>5?argv[5]:"");
+    char x[64]=""; if(argc>5) snprintf(x,sizeof x,"%s",argv[5]);
+    if(!conv&&argc>5){ double t=d_count(argv[5]); if(t<=0){ fprintf(stderr,"[fetch] target tokens must be a number (suffixes k M B allowed)\n"); return 1; } snprintf(x,sizeof x,"%.0f",t); }
+    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x);
     return run_cmd(cl); }
 
 static int cmd_data_canon(int argc,char**argv){
@@ -721,6 +729,7 @@ static int cmd_data(int argc,char**argv){
         "  cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]  train a byte-level BPE (+ canon.bin)\n"
         "  cudalm data encode    <new|append> <out> <inputs> <tokenizer> [val%%=1] [dedup=1] [follow=0]\n"
         "  cudalm data mix       <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...\n"
+        "  token counts accept k / M / B suffixes (500M, 1B)\n"
         "  cudalm data info      <corpus|tokenizer>\n"
         "  cudalm data canon     <tokenizer> [out.bin]\n"
         "  cudalm data weights   <corpus> <rows.jsonl>     per-doc loss weights (\"w\") -> train.w\n"

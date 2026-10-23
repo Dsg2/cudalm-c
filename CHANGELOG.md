@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-23
 
+- feat(data): add d_count() for token/byte counts with k/M/B suffixes
+- feat(cudalm): tuicheck now passes all args instead of only the second
+- docs: update README.md with new TUI data tools and token count suffixes
+
+## Unreleased - 2026-10-23
+
 - Add ensure_dirs() to cudalm.cu to create these folders next to the exe
 - Add README.md entry explaining the new folder structure
 

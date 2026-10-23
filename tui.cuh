@@ -7,19 +7,26 @@
  * The child runs in its own process group. Ctrl+C during Train writes models\<name>.bin.stop (clean save+exit at
  * the next 20-iter check -- never a hard kill of a CUDA process); for other commands it is forwarded as Ctrl+Break,
  * i.e. what plain CLI Ctrl+C does. Working dir is set to the exe dir. The child's output is shown live and
- * also saved to logs\<command>-<model>-<time>.log. */
+ * also saved to logs\<command>-<model>-<time>.log; the result screen offers the next step with the output pre-filled.
+ * Data forms show a live panel (resolved output folder, free space, size estimate, problems) and ask before running
+ * with problems. */
 #ifdef _WIN32
 #include <conio.h>
+#include <stdarg.h>
+#include <shellapi.h>
+#pragma comment(lib,"shell32.lib")
 
 enum { F_TEXT, F_MODEL, F_DATA, F_FILE, F_CHOICE, F_DIR, F_PATH, F_TOKD, F_OPT, F_ENV, F_MEM, F_FLAG };
 /* arg: choices "a|b" (F_CHOICE), the --flag (F_OPT, F_FLAG = valueless, passed when 1) or the env var (F_ENV).
- * vis: 0 always, 1 ngram only, 2 engram only, 3 any memory. ext: "a|b" choices, a file glob, or F_PATH suffixes ".a;.b".
+ * vis: 0 always, 1 ngram only, 2 engram only, 3 any memory, 4 advanced (F2 shows). ext: "a|b" choices, a file glob, or F_PATH suffixes ".a;.b".
  * F_DATA = corpus picker, F_TOKD = tokenizer/corpus picker, F_DIR / F_PATH = folder / file-or-folder browser. */
 typedef struct { const char*label,*def; int kind; const char*arg; int vis; const char*ext; const char*help; } TFld;   /* help: '\n' = next line */
 #define T_NF 26
-typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int grp; } TCmd;   /* run: help on [ Run ]; grp 1 = Data tools, 2 = Diagnostics */
+typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int grp; } TCmd;   /* run: help on [ Run ]; grp 1 = Data tools, 2 = Diagnostics, 3 = Data tools (advanced) */
 #define T_TEXTIN ".jsonl;.json;.txt"
 #define T_PRESETS "nano|micro|m1|m3|m6|m8|m16|m32|m70|m50|m64e|m220e|a8m|a8m9|s8x|s8w"
+#define T_MIXP(n) {"corpus " n,"",F_DATA,0,0,0,"A corpus to blend in; the next pair appears once this one is set."},\
+    {" weight " n,"",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."}
 static const TCmd T_CMDS[]={
  {"train","Train","continue training a model (create it first with New model)",
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT,0,0,0,
@@ -128,7 +135,7 @@ static const TCmd T_CMDS[]={
      "web, code, math, cosmopedia, chat, tools = one source each. Or type the https URL of a single .parquet/.json file."},
    {"out folder","text_v3pre",F_TEXT,0,0,0,"Folder for the text (<category>__<source>.jsonl). A bare name goes under the data root with the most free space.\n"
      "Run again with the same folder to resume an interrupted download."},
-   {"tokens","1000000000",F_TEXT,0,0,0,"Roughly how many tokens of text to fetch (1e9 ~ 4.6 GB of text), split by the profile's weights.\n"
+   {"tokens","1B",F_TEXT,0,0,0,"Roughly how many tokens of text to fetch (k / M / B suffixes; 1B ~ 4.6 GB of text), split by the profile's weights.\n"
      "Get 10-20% more than you plan to train on."}},
   "Run: download and parse each source in turn (raw shards are deleted once parsed).\nNext: Build corpus with this folder as text (tokenizer v3tok), or Train tokenizer first for a new vocab.",1},
  {"data fetch","Convert files","parquet / json / jsonl from elsewhere -> plain .jsonl text (python + pyarrow)",
@@ -158,28 +165,17 @@ static const TCmd T_CMDS[]={
      "Must be the tokenizer of the model you will train (v3tok = all v3 models)."},
    {"val %","1",F_TEXT,0,0,0,"Share of docs held out in val.bin (every Nth doc), used by Eval and the training val loss. 0 = none."},
    {"dedup","1",F_CHOICE,"1|0",0,0,"1 = skip docs whose exact text already appeared in this run."},
-   {"follow","0",F_CHOICE,"0|1",0,0,"1 = keep reading a .jsonl another program is still writing, until <file>.done appears\n"
+   {"follow","0",F_CHOICE,"0|1",4,0,"1 = keep reading a .jsonl another program is still writing, until <file>.done appears\n"
      "(e.g. teacher generation). 0 = stop at the end of the input."}},
   "Run: tokenize on all CPU cores (token-exact with the HF tokenizer).\nNext: Corpus info to check it, then Train with this corpus as data dir.",1},
  {"data mix","Mix corpora","weighted, shuffled blend of corpora that share one tokenizer",
   {{"out name","mix",F_TEXT,0,0,0,"New corpus folder (a bare name goes under the data root with most free space)."},
-   {"train tokens","0",F_TEXT,0,0,0,"Size of the blend's train.bin. 0 = as large as the weights allow without reusing any corpus\n"
-     "more than max repeat times."},
+   {"train tokens","0",F_TEXT,0,0,0,"Size of the blend's train.bin (k / M / B suffixes). 0 = as large as the weights allow without reusing\n"
+     "any corpus more than max repeat times. The table below shows what each corpus contributes."},
    {"max repeat","1",F_TEXT,0,0,0,"How often one corpus's docs may be reused (1 = each doc at most once, 2 = up to twice).\n"
      "A corpus that runs out contributes less than its weight (a note is printed)."},
-   {"val tokens","1000000",F_TEXT,0,0,0,"Tokens in val.bin, taken from each corpus's own val.bin by weight."},
-   {"corpus 1","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 1","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."},
-   {"corpus 2","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 2","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."},
-   {"corpus 3","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 3","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."},
-   {"corpus 4","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 4","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."},
-   {"corpus 5","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 5","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."},
-   {"corpus 6","",F_DATA,0,0,0,"A corpus to blend in. Fill corpus/weight pairs in order; unused pairs stay empty."},
-   {" weight 6","",F_TEXT,0,0,0,"Relative weight (any scale: 3 and 1 = 75% / 25% of the train tokens)."}},
+   {"val tokens","1M",F_TEXT,0,0,0,"Tokens in val.bin, taken from each corpus's own val.bin by weight."},
+   T_MIXP("1"),T_MIXP("2"),T_MIXP("3"),T_MIXP("4"),T_MIXP("5"),T_MIXP("6"),T_MIXP("7"),T_MIXP("8"),T_MIXP("9"),T_MIXP("10")},
   "Run: pick whole docs per corpus, shuffle them together, write train.bin + val.bin + meta.json.\nAll corpora must use the identical tokenizer (checked).",1},
  {"data info","Corpus info","tokenizer, token / doc counts, doc lengths, categories and a decoded sample",
   {{"corpus","",F_TOKD,0,0,0,"A corpus (or tokenizer) folder. Checks every token id against the vocab - catches data built\n"
@@ -189,12 +185,12 @@ static const TCmd T_CMDS[]={
   {{"tokenizer","v3tok",F_TOKD,0,0,0,"Tokenizer or corpus folder. Tokens differing only by case, leading space or Unicode form\n"
      "map to one id, so they share engram table rows."},
    {"out file","",F_TEXT,0,0,0,"Output .bin (empty = canon.bin inside the tokenizer folder)."}},
-  "Run: write one uint16 per token. Train tokenizer already writes canon.bin.",1},
+  "Run: write one uint16 per token. Train tokenizer already writes canon.bin.",3},
  {"data weights","Loss weights","train.w per-token loss weights for a corpus (CUDALM_TOKW=1 trains with it)",
   {{"corpus","",F_DATA,0,0,0,"A corpus encoded from the rows file in order with val % = 0 and dedup = 0 (doc k = row k)."},
    {"rows","",F_PATH,0,0,".jsonl","jsonl rows: \"w\" = per-doc weight (GRPO advantage), or \"a0\"/\"tl\"/\"tp\" teacher log-probs\n"
     "(on-policy distillation, agentenv tscore)."}},
-  "Run: write <corpus>\\train.w (int8 per token).",1},
+  "Run: write <corpus>\\train.w (int8 per token).",3},
 };
 #define T_NCMD (int)(sizeof(T_CMDS)/sizeof(T_CMDS[0]))
 /* positional fields the CLI requires (by form title): Run refuses while one is empty */
@@ -204,7 +200,7 @@ static const struct { const char*title; int n; } T_REQ[]={
  {"Download text",2},{"Convert files",2},{"Train tokenizer",2},{"Build corpus",4},{"Mix corpora",6},{"Corpus info",1},
  {"Canon map",1},{"Loss weights",2}};
 static int t_req(const TCmd*c){ for(size_t i=0;i<sizeof T_REQ/sizeof T_REQ[0];i++) if(!strcmp(T_REQ[i].title,c->title)) return T_REQ[i].n; return 0; }
-enum { K_UP=1072, K_DOWN=1080, K_LEFT=1075, K_RIGHT=1077, K_PGUP=1073, K_PGDN=1081, K_HOME=1071, K_END=1079, K_F5=1063, K_DEL=1083 };
+enum { K_UP=1072, K_DOWN=1080, K_LEFT=1075, K_RIGHT=1077, K_PGUP=1073, K_PGDN=1081, K_HOME=1071, K_END=1079, K_F2=1060, K_F5=1063, K_DEL=1083 };
 #define T_MAXL 512
 #define T_INFO 220
 static char t_items[T_MAXL][260], t_info[T_MAXL][T_INFO];
@@ -230,18 +226,22 @@ static int t_edit(const char*label, char*buf, int cap){
         else if(k>=32 && k<256 && n<(int)sizeof(tmp)-1 && n<cap-1){ tmp[n++]=(char)k; tmp[n]=0; }
     }
 }
-/* scrolling list over t_items/t_info; returns index or -1 */
+/* scrolling list over t_items/t_info; returns index or -1.
+ * t_pv: optional preview of the highlighted item under the list; t_multi = k+1: items from k on toggle t_mark with Space */
+static void (*t_pv)(int sel); static int t_multi; static char t_mark[T_MAXL];
 static int t_pick(const char*title, const char*hint, int n, int sel){
     if(n<=0) return -1; if(sel<0||sel>=n) sel=0; int top=0;
     for(;;){
-        int h=t_rows()-6; if(h<3) h=3;
+        int h=t_rows()-6-(t_pv?6:0); if(h<3) h=3;
         if(sel<top) top=sel; if(sel>=top+h) top=sel-h+1;
         t_head(title);
         for(int i=top;i<n && i<top+h;i++)
-            printf("%s %-44s \x1b[2m%s\x1b[0m\x1b[0m\n", i==sel?"\x1b[7m>":" ", t_items[i], t_info[i]);
+            printf("%s %s%-44s \x1b[2m%s\x1b[0m\x1b[0m\n", i==sel?"\x1b[7m>":" ", t_multi&&i>=t_multi-1?(t_mark[i]?"[x] ":"[ ] "):"", t_items[i], t_info[i]);
+        if(t_pv){ printf("\x1b[%d;1H",t_rows()-7); t_pv(sel); }
         printf("\x1b[%d;1H\x1b[2m%s\x1b[0m",t_rows()-1,hint?hint:"Up/Down PgUp/PgDn  Enter select  Esc back"); fflush(stdout);
         int k=t_key();
-        if(k==K_UP && sel>0) sel--; else if(k==K_DOWN && sel<n-1) sel++;
+        if(k==' ' && t_multi && sel>=t_multi-1) t_mark[sel]^=1;
+        else if(k==K_UP && sel>0) sel--; else if(k==K_DOWN && sel<n-1) sel++;
         else if(k==K_PGUP) sel=sel>h?sel-h:0; else if(k==K_PGDN) sel=sel+h<n?sel+h:n-1;
         else if(k==K_HOME) sel=0; else if(k==K_END) sel=n-1;
         else if(k==13) return sel; else if(k==27) return -1;
@@ -264,6 +264,13 @@ static int t_list_models(void){
 static long long t_meta_tokens(const char*dir){
     char p[800]; snprintf(p,sizeof p,"%s\\meta.json",dir); size_t len; char*b=(char*)read_file(p,&len); if(!b) return -1;
     char*q=strstr(b,"\"total_tokens\""); long long v=q?_atoi64(strchr(q,':')+1):-1; free(b); return v; }
+/* short id of a folder's tokenizer.bin (0 = none): equal ids = identical tokenizer, which mix/append require */
+static unsigned t_tokhash(const char*dir){
+    static char kp[32][1100]; static unsigned kh[32]; static int kn;
+    for(int i=0;i<kn&&i<32;i++) if(!strcmp(kp[i],dir)) return kh[i];
+    char p[1200]; snprintf(p,sizeof p,"%s\\tokenizer.bin",dir); size_t n; char*b=(char*)read_file(p,&n); if(!b) return 0;
+    unsigned h=(unsigned)(d_fnv(b,n)&0xFFFFFF); free(b); if(!h) h=1;
+    int i=kn++%32; snprintf(kp[i],sizeof kp[i],"%s",dir); kh[i]=h; return h; }
 /* folders under the data roots holding a corpus (train.bin) or, tok=1, any tokenizer.bin */
 static int t_list_dirs(int tok){
     char r[1024]; int n=0;
@@ -276,9 +283,10 @@ static int t_list_dirs(int tok){
             int hc=d_exists(tb), ht=d_exists(tk); if(tok?!ht:!hc) continue;
             int V=0; FILE*f=fopen(tk,"rb"); if(f){ char m[4]; if(fread(m,1,4,f)!=4||fread(&V,4,1,f)!=1) V=0; fclose(f); }
             snprintf(t_items[n],260,"%s",d); long long t=hc?t_meta_tokens(d):-1;
-            if(hc&&t>0) snprintf(t_info[n],T_INFO,"%9.1fM tok  V=%d",t/1e6,V);
-            else if(hc) snprintf(t_info[n],T_INFO,"%9.1fM tok  V=%d",d_fsize(tb)/2e6,V);
-            else snprintf(t_info[n],T_INFO,"tokenizer    V=%d",V);
+            unsigned th=t_tokhash(d);
+            if(hc&&t>0) snprintf(t_info[n],T_INFO,"%9.1fM tok  V=%d  tok %06x",t/1e6,V,th);
+            else if(hc) snprintf(t_info[n],T_INFO,"%9.1fM tok  V=%d  tok %06x",d_fsize(tb)/2e6,V,th);
+            else snprintf(t_info[n],T_INFO,"tokenizer    V=%d  tok %06x",V,th);
             n++;
         }while(FindNextFileA(h,&fd)); FindClose(h);
     }
@@ -348,6 +356,81 @@ static void t_browse(const char*label, char*val, int cap, const char*ext, int fi
             snprintf(val,cap,"%s\\%s",cur,nm); return; }
     }
 }
+/* ---- data helpers: sizes, free space, previews, pickers ---- */
+static int t_is(const TCmd*c,const char*t){ return !strcmp(c->title,t); }
+static int t_ci(const char*title){ for(int i=0;i<T_NCMD;i++) if(!strcmp(T_CMDS[i].title,title)) return i; return -1; }
+static int t_fi(int ci,const char*label){ if(ci<0) return -1;
+    for(int i=0;i<T_NF&&T_CMDS[ci].f[i].label;i++) if(!strcmp(T_CMDS[ci].f[i].label,label)) return i; return -1; }
+static const char* t_hb(double b,char*o){ if(b>=1e9) sprintf(o,"%.1f GB",b/1e9); else if(b>=1e6) sprintf(o,"%.0f MB",b/1e6); else sprintf(o,"%.0f KB",b/1e3); return o; }
+static const char* t_hn(double v,char*o){ if(v>=1e9) sprintf(o,"%.2fB",v/1e9); else if(v>=1e6) sprintf(o,"%.1fM",v/1e6);
+    else if(v>=1e3) sprintf(o,"%.1fk",v/1e3); else sprintf(o,"%.0f",v); return o; }
+static double t_tree(const char*p,const char*ext,int*nf){          /* bytes of the files under p matching ext (NULL = all) */
+    if(!d_isdir(p)){ if(!d_exists(p)||!t_extok(p,ext)) return 0; (*nf)++; return (double)d_fsize(p); }
+    char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",p); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd); double s=0;
+    if(h==INVALID_HANDLE_VALUE) return 0;
+    do{ if(fd.cFileName[0]=='.') continue; char q[1200]; snprintf(q,sizeof q,"%s\\%s",p,fd.cFileName);
+        if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) s+=t_tree(q,ext,nf);
+        else if(t_extok(fd.cFileName,ext)){ s+=(double)fd.nFileSizeHigh*4294967296.0+fd.nFileSizeLow; (*nf)++; } }while(FindNextFileA(h,&fd));
+    FindClose(h); return s; }
+static double t_spec(const char*spec,const char*ext,int*nf){      /* ';' list of files/folders (data-root names ok); cached 10 s */
+    static char ks[4][1100]; static double kv[4]; static int kn[4],kk; static DWORD kt[4]; char key[1100];
+    snprintf(key,sizeof key,"%s|%s",spec,ext?ext:"");
+    for(int i=0;i<4;i++) if(!strcmp(ks[i],key)&&GetTickCount()-kt[i]<10000){ *nf=kn[i]; return kv[i]; }
+    char s[1024]; snprintf(s,sizeof s,"%s",spec); double b=0; int n=0;
+    for(char*p=s,*e;p;p=e){ e=strchr(p,';'); if(e) *e++=0; while(*p==' ') p++; if(!*p) continue; char r[1200]; data_resolve(p,r,sizeof r); b+=t_tree(r,ext,&n); }
+    int i=kk++%4; snprintf(ks[i],sizeof ks[i],"%s",key); kv[i]=b; kn[i]=n; kt[i]=GetTickCount(); *nf=n; return b; }
+static double t_free(const char*path){                             /* free bytes on the drive of path (or its nearest parent) */
+    char d[1200]; if(!GetFullPathNameA(path,sizeof d,d,NULL)) return -1;
+    for(;;){ ULARGE_INTEGER f; if(GetDiskFreeSpaceExA(d,&f,NULL,NULL)) return (double)f.QuadPart;
+        char*q=strrchr(d,'\\'); if(!q) return -1; if(q<=d+2){ if(q[1]==0) return -1; q[1]=0; } else *q=0; } }
+static void t_corpus_pv(int sel){                                  /* corpus / tokenizer preview under a picker */
+    const char*d=t_items[sel]; if(!d_isdir(d)) return; char p[1300],a[32],b[32]; size_t ml;
+    snprintf(p,sizeof p,"%s\\train.bin",d); double tr=d_exists(p)?d_fsize(p)/2.0:-1;
+    snprintf(p,sizeof p,"%s\\val.bin",d); double va=d_exists(p)?d_fsize(p)/2.0:0;
+    printf("\x1b[36m%s\x1b[0m\n",d);
+    if(tr>=0) printf("  train %s tok   val %s tok   tokenizer %06x",t_hn(tr,a),t_hn(va,b),t_tokhash(d));
+    else printf("  tokenizer only   %06x",t_tokhash(d));
+    snprintf(p,sizeof p,"%s\\meta.json",d); char*mj=(char*)read_file(p,&ml); if(!mj){ printf("\n"); return; }
+    mj=(char*)realloc(mj,ml+1); mj[ml]=0;
+    const char*bb=jget(mj,"built_by"); if(bb){ DBuf x={0}; jdec(bb,&x); printf("   built by %s",x.p?x.p:""); free(x.p); }
+    const char*h=jget(mj,"history"); int nh=0; if(h) for(const char*e=jfirst(h);e;e=jnext(e)) nh++; if(nh>1) printf("  (+%d appends)",nh-1);
+    printf("\n");
+    const char*v=jget(mj,"categories"); char line[600]=""; int lo=0,n=0;
+    if(v) for(const char*k=jfirst(v);k&&*k=='"'&&n<8;k=jobj_next(k),n++){ const char*o=jobj_val(k); if(!o) break; DBuf nm={0}; jdec(k,&nm);
+        const char*x=jget(o,"tokens"); if(!x) x=jget(o,"emitted");
+        lo+=snprintf(line+lo,sizeof line-lo,"%s%s %s",n?", ":"",nm.p?nm.p:"",x?t_hn(atof(x),a):"?"); free(nm.p); if(lo>=(int)sizeof line) break; }
+    if(lo) printf("  \x1b[2m%.150s\x1b[0m\n",line);
+    free(mj); }
+static int t_keep_tok(int n,unsigned h){                           /* keep only list entries with tokenizer h */
+    int m=0; for(int i=0;i<n;i++) if(t_tokhash(t_items[i])==h){ if(m!=i){ memcpy(t_items[m],t_items[i],260); memcpy(t_info[m],t_info[i],T_INFO); } m++; }
+    return m; }
+static void t_mark_tok(int n,unsigned h){ for(int i=0;i<n;i++) if(t_tokhash(t_items[i])!=h){ size_t l=strlen(t_info[i]);
+    snprintf(t_info[i]+l,T_INFO-l,"  \x1b[33mother tokenizer\x1b[0m"); } }
+/* text folders under the data roots (Space marks several, joined with ';') */
+static void t_pick_text(const char*label,char*val,int cap,const char*ext){
+    int n=0; char r[1100],a[32];
+    snprintf(t_items[n],260,"(type a path...)"); snprintf(t_info[n++],T_INFO,"several: separate with ;");
+    snprintf(t_items[n],260,"[ browse files / folders... ]"); t_info[n++][0]=0;
+    for(int ri=0;d_root(ri,r,sizeof r);ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+        if(h==INVALID_HANDLE_VALUE) continue;
+        do{ if(n>=T_MAXL||!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||fd.cFileName[0]=='.') continue;
+            char d[1200],q[1300]; snprintf(d,sizeof d,"%s\\%s",r,fd.cFileName); snprintf(q,sizeof q,"%s\\tokenizer.bin",d); if(d_exists(q)) continue;
+            int nf=0; double b=t_tree(d,ext,&nf); if(!nf) continue;
+            snprintf(t_items[n],260,"%s",d); snprintf(t_info[n++],T_INFO,"%6d files %10s",nf,t_hb(b,a)); }while(FindNextFileA(h,&fd)); FindClose(h); }
+    memset(t_mark,0,sizeof t_mark);
+    { char s[1024]; snprintf(s,sizeof s,"%s",val); for(char*p=s,*e;p;p=e){ e=strchr(p,';'); if(e) *e++=0; if(!*p) continue; char x[1200]; data_resolve(p,x,sizeof x);
+        for(int i=2;i<n;i++) if(!_stricmp(t_items[i],x)) t_mark[i]=1; } }
+    char ttl[300]; snprintf(ttl,sizeof ttl,"select %s: text folders under the data roots",label);
+    t_multi=3; int s=t_pick(ttl,"Space mark several   Enter use the marked ones (or the highlighted one)   Esc cancel",n,0); t_multi=0;
+    if(s<0) return; if(s==0){ t_edit(label,val,cap); return; } if(s==1){ t_browse(label,val,cap,ext,1); return; }
+    char o[T_MAXL]=""; int lo=0; for(int i=2;i<n;i++) if(t_mark[i]) lo+=snprintf(o+lo,sizeof o-lo,"%s%s",lo?";":"",t_items[i]);
+    snprintf(val,cap,"%s",lo?o:t_items[s]); }
+static int t_yes(const char*fmt,...){                              /* y/N question on the bottom row */
+    va_list ap; va_start(ap,fmt); printf("\x1b[%d;1H\x1b[2K\x1b[1;33m",t_rows()); vprintf(fmt,ap); printf("\x1b[0m"); va_end(ap); fflush(stdout);
+    while(_kbhit()) _getch(); int k=t_key(); return k=='y'||k=='Y'; }
+static void t_note(const char*fmt,...){
+    va_list ap; va_start(ap,fmt); printf("\x1b[%d;1H\x1b[2K\x1b[33m",t_rows()); vprintf(fmt,ap); printf("\x1b[0m   \x1b[2mpress any key\x1b[0m"); va_end(ap); fflush(stdout);
+    while(_kbhit()) _getch(); t_key(); }
 static void t_choice_items(const char*ch, int*n){
     *n=0; const char*p=ch;
     while(*p && *n<T_MAXL){ const char*q=strchr(p,'|'); int l=q?(int)(q-p):(int)strlen(p);
@@ -399,7 +482,7 @@ static int t_cmdline(const TCmd*c, char vals[][T_MAXL], char*o, size_t cap, char
 }
 /* runs cl with stdout+stderr piped back here: shown live and copied to logs\<tag>-<time>.log
  * (LMTUI_CHILD makes the child's stdout unbuffered so the pipe stays live) */
-static void t_spawn(const char*cl, const char*stop, const char*tag){
+static DWORD t_spawn(const char*cl, const char*stop, const char*tag, char*lpo, size_t lcap){
     printf("\x1b[2J\x1b[H\x1b[1;36m> %s\x1b[0m\n\n",cl); fflush(stdout);
     char lp[600]; SYSTEMTIME tm; GetLocalTime(&tm); CreateDirectoryA("logs",NULL);
     snprintf(lp,sizeof lp,"logs\\%s-%04d%02d%02d-%02d%02d%02d.log",tag,tm.wYear,tm.wMonth,tm.wDay,tm.wHour,tm.wMinute,tm.wSecond);
@@ -419,8 +502,9 @@ static void t_spawn(const char*cl, const char*stop, const char*tag){
         GetExitCodeProcess(pi.hProcess,&code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
     lm_setenv("LMTUI_CHILD",""); if(wr) CloseHandle(wr); if(rd) CloseHandle(rd);
     if(lf){ fprintf(lf,"\n[exit %lu, %.1f s]\n",code,(GetTickCount()-t0)/1000.0); fclose(lf); }
-    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  \x1b[2mlog: %s\\%s\x1b[0m  press any key\n",code?31:32,code,(GetTickCount()-t0)/1000.0,exe_dir(),lp);
-    while(_kbhit()) _getch(); t_key();
+    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  \x1b[2mlog: %s\\%s\x1b[0m\n",code?31:32,code,(GetTickCount()-t0)/1000.0,exe_dir(),lp);
+    if(lpo) snprintf(lpo,lcap,"%s\\%s",exe_dir(),lp);
+    return code;
 }
 
 /* ---- form env fields: pushed into this process's env (inherited by the child), then restored ---- */
@@ -432,7 +516,8 @@ static void t_env_pop(void){ while(t_nsaved>0){ t_nsaved--; lm_setenv(t_saved[t_
 static int t_mode(const TCmd*c, char vals[][T_MAXL]){
     for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_MEM) return !strcmp(vals[i],"engram")?2:!strcmp(vals[i],"ngram")?1:0;
     return -1; }
-static int t_vis(const TFld*f,int mode){ return !f->vis || (f->vis==3 ? mode>0 : mode==f->vis); }
+static int t_adv;                                                  /* F2: show advanced fields (vis 4) */
+static int t_vis(const TFld*f,int mode){ return !f->vis || (f->vis==4 ? t_adv : f->vis==3 ? mode>0 : mode==f->vis); }
 /* hidden or empty fields are pushed as unset, so a loaded profile cannot leak into the other memory mode */
 static void t_form_env(const TCmd*c, char vals[][T_MAXL]){
     int mode=t_mode(c,vals);
@@ -465,53 +550,171 @@ static void t_help(const TFld*f, const char*v, const char*run){
             cf.win?" (windowed)":""); n++; }
     for(;n<3;n++) printf("\n"); }
 
+/* ---- form values (kept per form for the session; other forms' results are handed in with t_set) ---- */
+static char t_vals[T_NCMD][T_NF][T_MAXL]; static int t_vinit[T_NCMD];
+static void t_form_init(int ci){
+    if(t_vinit[ci]) return; const TCmd*c=&T_CMDS[ci]; char (*V)[T_MAXL]=t_vals[ci]; int nf=0; while(nf<T_NF && c->f[nf].label) nf++;
+    int envmem=getenv("CUDALM_NGRAM")||getenv("CUDALM_ENGRAM");
+    for(int i=0;i<nf;i++){ const TFld*f=&c->f[i]; const char*e=f->kind==F_ENV?getenv(f->arg):NULL;
+        if(e&&*e&&!strncmp(f->arg,"NGRAM_",6)) envmem=1;
+        snprintf(V[i],T_MAXL,"%s",e&&*e?e:f->def);
+        if(f->kind==F_FILE && f->def[0] && !d_exists(f->def)){ char b[300]; snprintf(b,sizeof b,"bench\\%s",f->def);
+            if(d_exists(b)) snprintf(V[i],T_MAXL,"%s",b); } }
+    for(int i=0;i<nf;i++) if(c->f[i].kind==F_MEM && envmem){   /* a loaded profile decides the mode */
+        MemCfg m; mem_from_env(&m,64); snprintf(V[i],T_MAXL,"%s",mem_name(m.mode)); }
+    t_vinit[ci]=1; }
+static void t_set(const char*title,const char*label,const char*v){
+    int ci=t_ci(title), fi=t_fi(ci,label); if(fi<0) return; t_form_init(ci); snprintf(t_vals[ci][fi],T_MAXL,"%s",v); }
+/* Mix: pair k (k>=2) stays hidden until pair k-1 has a corpus */
+static int t_mixhide(const TCmd*c,char v[][T_MAXL],int i){ if(!t_is(c,"Mix corpora")||i<6) return 0; int k=(i-4)/2; return !v[4+2*(k-1)][0]&&!v[4+2*k][0]; }
+
+/* ---- live checks + output preview for data forms ---- */
+static char t_outp[1200]; static int t_nprob;
+static void t_prob(int draw,const char*fmt,...){ t_nprob++; if(!draw) return; va_list ap; va_start(ap,fmt);
+    printf("  \x1b[31mx \x1b[0m"); vprintf(fmt,ap); printf("\n"); va_end(ap); }
+static const struct { const char*t,*l; double lo,hi; int cnt; } T_NUM[]={
+    {"Download text","tokens",1e3,1e13,1},{"Train tokenizer","vocab",512,65535,0},{"Train tokenizer","sample MB",1,1e6,0},
+    {"Build corpus","val %",0,50,0},{"Mix corpora","train tokens",0,1e13,1},{"Mix corpora","max repeat",0.01,1e3,0},{"Mix corpora","val tokens",0,1e11,1}};
+static double t_mixtab(char v[][T_MAXL],int draw){                 /* live blend table; returns the train tokens written */
+    char d[10][1200],a[32],b[32]; double n[10],w[10],ws=0,sum=0; unsigned h[10]; int k=0, idx[10];
+    double rep=atof(v[2]); if(rep<=0) rep=1; double tot=d_count(v[1]);
+    for(int i=0;i<10;i++){ const char*cv=v[4+2*i],*wv=v[5+2*i]; if(!cv[0]) continue;
+        data_resolve(cv,d[k],sizeof d[k]); char p[1300]; snprintf(p,sizeof p,"%s\\train.bin",d[k]); n[k]=d_exists(p)?d_fsize(p)/2.0:0;
+        w[k]=wv[0]?atof(wv):0; h[k]=t_tokhash(d[k]); idx[k]=i+1;
+        if(w[k]<=0) t_prob(draw,"'weight %d' must be > 0",i+1); else ws+=w[k];
+        if(k&&h[k]&&h[0]&&h[k]!=h[0]) t_prob(draw,"corpus %d uses tokenizer %06x, corpus 1 uses %06x: mix refuses different tokenizers",i+1,h[k],h[0]);
+        k++; }
+    if(!k||ws<=0) return 0;
+    if(tot<=0){ tot=1e300; for(int i=0;i<k;i++) if(w[i]>0&&n[i]>0){ double cap=n[i]*rep/(w[i]/ws); if(cap<tot) tot=cap; } if(tot>=1e300) tot=0; }
+    if(draw) printf("  \x1b[2m    %-28s %9s %7s %9s %7s  tokenizer\x1b[0m\n","corpus","tokens","share","takes","repeat");
+    for(int i=0;i<k;i++){ double want=w[i]>0?tot*w[i]/ws:0, take=want<n[i]*rep?want:n[i]*rep; sum+=take;
+        if(draw) printf("  %2d  %-28.28s %9s %6.1f%% %9s %6.2fx  %06x%s\n",idx[i],d_base(d[i]),t_hn(n[i],a),100*w[i]/ws,t_hn(take,b),n[i]>0?take/n[i]:0,h[i],
+                        take<want*0.98?"  \x1b[33mruns out (max repeat)\x1b[0m":""); }
+    if(draw) printf("  \x1b[2m    blend: %s train tokens\x1b[0m\n",t_hn(sum,a));
+    return sum; }
+static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the number of problems; sets t_outp */
+    char r[1200],o[1200],q[1300],a[32],b[32]; double est=-1; int ci=(int)(c-T_CMDS), mode=t_mode(c,v), isnew=1, follow=0, pbad=0, of=-1;
+    t_nprob=0; t_outp[0]=0;
+    if(t_is(c,"Build corpus")){ isnew=strcmp(v[0],"append")!=0; follow=!strcmp(v[6],"1"); }
+    for(size_t i=0;i<sizeof T_NUM/sizeof T_NUM[0];i++) if(t_is(c,T_NUM[i].t)){ int f=t_fi(ci,T_NUM[i].l); if(f<0||!v[f][0]) continue;
+        char*e; double x=T_NUM[i].cnt?d_count(v[f]):strtod(v[f],&e); if(!T_NUM[i].cnt&&*e) x=-1;
+        if(x<T_NUM[i].lo||x>T_NUM[i].hi) t_prob(draw,"'%s' must be a number from %g to %g%s",T_NUM[i].l,T_NUM[i].lo,T_NUM[i].hi,T_NUM[i].cnt?" (k / M / B suffixes ok)":""); }
+    for(int i=0;i<T_NF&&c->f[i].label;i++){ const TFld*f=&c->f[i]; if(!v[i][0]||!t_vis(f,mode)||t_mixhide(c,v,i)) continue;
+        if(f->kind==F_TOKD){ data_resolve(v[i],r,sizeof r);
+            if(!t_tokhash(r)) t_prob(draw,"'%s': no tokenizer.bin in %s - Enter to pick one%s",f->label,r,t_is(c,"Build corpus")?", or make one with Train tokenizer":""); }
+        else if(f->kind==F_DATA && !(t_is(c,"Build corpus")&&isnew)){ data_resolve(v[i],r,sizeof r); snprintf(q,sizeof q,"%s\\train.bin",r);
+            if(!d_exists(q)) t_prob(draw,"'%s': no corpus (train.bin) in %s",f->label,r); }
+        else if(f->kind==F_PATH && !follow){ char sp[1024]; snprintf(sp,sizeof sp,"%s",v[i]);
+            for(char*p=sp,*e;p;p=e){ e=strchr(p,';'); if(e) *e++=0; while(*p==' ') p++; if(!*p) continue; data_resolve(p,r,sizeof r);
+                if(!d_exists(r)){ t_prob(draw,"'%s': not found: %s",f->label,p); pbad=1; } } } }
+    int nf=0; double tb;
+    if(t_is(c,"Download text")){ of=1; double t=d_count(v[2]); if(t>0) est=t*4.6; }
+    else if(t_is(c,"Convert files")){ of=1; if(v[0][0]&&!pbad){ tb=t_spec(v[0],".parquet;.json;.jsonl",&nf); est=tb*2;
+        if(draw) printf("  \x1b[2msource %s in %d file(s); parquet grows about 2x as .jsonl\x1b[0m\n",t_hb(tb,a),nf); } }
+    else if(t_is(c,"Train tokenizer")){ of=0; if(v[1][0]&&!pbad){ tb=t_spec(v[1],T_TEXTIN,&nf);
+        if(!nf) t_prob(draw,"'text': no .jsonl / .json / .txt files there");
+        else if(draw) printf("  \x1b[2mtext %s in %d file(s); reads up to %s MB of it\x1b[0m\n",t_hb(tb,a),nf,v[3]); } }
+    else if(t_is(c,"Build corpus")){ of=1; if(v[2][0]&&!pbad&&!follow){ tb=t_spec(v[2],T_TEXTIN,&nf); est=tb/4.5*2;
+            if(!nf) t_prob(draw,"'text': no .jsonl / .json / .txt files there");
+            else if(draw) printf("  \x1b[2mtext %s in %d file(s) -> about %s tokens\x1b[0m\n",t_hb(tb,a),nf,t_hn(tb/4.5,b)); }
+        if(!isnew&&v[1][0]&&v[3][0]){ char tk[1200]; data_resolve(v[1],r,sizeof r); data_resolve(v[3],tk,sizeof tk); unsigned h1=t_tokhash(r),h2=t_tokhash(tk);
+            if(h1&&h2&&h1!=h2) t_prob(draw,"append: the corpus uses tokenizer %06x, 'tokenizer' is %06x - they must be identical",h1,h2); } }
+    else if(t_is(c,"Mix corpora")){ of=0; est=t_mixtab(v,draw)*2; }
+    if(of>=0&&v[of][0]){
+        if(t_is(c,"Build corpus")&&!isnew) data_resolve(v[of],o,sizeof o); else data_outdir(v[of],o,sizeof o);
+        snprintf(t_outp,sizeof t_outp,"%s",o); double fr=t_free(o);
+        if(draw){ printf("  \x1b[36moutput\x1b[0m %s",o); if(fr>=0) printf("   \x1b[2m%s free",t_hb(fr,a)); if(est>0) printf(", needs about %s",t_hb(est,b)); printf("\x1b[0m\n"); }
+        if(est>0&&fr>=0&&est>fr) t_prob(draw,"not enough space: needs about %s, %s free on that drive",t_hb(est,a),t_hb(fr,b));
+        if(draw&&d_isdir(o)&&t_is(c,"Download text")) printf("  \x1b[2mthe folder exists: the download resumes into it\x1b[0m\n");
+        if(draw&&d_isdir(o)&&t_is(c,"Convert files")) printf("  \x1b[2mthe folder exists: converted files are added to it\x1b[0m\n");
+        snprintf(q,sizeof q,"%s\\tokenizer.bin",o); if(t_is(c,"Train tokenizer")&&d_exists(q)) t_prob(draw,"%s already has a tokenizer - pick a new name",o);
+        snprintf(q,sizeof q,"%s\\train.bin",o);
+        if(((t_is(c,"Build corpus")&&isnew)||t_is(c,"Mix corpora"))&&d_exists(q)) t_prob(draw,"%s already holds a corpus - pick a new name%s",o,t_is(c,"Build corpus")?" (or mode append)":""); }
+    if(t_is(c,"Corpus info")&&v[0][0]) data_resolve(v[0],t_outp,sizeof t_outp);
+    return t_nprob; }
+
+/* ---- after a run: hand the output to the next forms and offer the next step ---- */
+static const struct { const char*from,*to; } T_NEXT[]={{"Download text","Build corpus"},{"Convert files","Build corpus"},
+    {"Train tokenizer","Build corpus"},{"Build corpus","Corpus info"},{"Mix corpora","Corpus info"},{"Corpus info","Train"},{"Loss weights","Train"}};
+static void t_handoff(const TCmd*c,const char*o){
+    char q[1300]; snprintf(q,sizeof q,"%s\\train.bin",o); int corpus=d_exists(q);
+    if(t_is(c,"Download text")||t_is(c,"Convert files")){ t_set("Build corpus","text",o); t_set("Train tokenizer","text",o); }
+    else if(t_is(c,"Train tokenizer")){ t_set("Build corpus","tokenizer",o); t_set("Canon map","tokenizer",o); }
+    else if(corpus&&(t_is(c,"Build corpus")||t_is(c,"Mix corpora")||t_is(c,"Corpus info"))){
+        if(!t_is(c,"Corpus info")) t_set("Corpus info","corpus",o);
+        t_set("Train","data dir",o); t_set("Eval","data dir",o); if(t_is(c,"Build corpus")) t_set("Loss weights","corpus",o); } }
+static void t_form(const TCmd*c);
+static void t_after(const TCmd*c,DWORD code,const char*lp,const char*o){
+    const char*nx=NULL; char exe[MAX_PATH],cl[2600],lp2[700];
+    if(!code) for(size_t i=0;i<sizeof T_NEXT/sizeof T_NEXT[0];i++) if(t_is(c,T_NEXT[i].from)) nx=T_NEXT[i].to;
+    int info=!code&&o[0]&&d_isdir(o)&&(t_is(c,"Build corpus")||t_is(c,"Mix corpora")||t_is(c,"Train tokenizer"));
+    if(!code&&o[0]) t_handoff(c,o);
+    for(;;){
+        printf("\n");
+        if(nx) printf("  \x1b[1mEnter\x1b[0m next: %s (filled in)   ",nx);
+        if(info) printf("\x1b[1mI\x1b[0m info on the output   ");
+        printf("\x1b[1mL\x1b[0m open the log   \x1b[2many other key: back\x1b[0m\n"); fflush(stdout);
+        while(_kbhit()) _getch(); int k=t_key();
+        if(k=='l'||k=='L'){ ShellExecuteA(NULL,"open",lp,NULL,NULL,SW_SHOWNORMAL); continue; }
+        if((k=='i'||k=='I')&&info){ GetModuleFileNameA(0,exe,sizeof exe); cl[0]=0; t_quote(cl,sizeof cl,exe); t_quote(cl,sizeof cl,"data");
+            t_quote(cl,sizeof cl,"info"); t_quote(cl,sizeof cl,o); t_spawn(cl,NULL,"data-info",lp2,sizeof lp2); continue; }
+        if(k==13&&nx) t_form(&T_CMDS[t_ci(nx)]);
+        return; } }
+
 static void t_form(const TCmd*c){
-    static char vals[T_NCMD][T_NF][T_MAXL]; static int init[T_NCMD];
     int ci=(int)(c-T_CMDS), nf=0; while(nf<T_NF && c->f[nf].label) nf++;
-    if(!init[ci]){ int envmem=getenv("CUDALM_NGRAM")||getenv("CUDALM_ENGRAM");
-        for(int i=0;i<nf;i++){ const TFld*f=&c->f[i]; const char*e=f->kind==F_ENV?getenv(f->arg):NULL;
-            if(e&&*e&&!strncmp(f->arg,"NGRAM_",6)) envmem=1;
-            snprintf(vals[ci][i],T_MAXL,"%s",e&&*e?e:f->def);
-            if(f->kind==F_FILE && f->def[0] && !d_exists(f->def)){ char b[300]; snprintf(b,sizeof b,"bench\\%s",f->def);
-                if(d_exists(b)) snprintf(vals[ci][i],T_MAXL,"%s",b); } }
-        for(int i=0;i<nf;i++) if(c->f[i].kind==F_MEM && envmem){   /* a loaded profile decides the mode */
-            MemCfg m; mem_from_env(&m,64); snprintf(vals[ci][i],T_MAXL,"%s",mem_name(m.mode)); }
-        init[ci]=1; }
+    t_form_init(ci); char (*V)[T_MAXL]=t_vals[ci];
+    int hasadv=0; for(int i=0;i<nf;i++) if(c->f[i].vis==4) hasadv=1;
     int sel=0; char msg[300]="";
     for(;;){
-        int mode=t_mode(c,vals[ci]), vis[T_NF], nv=0;
-        for(int i=0;i<nf;i++) if(t_vis(&c->f[i],mode)) vis[nv++]=i;
+        int mode=t_mode(c,V), vis[T_NF], nv=0;
+        for(int i=0;i<nf;i++) if(t_vis(&c->f[i],mode)&&!t_mixhide(c,V,i)) vis[nv++]=i;
         if(sel>nv) sel=nv;
-        char cl[4096], err[200]; int ok=t_cmdline(c,vals[ci],cl,sizeof cl,err,sizeof err);
+        char cl[4096], err[200]; int ok=t_cmdline(c,V,cl,sizeof cl,err,sizeof err);
         t_head(c->title); printf("  \x1b[2m%s\x1b[0m\n\n",c->help);
-        for(int j=0;j<nv;j++){ const TFld*f=&c->f[vis[j]]; const char*v=vals[ci][vis[j]];
+        for(int j=0;j<nv;j++){ const TFld*f=&c->f[vis[j]]; const char*v=V[vis[j]];
             printf("%s %-14s\x1b[0m %s",j==sel?"\x1b[7m>":" ",f->label,v[0]?v:"\x1b[2m-\x1b[0m");
             if(f->kind==F_ENV) printf("   \x1b[2m%s%s\x1b[0m",f->arg,t_choices(f)?"  <- ->":"");
             else if(f->kind==F_MEM||f->kind==F_FLAG) printf("   \x1b[2m<- ->\x1b[0m");
             printf("\n"); }
-        if(mode>=0 || c->run) t_help(sel<nv?&c->f[vis[sel]]:NULL,sel<nv?vals[ci][vis[sel]]:"",c->run);
+        if(mode>=0 || c->run) t_help(sel<nv?&c->f[vis[sel]]:NULL,sel<nv?V[vis[sel]]:"",c->run);
         printf("\n%s [ Run ]\x1b[0m\n\n\x1b[2m%s\x1b[0m\n",sel==nv?"\x1b[7m>":" ",ok?cl:err);
-        if(mode>=0){ printf("\n"); t_new_stats(c,vals[ci]); }
+        t_panel(c,V,1);
+        if(mode>=0){ printf("\n"); t_new_stats(c,V); }
         if(msg[0]) printf("\x1b[33m%s\x1b[0m\n",msg); msg[0]=0;
-        printf("\x1b[%d;1H\x1b[2mUp/Down move  Enter edit/pick  Left/Right cycle choice  Del clear  F5 run  Esc back\x1b[0m",t_rows()); fflush(stdout);
+        printf("\x1b[%d;1H\x1b[2mUp/Down move  Enter edit/pick  Left/Right cycle choice  Del clear  F5 run  %sEsc back\x1b[0m",t_rows(),
+               hasadv?(t_adv?"F2 hide advanced  ":"F2 advanced fields  "):""); fflush(stdout);
         int k=t_key();
         if(k==27) return;
+        if(k==K_F2&&hasadv){ t_adv^=1; continue; }
         if(k==K_UP) sel=sel>0?sel-1:nv; else if(k==K_DOWN) sel=sel<nv?sel+1:0;
         else if(k==K_F5 || (k==13 && sel==nv)){
             if(!ok){ snprintf(msg,sizeof msg,"%s",err); continue; }
-            char sp[1100]=""; if(!strcmp(c->cmd,"train")){ model_path(vals[ci][0],sp,sizeof sp-5); strcat(sp,".stop"); }
-            char tag[200]; snprintf(tag,sizeof tag,"%s%s%.80s",c->cmd,nf&&vals[ci][0][0]?"-":"",nf?vals[ci][0]:"");
+            int np=t_panel(c,V,0); char outp[1200]; snprintf(outp,sizeof outp,"%s",t_outp);
+            if(np&&!t_yes("%d problem%s shown above - run anyway? (y/N) ",np,np>1?"s":"")) continue;
+            char sp[1100]=""; if(!strcmp(c->cmd,"train")){ model_path(V[0],sp,sizeof sp-5); strcat(sp,".stop"); }
+            char tag[200],lp[700]; snprintf(tag,sizeof tag,"%s%s%.80s",c->cmd,nf&&V[0][0]?"-":"",nf?V[0]:"");
             for(char*p=tag;*p;p++) if(*p==' ') *p='-';
-            t_form_env(c,vals[ci]); t_spawn(cl,sp[0]?sp:NULL,tag); t_env_pop(); }
+            t_form_env(c,V); DWORD code=t_spawn(cl,sp[0]?sp:NULL,tag,lp,sizeof lp); t_env_pop();
+            t_after(c,code,lp,outp); }
         else if(sel<nv){
-            const TFld*f=&c->f[vis[sel]]; char*v=vals[ci][vis[sel]]; const char*ch=t_choices(f); int n;
+            const TFld*f=&c->f[vis[sel]]; char*v=V[vis[sel]]; const char*ch=t_choices(f); int n; char r[1200];
             if(k==K_DEL) v[0]=0;
             else if((k==K_LEFT||k==K_RIGHT) && ch){ t_choice_items(ch,&n); int cur=0;
                 for(int i=0;i<n;i++) if(!strcmp(t_items[i],v)) cur=i;
                 cur=(cur+(k==K_RIGHT?1:n-1))%n; snprintf(v,T_MAXL,"%s",t_items[cur]); }
             else if(k==13){
-                if(f->kind==F_MODEL){ n=t_list_models(); t_choose(f->label,n,v,T_MAXL,0); }
-                else if(f->kind==F_DATA||f->kind==F_TOKD){ n=t_list_dirs(f->kind==F_TOKD); t_choose(f->label,n,v,T_MAXL,1); }
+                if(t_is(c,"Build corpus")&&vis[sel]==1){           /* new: a name to create; append: corpora with the same tokenizer */
+                    if(strcmp(V[0],"append")) t_choose(f->label,0,v,T_MAXL,1);
+                    else { n=t_list_dirs(0); data_resolve(V[3],r,sizeof r); unsigned h=t_tokhash(r); if(h) n=t_keep_tok(n,h);
+                        t_pv=t_corpus_pv; t_choose(f->label,n,v,T_MAXL,1); t_pv=0; } }
+                else if(t_is(c,"Mix corpora")&&f->kind==F_DATA){
+                    n=t_list_dirs(0); if(vis[sel]!=4&&V[4][0]){ data_resolve(V[4],r,sizeof r); unsigned h=t_tokhash(r); if(h) t_mark_tok(n,h); }
+                    t_pv=t_corpus_pv; t_choose(f->label,n,v,T_MAXL,1); t_pv=0;
+                    if(v[0]&&!V[vis[sel]+1][0]) snprintf(V[vis[sel]+1],T_MAXL,"1"); }
+                else if(f->kind==F_MODEL){ n=t_list_models(); t_choose(f->label,n,v,T_MAXL,0); }
+                else if(f->kind==F_DATA||f->kind==F_TOKD){ n=t_list_dirs(f->kind==F_TOKD); t_pv=t_corpus_pv; t_choose(f->label,n,v,T_MAXL,1); t_pv=0; }
+                else if(f->kind==F_PATH&&f->ext&&!strcmp(f->ext,T_TEXTIN)) t_pick_text(f->label,v,T_MAXL,f->ext);
                 else if(f->kind==F_DIR||f->kind==F_PATH) t_browse(f->label,v,T_MAXL,f->ext,f->kind==F_PATH);
                 else if(f->kind==F_FILE){ n=t_list_glob("*.txt"); t_choose(f->label,n,v,T_MAXL,0); }
                 else if(f->kind==F_ENV && f->ext && strchr(f->ext,'*')){ n=t_list_glob(f->ext); t_choose(f->label,n,v,T_MAXL,0); }
@@ -603,23 +806,88 @@ static void t_model_cfg(void){
     snprintf(ttl,sizeof ttl,"config %s  (applied by every command on this model; the environment overrides)",mp);
     t_reg(&t_st,ttl); }
 
+/* data roots: built-in, data_roots.txt (add / remove here) or CUDALM_DATA_ROOTS */
+static void t_roots(void){
+    int sel=0; char fp[1100]; snprintf(fp,sizeof fp,"%s\\data_roots.txt",exe_dir());
+    for(;;){ char x[1200],a[32]; const char*env=getenv("CUDALM_DATA_ROOTS"); int ev=env&&*env, n=0, nr=0;
+        for(int i=0;d_root(i,x,sizeof x)&&n<T_MAXL-2;i++,nr++){ snprintf(t_items[n],260,"%s",x); double fr=d_isdir(x)?t_free(x):-1;
+            char fs[48]; if(fr>=0) snprintf(fs,sizeof fs,"%s free",t_hb(fr,a)); else snprintf(fs,sizeof fs,"(missing)");
+            snprintf(t_info[n++],T_INFO,"%-18s %s",ev?"CUDALM_DATA_ROOTS":i<2?"built-in":"data_roots.txt",fs); }
+        snprintf(t_items[n],260,"[ add a folder ]"); snprintf(t_info[n++],T_INFO,"browse to it; saved in data_roots.txt");
+        snprintf(t_items[n],260,"[ open data_roots.txt ]"); snprintf(t_info[n++],T_INFO,"%s",fp);
+        int s=t_pick(ev?"data roots   CUDALM_DATA_ROOTS is set: it replaces this list (edits here apply once it is cleared)"
+                       :"data roots   bare text / tokenizer / corpus names are looked up here, in order; new outputs go to the one with most free space",
+                     "Enter on a data_roots.txt folder removes it   Esc back",n,sel);
+        if(s<0) return; sel=s;
+        if(s==nr){ char v[1200]=""; t_browse("add data root",v,sizeof v,NULL,0);
+            if(v[0]){ FILE*f=fopen(fp,"a"); if(f){ fprintf(f,"%s\n",v); fclose(f); } } }
+        else if(s==nr+1){ FILE*f=fopen(fp,"a"); if(f) fclose(f); ShellExecuteA(NULL,"open",fp,NULL,NULL,SW_SHOWNORMAL); }
+        else if(!ev&&s>=2&&t_yes("remove %s from data_roots.txt? The folder itself is not touched. (y/N) ",t_items[s])){
+            size_t len; char*b=(char*)read_file(fp,&len); if(!b) continue; b=(char*)realloc(b,len+1); b[len]=0;
+            FILE*f=fopen(fp,"wb"); int gone=0;
+            for(char*l=b,*e;f&&*l;l=e){ e=strchr(l,'\n'); e=e?e+1:l+strlen(l); char t[1100]; snprintf(t,sizeof t,"%.*s",(int)(e-l),l); t[strcspn(t,"\r\n")]=0;
+                if(!gone&&!strcmp(t,t_items[s])){ gone=1; continue; } fwrite(l,1,e-l,f); }
+            if(f) fclose(f); free(b); } } }
+/* every folder under the data roots: type, size, date; open / info / rename / Recycle Bin */
+static void t_manage(void){
+    static char pth[T_MAXL][1100]; int sel=0;
+    for(;;){ int n=0; char r[1100],a[32];
+        printf("\x1b[2J\x1b[H  scanning the data roots...\n"); fflush(stdout);
+        for(int ri=0;d_root(ri,r,sizeof r)&&n<T_MAXL;ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+            if(h==INVALID_HANDLE_VALUE) continue;
+            do{ if(n>=T_MAXL||!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||fd.cFileName[0]=='.') continue;
+                char d[1200],q[1300]; snprintf(d,sizeof d,"%s\\%s",r,fd.cFileName); int nf=0,tn=0; double sz=t_tree(d,NULL,&nf);
+                snprintf(q,sizeof q,"%s\\train.bin",d); const char*ty=d_exists(q)?"corpus":NULL;
+                if(!ty){ snprintf(q,sizeof q,"%s\\tokenizer.bin",d); ty=d_exists(q)?"tokenizer":NULL; }
+                if(!ty){ t_tree(d,T_TEXTIN,&tn); ty=tn?"text":"other"; }
+                SYSTEMTIME st; FileTimeToSystemTime(&fd.ftLastWriteTime,&st);
+                snprintf(pth[n],1100,"%s",d); snprintf(t_items[n],260,"%s",d);
+                snprintf(t_info[n++],T_INFO,"%-9s %10s %7d files  %04d-%02d-%02d",ty,t_hb(sz,a),nf,st.wYear,st.wMonth,st.wDay); }while(FindNextFileA(h,&fd));
+            FindClose(h); }
+        if(!n){ t_note("no folders under the data roots yet"); return; }
+        int s=t_pick("Manage data folders   (size = everything inside)","Enter actions   Esc back",n,sel); if(s<0) return; sel=s;
+        char d[1100]; snprintf(d,sizeof d,"%s",pth[s]);
+        snprintf(t_items[0],260,"Open in Explorer"); t_info[0][0]=0;
+        snprintf(t_items[1],260,"Info"); snprintf(t_info[1],T_INFO,"cudalm data info (corpus / tokenizer folders)");
+        snprintf(t_items[2],260,"Rename..."); t_info[2][0]=0;
+        snprintf(t_items[3],260,"Delete to the Recycle Bin..."); snprintf(t_info[3],T_INFO,"can be restored from the Recycle Bin");
+        int act=t_pick(d,NULL,4,0);
+        if(act==0) ShellExecuteA(NULL,"explore",d,NULL,NULL,SW_SHOWNORMAL);
+        else if(act==1){ char exe[MAX_PATH],cl[2600],lp[700]; GetModuleFileNameA(0,exe,sizeof exe); cl[0]=0; t_quote(cl,sizeof cl,exe);
+            t_quote(cl,sizeof cl,"data"); t_quote(cl,sizeof cl,"info"); t_quote(cl,sizeof cl,d); t_spawn(cl,NULL,"data-info",lp,sizeof lp); t_note("done"); }
+        else if(act==2){ char nm[260]; snprintf(nm,sizeof nm,"%s",d_base(d));
+            if(t_edit("new name",nm,sizeof nm)&&nm[0]&&!strpbrk(nm,"\\/:*?\"<>|")){ char to[1400]; snprintf(to,sizeof to,"%.*s%s",(int)(d_base(d)-d),d,nm);
+                if(!MoveFileA(d,to)) t_note("rename failed (error %lu) - is it in use?",GetLastError()); } }
+        else if(act==3){ char y[16]=""; t_head("delete"); printf("  send %s to the Recycle Bin?\n  type yes and Enter to confirm, Esc to cancel\n",d);
+            if(t_edit("confirm",y,sizeof y)&&!strcmp(y,"yes")){ char fr[1102]; memset(fr,0,sizeof fr); snprintf(fr,sizeof fr-1,"%s",d);
+                SHFILEOPSTRUCTA op; memset(&op,0,sizeof op); op.wFunc=FO_DELETE; op.pFrom=fr; op.fFlags=FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_WANTNUKEWARNING;
+                int rc=SHFileOperationA(&op); if(rc||op.fAnyOperationsAborted) t_note("not deleted (code %d)",rc); } } } }
 static void t_group_menu(int grp){
     int sel=0;
-    for(;;){ int n=0, ids[T_NCMD];
+    for(;;){ int n=0, ids[T_NCMD+8];
         for(int i=0;i<T_NCMD;i++) if(T_CMDS[i].grp==grp){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
-        int nc=n;
-        if(grp==1){ char r[2048]; data_roots(r,sizeof r); snprintf(t_items[n],260,"(data roots)"); snprintf(t_info[n++],T_INFO,"%.200s",r); }
+        if(grp==1){
+            ids[n]=-1; snprintf(t_items[n],260,"-- advanced --"); t_info[n++][0]=0;
+            for(int i=0;i<T_NCMD;i++) if(T_CMDS[i].grp==3){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
+            ids[n]=-1; snprintf(t_items[n],260,"-- folders --"); t_info[n++][0]=0;
+            ids[n]=-2; snprintf(t_items[n],260,"Manage data folders"); snprintf(t_info[n++],T_INFO,"sizes, open, rename, delete to the Recycle Bin");
+            char r[2048]; data_roots(r,sizeof r); ids[n]=-3; snprintf(t_items[n],260,"Data roots"); snprintf(t_info[n++],T_INFO,"%.200s",r); }
         int s=grp==1?t_pick("Data tools   order: Download / Convert text -> (Train tokenizer) -> Build corpus -> (Mix) -> Corpus info -> Train",
-                     "Up/Down  Enter open  Esc back   bare names = folders under the data roots (CUDALM_DATA_ROOTS)",n,sel)
+                     "Up/Down  Enter open  Esc back   bare names = folders under the data roots",n,sel)
                     :t_pick("Diagnostics   correctness checks for kernels, decoder, tokenizer and QLM weights",NULL,n,sel);
-        if(s<0) return; sel=s; if(s<nc) t_form(&T_CMDS[ids[s]]); } }
+        if(s<0) return; sel=s;
+        if(ids[s]>=0) t_form(&T_CMDS[ids[s]]); else if(ids[s]==-2) t_manage(); else if(ids[s]==-3) t_roots(); } }
 /* tuicheck [model]: every form's command line from its defaults (model fields = model), no console needed */
-static int tui_check(const char*model){
-    static char vals[T_NF][T_MAXL];
-    for(int ci=0;ci<T_NCMD;ci++){ const TCmd*c=&T_CMDS[ci]; char cl[4096],err[200];
-        for(int i=0;i<T_NF&&c->f[i].label;i++) snprintf(vals[i],T_MAXL,"%s",c->f[i].kind==F_MODEL&&model?model:c->f[i].def);
-        int ok=t_cmdline(c,vals,cl,sizeof cl,err,sizeof err);
-        printf("%-16s %s\n",c->title,ok?cl:err); }
+/* tuicheck [model] ["Form:label=value" ...]: every form's command line, plus the live panel of the data forms */
+static int tui_check(int argc,char**argv){
+    const char*model=argc>2&&!strchr(argv[2],':')?argv[2]:NULL;
+    for(int i=model?3:2;i<argc;i++){ char t[600]; snprintf(t,sizeof t,"%s",argv[i]); char*l=strchr(t,':'),*v=l?strchr(l,'='):NULL;
+        if(!v){ fprintf(stderr,"tuicheck: expected Form:label=value, got %s\n",argv[i]); return 1; } *l++=0; *v++=0; t_set(t,l,v); }
+    for(int ci=0;ci<T_NCMD;ci++){ const TCmd*c=&T_CMDS[ci]; char cl[4096],err[200]; t_form_init(ci); char (*V)[T_MAXL]=t_vals[ci];
+        for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_MODEL&&model) snprintf(V[i],T_MAXL,"%s",model);
+        int ok=t_cmdline(c,V,cl,sizeof cl,err,sizeof err);
+        printf("%-16s %s\n",c->title,ok?cl:err);
+        if(c->grp==1||c->grp==3){ int np=t_panel(c,V,1); if(np) printf("  (%d problem%s)\n",np,np>1?"s":""); } }
     return 0; }
 static int tui_main(void){
     HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); DWORD m=0;

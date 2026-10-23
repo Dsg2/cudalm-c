@@ -137,7 +137,19 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
   - alpaca-style `instruction` / `input` / `output`;
   - `content` / `code` / `markdown` / `body`.
 - **Mixing:** `cudalm data mix <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...` mixes encoded
-  corpora that share a tokenizer.
+  corpora that share a tokenizer. Token counts (fetch, mix) accept `k` / `M` / `B` suffixes (`500M`, `1B`).
+- **TUI Data tools:**
+  - Each form shows a live panel: the resolved output folder, free space and estimated size, range checks, missing
+    tokenizer/corpus, tokenizer mismatches, and outputs that already exist. Mix also shows a blend table with each
+    corpus's share, the tokens it contributes and the repeats. F5 with problems asks before running.
+  - Pickers show a tokenizer id (`tok 289cba`; equal ids mean an identical `tokenizer.bin`) and preview the
+    highlighted corpus. The text picker lists folders under the data roots; Space marks several.
+  - After a successful run, the output is filled into the next forms. Enter opens the next step, I shows info on
+    the output, and L opens the log.
+  - Canon map and Loss weights sit under "advanced". Build corpus `follow` appears with F2.
+  - **Manage data folders** lists every folder under the roots with its type, size and date, and can open, show
+    info, rename, or send one to the Recycle Bin. **Data roots** adds folders to `data_roots.txt` and removes them.
+  - `cudalm tuicheck [model] ["Form:label=value" ...]` prints every form's command line and data panel without the UI.
 - **Per-token loss weights (RL):** `cudalm data weights <corpus> <rows.jsonl>` writes `train.w` from each row's `"w"`
   (encode those rows with `val%=0 dedup=0` first). `data mix` carries it through (1.0 for corpora without one), and
   `CUDALM_TOKW=1` trains with it: negative weights push failed rollouts down until their p < `CUDALM_NEG_PMIN`.
