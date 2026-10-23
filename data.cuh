@@ -182,7 +182,7 @@ static int d_textfile(const char*n){ return d_ends(n,".jsonl")||d_ends(n,".json"
 static void d_walk(DFiles*l,const char*dir){
     char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",dir); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
     if(h==INVALID_HANDLE_VALUE) return;
-    do{ if(fd.cFileName[0]=='.'||fd.cFileName[0]=='_') continue;
+    do{ if(fd.cFileName[0]=='.'||fd.cFileName[0]=='_'||!_stricmp(fd.cFileName,"sources.json")) continue;   /* fetch.py's metadata */
         char p[1200]; snprintf(p,sizeof p,"%s\\%s",dir,fd.cFileName);
         if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) d_walk(l,p);
         else if(d_textfile(fd.cFileName)) d_addf(l,p); else if(d_ends(fd.cFileName,".parquet")) l->npq++;
@@ -655,12 +655,102 @@ static int cmd_data_info(int argc,char**argv){
         free(l); free(d); dunmap(&m); }
     return 0; }
 
+/* ---------------- hf: browse Hugging Face datasets (search, splits, first rows) over WinINet, loaded at run time ---------------- */
+static int d_http(const char*url,DBuf*o){          /* GET -> o (NUL-terminated); returns the HTTP status, 0 = no connection */
+    static HMODULE m; static FARPROC f[5]; static const char*fn[5]={"InternetOpenA","InternetOpenUrlA","InternetReadFile","InternetCloseHandle","HttpQueryInfoA"};
+    if(!m){ if(!(m=LoadLibraryA("wininet.dll"))) return 0; for(int i=0;i<5;i++) if(!(f[i]=GetProcAddress(m,fn[i]))) return 0; }
+    typedef void*(WINAPI*Op)(const char*,DWORD,const char*,const char*,DWORD); typedef void*(WINAPI*Ou)(void*,const char*,const char*,DWORD,DWORD,DWORD_PTR);
+    typedef BOOL(WINAPI*Rd)(void*,void*,DWORD,DWORD*); typedef BOOL(WINAPI*Cl)(void*); typedef BOOL(WINAPI*Qi)(void*,DWORD,void*,DWORD*,DWORD*);
+    o->n=0; db_s(o,""); void*ss=((Op)f[0])("cudalm",0,NULL,NULL,0); if(!ss) return 0;      /* 0 = INTERNET_OPEN_TYPE_PRECONFIG */
+    char h[600]=""; const char*tk=getenv("HF_TOKEN"); if(tk&&*tk) snprintf(h,sizeof h,"Authorization: Bearer %s\r\n",tk);
+    void*r=((Ou)f[1])(ss,url,h[0]?h:NULL,h[0]?(DWORD)-1:0,0x80000000u|0x04000000u|0x00000200u,0);   /* RELOAD | NO_CACHE_WRITE | NO_UI */
+    DWORD st=0,sl=sizeof st; char b[16384]; DWORD n;
+    if(r){ ((Qi)f[4])(r,19|0x20000000u,&st,&sl,NULL);                                       /* STATUS_CODE | FLAG_NUMBER */
+        while(((Rd)f[2])(r,b,sizeof b,&n)&&n) db_put(o,b,n); ((Cl)f[3])(r); }
+    ((Cl)f[3])(ss); return (int)st; }
+static void d_urlenc(const char*s,char*o,size_t cap){ size_t n=0;
+    for(;*s&&n+4<cap;s++){ unsigned char c=(unsigned char)*s; if(isalnum(c)||strchr("-_.~/",c)) o[n++]=c; else n+=snprintf(o+n,cap-n,"%%%02X",c); } o[n]=0; }
+static const char* d_hb2(double b,char*o){ if(b>=1e9) sprintf(o,"%.1f GB",b/1e9); else if(b>=1e6) sprintf(o,"%.0f MB",b/1e6); else sprintf(o,"%.0f KB",b/1e3); return o; }
+static void d_jstr(const char*v,char*o,size_t cap){ o[0]=0; if(!v||*v!='"') return; DBuf b={0}; jdec(v,&b); snprintf(o,cap,"%s",b.p?b.p:""); free(b.p); }
+typedef struct { char id[128], lic[40], size[24], task[48], lang[40], fmt[24], desc[400]; long long dl; int likes, gated; } HfDs;
+typedef struct { char cfg[96], split[64]; long long rows, bytes; } HfSplit;
+#define HF_DS "https://datasets-server.huggingface.co"
+static int hf_search(const char*q,HfDs*o,int cap){                  /* most downloaded first; <0 = -HTTP status (-1 = no connection) */
+    char e[600],u[900]; d_urlenc(q,e,sizeof e); snprintf(u,sizeof u,"https://huggingface.co/api/datasets?search=%s&sort=downloads&direction=-1&limit=%d",e,cap);
+    DBuf b={0}; int st=d_http(u,&b), n=0; if(st!=200){ free(b.p); return st?-st:-1; }
+    for(const char*x=jfirst(b.p);x&&n<cap;x=jnext(x)){ HfDs*d=&o[n]; memset(d,0,sizeof *d); if(*x!='{') continue;
+        d_jstr(jget(x,"id"),d->id,sizeof d->id); if(!d->id[0]) continue;
+        const char*v=jget(x,"downloads"); d->dl=v?_atoi64(v):0; v=jget(x,"likes"); d->likes=v?atoi(v):0;
+        v=jget(x,"gated"); d->gated=v&&*v!='f'; d_jstr(jget(x,"description"),d->desc,sizeof d->desc);
+        v=jget(x,"tags"); if(v) for(const char*t=jfirst(v);t;t=jnext(t)){ char g[128]; d_jstr(t,g,sizeof g); char*c=strchr(g,':'); if(!c) continue; *c++=0;
+            if(!strcmp(g,"license")) snprintf(d->lic,sizeof d->lic,"%s",c); else if(!strcmp(g,"size_categories")) snprintf(d->size,sizeof d->size,"%s",c);
+            else if(!strcmp(g,"task_categories")&&!d->task[0]) snprintf(d->task,sizeof d->task,"%s",c); else if(!strcmp(g,"format")&&!d->fmt[0]) snprintf(d->fmt,sizeof d->fmt,"%s",c);
+            else if(!strcmp(g,"language")&&strlen(d->lang)<30){ size_t l=strlen(d->lang); snprintf(d->lang+l,sizeof d->lang-l,"%s%s",l?",":"",c); } }
+        n++; }
+    free(b.p); return n; }
+static int hf_splits(const char*repo,HfSplit*o,int cap,int*partial,char*err,size_t ecap){   /* configs x splits with rows / parquet bytes */
+    char e[400],u[700]; d_urlenc(repo,e,sizeof e); snprintf(u,sizeof u,HF_DS "/size?dataset=%s",e); DBuf b={0}; int st=d_http(u,&b), n=0; *partial=0; err[0]=0;
+    if(st!=200){ d_jstr(jget(b.p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,st?"HTTP %d":"no connection",st); free(b.p); return -1; }
+    const char*v=jget(b.p,"partial"); *partial=v&&*v=='t'; const char*sz=jget(b.p,"size"); v=sz?jget(sz,"splits"):NULL;
+    if(v) for(const char*x=jfirst(v);x&&n<cap;x=jnext(x)){ HfSplit*h=&o[n++]; d_jstr(jget(x,"config"),h->cfg,sizeof h->cfg); d_jstr(jget(x,"split"),h->split,sizeof h->split);
+        const char*r=jget(x,"num_rows"); h->rows=r?_atoi64(r):0; r=jget(x,"num_bytes_parquet_files"); h->bytes=r?_atoi64(r):0; }
+    free(b.p); return n; }
+static int hf_default(const HfSplit*s,int n){                      /* same pick as fetch.py: config "default", split "train", else the first */
+    int best=0,sc=-1; for(int i=0;i<n;i++){ int c=2*!strcmp(s[i].cfg,"default")+!strcmp(s[i].split,"train"); if(c>sc){ sc=c; best=i; } } return best; }
+static int hf_rows(const char*repo,const char*cfg,const char*split,DBuf*b){
+    char e[400],c[200],sp[120],u[1000]; d_urlenc(repo,e,sizeof e); d_urlenc(cfg,c,sizeof c); d_urlenc(split,sp,sizeof sp);
+    snprintf(u,sizeof u,HF_DS "/first-rows?dataset=%s&config=%s&split=%s",e,c,sp); return d_http(u,b); }
+/* which columns fetch.py's auto parser would use (its auto_doc order); string columns go to cols (cap 32) */
+static const char* hf_detect(const char*rj,char cols[][64],int*nc){
+    static char how[160]; how[0]=0; *nc=0; int has[16]={0}; const char*K[]={"text","messages","conversations","conversation","instruction","prompt","question",
+        "output","response","answer","content","code","markdown","body"}; const char*v=jget(rj,"features");
+    if(v) for(const char*x=jfirst(v);x;x=jnext(x)){ char nm[64]; d_jstr(jget(x,"name"),nm,sizeof nm); const char*t=jget(x,"type"); char dt[32]=""; if(t&&*t=='{') d_jstr(jget(t,"dtype"),dt,sizeof dt);
+        int str=!strcmp(dt,"string")||!strcmp(dt,"large_string"); if(str&&*nc<32) snprintf(cols[(*nc)++],64,"%s",nm);
+        for(int k=0;k<14;k++) if(!strcmp(nm,K[k])) has[k]=k>=1&&k<4?1:str; }
+    if(has[0]) return "text column 'text'";
+    for(int k=1;k<4;k++) if(has[k]){ snprintf(how,sizeof how,"chat turns in '%s'",K[k]); return how; }
+    if((has[4]||has[5]||has[6])&&(has[7]||has[8]||has[9])) return "instruction / answer pairs (rendered as chat)";
+    for(int k=10;k<14;k++) if(has[k]){ snprintf(how,sizeof how,"text column '%s'",K[k]); return how; }
+    return NULL; }
+static void hf_show_rows(const char*rj,int maxr,int w){             /* first rows: each column, one line, cut at w */
+    const char*v=jget(rj,"rows"); int r=0;
+    if(v) for(const char*x=jfirst(v);x&&r<maxr;x=jnext(x),r++){ const char*row=jget(x,"row"); if(!row) continue; printf("  \x1b[2mrow %d\x1b[0m\n",r);
+        for(const char*k=jfirst(row);k&&*k=='"';k=jobj_next(k)){ const char*val=jobj_val(k); if(!val) break; char nm[64]; d_jstr(k,nm,sizeof nm);
+            DBuf b={0}; if(*val=='"') jdec(val,&b); else { const char*e=jskip(val); if(e) db_put(&b,val,e-val); }
+            char*s=b.p?b.p:(char*)""; for(char*q=s;*q;q++) if(*q=='\n'||*q=='\r'||*q=='\t') *q=' ';
+            int cut=0,lim=w; while(s[cut]&&lim>0){ if(((unsigned char)s[cut]&0xC0)!=0x80) lim--; cut++; } while(((unsigned char)s[cut]&0xC0)==0x80) cut++;
+            printf("    \x1b[36m%-14.14s\x1b[0m %.*s%s\n",nm,cut,s,s[cut]?"...":""); free(b.p); } } }
+static void hf_name(const char*repo,const char*cfg,const char*split,char*o,size_t cap){   /* folder name: hf_<dataset>[_cfg][_split] */
+    const char*b=strrchr(repo,'/'); b=b?b+1:repo; size_t n=snprintf(o,cap,"hf_%s",b);
+    if(cfg&&*cfg&&strcmp(cfg,"default")) n+=snprintf(o+n,cap-n,"_%s",cfg); if(split&&*split&&strcmp(split,"train")) snprintf(o+n,cap-n,"_%s",split);
+    for(char*q=o;*q;q++) if(!isalnum((unsigned char)*q)&&!strchr("-_.",*q)) *q='_'; }
+static int cmd_data_hf(int argc,char**argv){
+    const char*s=argc>3?argv[3]:""; char a[32];
+    if(!strcmp(s,"search")&&argc>4){ static HfDs d[100]; int n=hf_search(argv[4],d,argc>5?atoi(argv[5]):30);
+        if(n<0){ fprintf(stderr,"[hf] search failed (HTTP %d)\n",-n); return 1; }
+        for(int i=0;i<n;i++) printf("%-50s %8.0fk dl %6d likes  %-12s %-16s%s\n",d[i].id,d[i].dl/1e3,d[i].likes,d[i].size,d[i].lic,d[i].gated?"  gated (HF_TOKEN)":"");
+        return 0; }
+    if((!strcmp(s,"info")||!strcmp(s,"rows"))&&argc>4){ HfSplit sp[256]; int part; char err[300]; int n=hf_splits(argv[4],sp,256,&part,err,sizeof err);
+        if(n<0){ fprintf(stderr,"[hf] %s: %s\n",argv[4],err); return 1; }
+        if(!strcmp(s,"info")){ for(int i=0;i<n;i++){ printf("%-32s %-16s %12lld rows %10s parquet\n",sp[i].cfg,sp[i].split,sp[i].rows,d_hb2(sp[i].bytes,a));
+                printf("    fetch spec: hf:%s:%s:%s\n",argv[4],sp[i].cfg,sp[i].split); }
+            if(part) printf("note: the parquet conversion is partial (about the first 5 GB of each split)\n"); return 0; }
+        int k=n?hf_default(sp,n):0; const char*cf=argc>5?argv[5]:n?sp[k].cfg:"default",*sl=argc>6?argv[6]:n?sp[k].split:"train";
+        DBuf b={0}; int st=hf_rows(argv[4],cf,sl,&b); if(st!=200){ char e[300]; d_jstr(jget(b.p,"error"),e,sizeof e); fprintf(stderr,"[hf] rows: HTTP %d %s\n",st,e); free(b.p); return 1; }
+        char cols[32][64]; int nc; const char*how=hf_detect(b.p,cols,&nc);
+        printf("%s  config %s  split %s\n  string columns:",argv[4],cf,sl); for(int i=0;i<nc;i++) printf(" %s",cols[i]);
+        printf("\n  fetch reads: %s\n",how?how:"nothing automatically - add @<column> to the spec"); hf_show_rows(b.p,3,110); free(b.p); return 0; }
+    fprintf(stderr,"usage: cudalm data hf search <query> [n=30]     datasets, most downloaded first\n"
+                   "       cudalm data hf info <user/dataset>        configs and splits (rows, parquet size)\n"
+                   "       cudalm data hf rows <user/dataset> [config] [split]   columns, what fetch would read, first rows\n"
+                   "  download: cudalm data fetch hf:<user/dataset>[:config[:split]][@column] <out> [tokens]\n"); return 1; }
+
 /* ---------------- fetch: prep\fetch.py (Hugging Face profiles, parquet/json conversion) ---------------- */
 static int cmd_data_fetch(int argc,char**argv){
-    if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url> <out> [target_tokens]   download\n"
+    if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url|hf:user/dataset[:config[:split]][@column]> <out> [target_tokens]   download\n"
         "       cudalm data fetch <file|folder> <out> [category]       convert parquet/json/jsonl\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
     char out[1200],src[1200],cl[4096]; data_outdir(argv[4],out,sizeof out); data_resolve(argv[3],src,sizeof src);
-    int conv=_strnicmp(argv[3],"http",4) && (!d_bare(argv[3])||strchr(argv[3],'.')) && d_exists(src);   /* bare word = profile */
+    int conv=_strnicmp(argv[3],"http",4) && _strnicmp(argv[3],"hf:",3) && (!d_bare(argv[3])||strchr(argv[3],'.')) && d_exists(src);   /* bare word = profile */
     char x[64]=""; if(argc>5) snprintf(x,sizeof x,"%s",argv[5]);
     if(!conv&&argc>5){ double t=d_count(argv[5]); if(t<=0){ fprintf(stderr,"[fetch] target tokens must be a number (suffixes k M B allowed)\n"); return 1; } snprintf(x,sizeof x,"%.0f",t); }
     snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" %s",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x);
@@ -722,10 +812,13 @@ static int cmd_data(int argc,char**argv){
     if(!strcmp(s,"canon"))     return cmd_data_canon(argc,argv);
     if(!strcmp(s,"weights"))   return cmd_data_weights(argc,argv);
     if(!strcmp(s,"fetch"))     return cmd_data_fetch(argc,argv);
+    if(!strcmp(s,"hf"))        return cmd_data_hf(argc,argv);
     char roots[2048]; data_roots(roots,sizeof roots);
     fprintf(stderr,
         "cudalm data - tokenizer and corpus tools (bare names resolve under the data roots)\n"
         "  cudalm data fetch     <profile|url|file|folder> <out> [tokens|category]  download / convert to .jsonl\n"
+        "                        hf:<user/dataset>[:config[:split]][@column] downloads any Hugging Face dataset\n"
+        "  cudalm data hf        search <query> | info <user/dataset> | rows <user/dataset> [config] [split]\n"
         "  cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]  train a byte-level BPE (+ canon.bin)\n"
         "  cudalm data encode    <new|append> <out> <inputs> <tokenizer> [val%%=1] [dedup=1] [follow=0]\n"
         "  cudalm data mix       <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...\n"

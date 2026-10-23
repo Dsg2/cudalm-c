@@ -138,6 +138,16 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
   - `content` / `code` / `markdown` / `body`.
 - **Mixing:** `cudalm data mix <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...` mixes encoded
   corpora that share a tokenizer. Token counts (fetch, mix) accept `k` / `M` / `B` suffixes (`500M`, `1B`).
+- **Any Hugging Face dataset:** `cudalm data fetch hf:<user/dataset>[:config[:split]][@column] <out> [tokens]` downloads
+  the hub's parquet files for that split, or the repo's own .parquet/.jsonl/.json files when the hub has no conversion.
+  The config defaults to `default` and the split to `train`. Text is auto-detected the same way as Convert files:
+  `text`, chat `messages`/`conversations`, instruction/answer pairs, or `content`/`code`/`markdown`/`body`.
+  `@column` reads one column instead.
+  - `cudalm data hf search <query>`: lists matching datasets.
+  - `cudalm data hf info <user/dataset>`: lists configs and splits with row counts and sizes.
+  - `cudalm data hf rows <user/dataset> [config] [split]`: shows the columns, what fetch will read, and the first rows.
+  - In the TUI, **Browse Hugging Face** (top of Data tools) does the same interactively and fills in Download text.
+  - Gated datasets need `HF_TOKEN`. Script-only datasets can't be read.
 - **TUI Data tools:**
   - Each form shows a live panel: the resolved output folder, free space and estimated size, range checks, missing
     tokenizer/corpus, tokenizer mismatches, and outputs that already exist. Mix also shows a blend table with each

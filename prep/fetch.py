@@ -4,11 +4,12 @@ Writes plain .jsonl ({"text","cat","src"} per line, chat already rendered with t
 
   python fetch.py list                                   profiles and their sources
   python fetch.py get <profile|url> <out> [tokens=1e9]   download (resumable) + parse; raw shards are deleted
+       profile hf:<user/dataset>[:config[:split]][@column]  any Hugging Face dataset (its parquet files)
   python fetch.py convert <file|folder> <out> [cat]      parquet/json/jsonl -> jsonl (schema auto-detected)
 
 HF_TOKEN (env) is sent when set (needed for gated sets such as xlam60k).
 """
-import os, sys, json, time, re, threading, queue, urllib.request, urllib.error
+import os, sys, json, time, re, threading, queue, urllib.request, urllib.error, urllib.parse
 
 CPT, SLACK = 4.0, 1.15            # chars per token (v3 tokenizer, approx), over-fetch slack
 M = dict(system="<|system|>\n", tools="<|tools|>\n", user="<|user|>\n",
@@ -207,6 +208,45 @@ SINGLE = {"web": ("web", "ultrafineweb"), "code": ("code", "github-python"), "ma
           "cosmopedia": ("synthetic", "cosmopedia-v2"), "chat": ("chat", "ultrachat"), "tools": ("tool", "glaive-v2")}
 for k, (c, s) in SINGLE.items(): P[k] = (f"only {s} ({S[s][2].split(' (')[0]})", {c: 1.0}, [(c, s)])
 
+# ------------------------------ any Hugging Face dataset ---------------------
+def hf_json(url):
+    h = {"User-Agent": "Mozilla/5.0"}
+    if os.environ.get("HF_TOKEN"): h["Authorization"] = "Bearer " + os.environ["HF_TOKEN"]
+    return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=60))
+
+def hf_source(spec):
+    """hf:<repo>[:config[:split]][@column] -> (name, urls, parser, licence). Files: the hub's parquet conversion
+    (datasets-server), else the repo's own .parquet/.jsonl/.json files. Config 'default' and split 'train' when not given."""
+    s, col = (spec[3:].rsplit("@", 1) + [None])[:2] if "@" in spec else (spec[3:], None)
+    repo, cfg, split = (s.split(":") + [None, None])[:3]
+    q = urllib.parse.quote(repo)
+    try: files = hf_json(f"https://datasets-server.huggingface.co/parquet?dataset={q}")
+    except Exception as e: files = {"parquet_files": []}; print(f"  (no parquet conversion: {e})", flush=True)
+    pf = files.get("parquet_files", [])
+    if pf:
+        cfgs = list(dict.fromkeys(f["config"] for f in pf)); cfg = cfg or ("default" if "default" in cfgs else cfgs[0])
+        sp = list(dict.fromkeys(f["split"] for f in pf if f["config"] == cfg)); split = split or ("train" if "train" in sp else sp[0] if sp else "train")
+        urls = [f["url"] for f in sorted((f for f in pf if f["config"] == cfg and f["split"] == split), key=lambda f: f["filename"])]
+        if files.get("partial"): print("  note: the hub's parquet conversion of this dataset is partial (about the first 5 GB per split)", flush=True)
+    else: urls = []
+    if not urls:                                                   # repo files, preferring paths that mention the split
+        tree = hf_json(f"https://huggingface.co/api/datasets/{q}/tree/main?recursive=true")
+        fs = [t["path"] for t in tree if t.get("type") == "file" and t["path"].endswith((".parquet", ".jsonl", ".json")) and not t["path"].startswith(".")]
+        pick = [f for f in fs if (split or "train") in f.lower()] or fs
+        if (split or cfg) and not pick: sys.exit(f"no files for {spec}")
+        urls = [f"{HF}/{repo}/resolve/main/{urllib.parse.quote(f)}" for f in sorted(pick)]
+    if not urls: sys.exit(f"{repo}: no parquet / jsonl / json files found (script-only datasets are not supported)")
+    lic = "?"
+    try: lic = next((t[8:] for t in hf_json(f"https://huggingface.co/api/datasets/{q}").get("tags", []) if t.startswith("license:")), "?")
+    except Exception: pass
+    name = re.sub(r"[^\w.-]", "_", repo.split("/")[-1] + (f"-{cfg}" if cfg and cfg != "default" else "") + (f"-{split}" if split and split != "train" else ""))
+    def p_one(p):                                                  # @column: that column as plain text
+        for r in iter_rows(p, [col]):
+            v = r.get(col); d = v.strip() if isinstance(v, str) else auto_doc({"messages": v}) if isinstance(v, list) else None
+            if d: yield d
+    print(f"[hf  ] {repo} config {cfg or '?'} split {split or '?'}: {len(urls)} file(s), reads {('column ' + col) if col else 'auto-detected text'}, licence {lic}", flush=True)
+    return name, urls, p_one if col else p_auto, f"{repo} ({lic})"
+
 # ------------------------------ download ------------------------------------
 def download(url, dest, retries=6):
     for attempt in range(retries):
@@ -280,9 +320,14 @@ def cmd_get(spec, out, tokens):
     if spec.startswith("http"):
         name = re.sub(r"[^\w.-]", "_", os.path.splitext(spec.rstrip("/").split("/")[-1].split("?")[0])[0])
         prof = ("url", {"text": 1.0}, [("text", name)]); S[name] = ([spec], p_auto, spec)
+    elif spec.startswith("hf:"):
+        name, urls, parser, lic = hf_source(spec); S[name] = (urls, parser, lic); prof = (spec, {name: 1.0}, [(name, name)])
     elif spec in P: prof = P[spec]
     else: sys.exit(f"unknown profile {spec!r} - run: fetch.py list")
     desc, w, srcs = prof
+    if any(".parquet" in u for _, nm in srcs for u in S[nm][0]):
+        try: import pyarrow.parquet
+        except ImportError: sys.exit(f"pyarrow is missing for {sys.executable}: run  {sys.executable} -m pip install pyarrow  (or set CUDALM_PYTHON)")
     spath = os.path.join(out, "_state.json")
     try: state = json.load(open(spath))
     except Exception: state = {}

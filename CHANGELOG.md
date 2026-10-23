@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-23
 
+- Add hf_* CLI commands and fetch.py profile handler for HF datasets
+- Add WinINet-based d_http for Hugging Face HTTP calls
+- Update data.cuh d_walk to skip sources.json metadata
+- Update README.md with HF dataset usage examples
+- Update tui.cuh data tools with HF browse option
+
+## Unreleased - 2026-10-23
+
 - feat(data): add d_count() for token/byte counts with k/M/B suffixes
 - feat(cudalm): tuicheck now passes all args instead of only the second
 - docs: update README.md with new TUI data tools and token count suffixes

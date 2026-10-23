@@ -132,7 +132,8 @@ static const TCmd T_CMDS[]={
  {"data fetch","Download text","Hugging Face blend -> .jsonl text (resumable; runs prep\\fetch.py: python + pyarrow)",
   {{"profile","v3pre",F_CHOICE,"v3pre|v3sft|v3chat|web|code|math|cosmopedia|chat|tools",0,0,
      "v3pre = pretraining blend (web 34, code 20, synthetic 16, math 14, chat 10, tools 6 %); v3sft / v3chat = instruction blends;\n"
-     "web, code, math, cosmopedia, chat, tools = one source each. Or type the https URL of a single .parquet/.json file."},
+     "web, code, math, cosmopedia, chat, tools = one source each. Or type the https URL of a single .parquet/.json file,\n"
+     "or hf:<user/dataset>[:config[:split]][@column] for any Hugging Face dataset (Browse Hugging Face fills this in)."},
    {"out folder","text_v3pre",F_TEXT,0,0,0,"Folder for the text (<category>__<source>.jsonl). A bare name goes under the data root with the most free space.\n"
      "Run again with the same folder to resume an interrupted download."},
    {"tokens","1B",F_TEXT,0,0,0,"Roughly how many tokens of text to fetch (k / M / B suffixes; 1B ~ 4.6 GB of text), split by the profile's weights.\n"
@@ -209,6 +210,8 @@ static char t_profile[260]="(none)";
 static int t_key(void){ int c=_getch(); if(c==0||c==0xE0) return 1000+_getch(); return c; }
 static int t_rows(void){ CONSOLE_SCREEN_BUFFER_INFO b; if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&b))
     return b.srWindow.Bottom-b.srWindow.Top+1; return 25; }
+static int t_cols(void){ CONSOLE_SCREEN_BUFFER_INFO b; if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&b))
+    return b.srWindow.Right-b.srWindow.Left+1; return 80; }
 static void t_head(const char*title){
     printf("\x1b[2J\x1b[H\x1b[1;36mcudalm\x1b[0m  %s   \x1b[2m[%s]  profile: %s\x1b[0m\n\n",title,exe_dir(),t_profile); }
 static int t_envwanted(const char*k){ return !_strnicmp(k,"CUDALM_",7)||!_strnicmp(k,"QLM_",4)||!_strnicmp(k,"NGRAM_",6); }
@@ -862,9 +865,72 @@ static void t_manage(void){
             if(t_edit("confirm",y,sizeof y)&&!strcmp(y,"yes")){ char fr[1102]; memset(fr,0,sizeof fr); snprintf(fr,sizeof fr-1,"%s",d);
                 SHFILEOPSTRUCTA op; memset(&op,0,sizeof op); op.wFunc=FO_DELETE; op.pFrom=fr; op.fFlags=FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_WANTNUKEWARNING;
                 int rc=SHFileOperationA(&op); if(rc||op.fAnyOperationsAborted) t_note("not deleted (code %d)",rc); } } } }
+/* ---- Hugging Face browser: search -> config / split -> columns + first rows -> Download text, filled in ---- */
+static HfDs t_hfd[100];
+static void t_hf_pv(int sel){ const HfDs*d=&t_hfd[sel]; char a[32], s[400]; int w=t_cols()-4; if(w<40) w=40; if(w>300) w=300;
+    printf("\x1b[36m%s\x1b[0m   %s downloads, %d likes%s\n",d->id,t_hn((double)d->dl,a),d->likes,d->gated?"   \x1b[33mgated: needs HF_TOKEN and the terms accepted on the website\x1b[0m":"");
+    printf("  \x1b[2mlicence %s   size %s   task %s   language %s   format %s\x1b[0m\n",d->lic[0]?d->lic:"?",d->size[0]?d->size:"?",
+           d->task[0]?d->task:"-",d->lang[0]?d->lang:"-",d->fmt[0]?d->fmt:"-");
+    int m=0; for(const char*q=d->desc;*q;q++){ char c=*q=='\n'||*q=='\r'||*q=='\t'?' ':*q; if(c!=' '||(m&&s[m-1]!=' ')) s[m++]=c; } s[m]=0;
+    for(int l=0,o=0;l<3&&s[o];l++){ int e=o,c=0; while(s[e]&&c<w){ if(((unsigned char)s[e]&0xC0)!=0x80) c++; e++; } while(((unsigned char)s[e]&0xC0)==0x80) e++;
+        printf("  %.*s\n",e-o,s+o); o=e; } }
+static void t_hf_open(const char*repo,const char*cfg,const char*split,long long bytes){
+    DBuf b={0}; char cols[32][64], col[64]="", a[32]; int nc=0, st=0; const char*how=NULL;
+    if(cfg[0]){ t_head(repo); printf("  loading the first rows...\n"); fflush(stdout); st=hf_rows(repo,cfg,split,&b); if(st==200) how=hf_detect(b.p,cols,&nc); }
+    for(;;){
+        t_head(repo); printf("  config \x1b[1m%s\x1b[0m   split \x1b[1m%s\x1b[0m",cfg[0]?cfg:"auto",split[0]?split:"auto");
+        if(bytes>0) printf("   \x1b[2m%s of parquet, roughly %s tokens\x1b[0m",t_hb((double)bytes,a),t_hn(bytes*0.45,a+16)); printf("\n\n");
+        if(st!=200){ char e[300]=""; if(b.p) d_jstr(jget(b.p,"error"),e,sizeof e);
+            printf("  \x1b[33mno preview%s%s: the download uses the repo's own .parquet / .jsonl / .json files\x1b[0m\n",e[0]?" - ":"",e); }
+        else { printf("  fetch reads: ");
+            if(col[0]) printf("\x1b[1mcolumn '%s'\x1b[0m (chosen)\n",col); else if(how) printf("\x1b[1m%s\x1b[0m (auto)\n",how);
+            else printf("\x1b[31m%s\x1b[0m\n",nc?"no text column recognised - press C to choose one":"no text columns: this dataset cannot be used");
+            printf("\n"); hf_show_rows(b.p,3,t_cols()-24); }
+        printf("\x1b[%d;1H\x1b[2mEnter download this (fills in Download text)   %sEsc back\x1b[0m",t_rows(),nc?"C choose the text column   ":""); fflush(stdout);
+        int k=t_key();
+        if(k==27){ free(b.p); return; }
+        if((k=='c'||k=='C')&&nc){ int n=0; snprintf(t_items[n],260,"(auto)"); snprintf(t_info[n++],T_INFO,"%s",how?how:"nothing recognised");
+            for(int i=0;i<nc;i++){ snprintf(t_items[n],260,"%s",cols[i]); t_info[n++][0]=0; }
+            int s=t_pick("text column: its strings become the documents",NULL,n,0); if(s==0) col[0]=0; else if(s>0) snprintf(col,sizeof col,"%s",cols[s-1]); continue; }
+        if(k!=13) continue;
+        if(st==200&&!how&&!col[0]){ t_note(nc?"no text column recognised: press C and pick one":"this dataset has no text columns (images, numbers...)"); continue; }
+        char spec[T_MAXL], nm[200], tk[32]; int n=snprintf(spec,sizeof spec,"hf:%s",repo);
+        if(cfg[0]) n+=snprintf(spec+n,sizeof spec-n,":%s:%s",cfg,split); if(col[0]) snprintf(spec+n,sizeof spec-n,"@%s",col);
+        hf_name(repo,cfg,split,nm,sizeof nm); double est=bytes>0?bytes*0.45*1.2:1e9; if(est>1e9) est=1e9; if(est<1e6) est=1e6;
+        snprintf(tk,sizeof tk,"%.0fM",est/1e6);
+        t_set("Download text","profile",spec); t_set("Download text","out folder",nm); t_set("Download text","tokens",tk);
+        free(b.p); t_form(&T_CMDS[t_ci("Download text")]); return; } }
+static void t_hf_ds(const char*repo){
+    static HfSplit sp[256]; int part; char err[300], a[32], b[32];
+    t_head(repo); printf("  loading configs and splits...\n"); fflush(stdout);
+    int n=hf_splits(repo,sp,256,&part,err,sizeof err);
+    if(n<=0){ t_note("no split list (%s) - the download will try the repo's own files",n<0?err:"empty"); t_hf_open(repo,"","",0); return; }
+    if(n==1){ t_hf_open(repo,sp[0].cfg,sp[0].split,sp[0].bytes); return; }
+    int sel=hf_default(sp,n); char ttl[400]; snprintf(ttl,sizeof ttl,"%s: pick a config / split%s",repo,part?"   (partial parquet conversion: about the first 5 GB of each)":"");
+    for(;;){ for(int i=0;i<n;i++){ snprintf(t_items[i],260,"%s / %s",sp[i].cfg,sp[i].split); snprintf(t_info[i],T_INFO,"%10s rows %10s",t_hn((double)sp[i].rows,a),t_hb((double)sp[i].bytes,b)); }
+        int s=t_pick(ttl,"Up/Down  Enter preview  Esc back",n,sel); if(s<0) return; sel=s; t_hf_open(repo,sp[s].cfg,sp[s].split,sp[s].bytes); } }
+static void t_hf(void){
+    static char q[200]; char a[32];
+    for(;;){
+        t_head("Browse Hugging Face datasets");
+        printf("  Search dataset names, e.g. tinystories, fineweb-edu, ultrachat, the-stack. Results come most downloaded first.\n"
+               "  Pick a dataset and split, check what fetch will read from its first rows, then download it as .jsonl text.\n"
+               "  \x1b[2mGated datasets need HF_TOKEN (environment or profile) and their terms accepted on huggingface.co.\n"
+               "  Datasets that only ship a loading script cannot be read.\x1b[0m\n");
+        if(!t_edit("search",q,sizeof q)||!q[0]) return;
+        printf("\x1b[%d;1H\x1b[2K  searching...",t_rows()); fflush(stdout);
+        int n=hf_search(q,t_hfd,100), sel=0;
+        if(n<0){ t_note(n==-1?"search failed: no connection":"search failed: HTTP %d",-n); continue; }
+        if(!n){ t_note("no datasets match '%s'",q); continue; }
+        char ttl[300]; snprintf(ttl,sizeof ttl,"Hugging Face: '%s'   %d result%s, most downloaded first",q,n,n>1?"s":"");
+        for(;;){ for(int i=0;i<n;i++){ const HfDs*d=&t_hfd[i]; snprintf(t_items[i],260,"%s",d->id);
+                snprintf(t_info[i],T_INFO,"%7s dl %6d likes  %-11s %-14.14s%s",t_hn((double)d->dl,a),d->likes,d->size,d->lic,d->gated?"  \x1b[33mgated\x1b[0m":""); }
+            t_pv=t_hf_pv; int s=t_pick(ttl,"Up/Down  Enter open  Esc new search",n,sel); t_pv=0;
+            if(s<0) break; sel=s; t_hf_ds(t_hfd[s].id); } } }
 static void t_group_menu(int grp){
     int sel=0;
     for(;;){ int n=0, ids[T_NCMD+8];
+        if(grp==1){ ids[n]=-4; snprintf(t_items[n],260,"Browse Hugging Face"); snprintf(t_info[n++],T_INFO,"search any dataset, preview its rows, download it as text"); }
         for(int i=0;i<T_NCMD;i++) if(T_CMDS[i].grp==grp){ ids[n]=i; snprintf(t_items[n],260,"%s",T_CMDS[i].title); snprintf(t_info[n++],T_INFO,"%s",T_CMDS[i].help); }
         if(grp==1){
             ids[n]=-1; snprintf(t_items[n],260,"-- advanced --"); t_info[n++][0]=0;
@@ -876,10 +942,11 @@ static void t_group_menu(int grp){
                      "Up/Down  Enter open  Esc back   bare names = folders under the data roots",n,sel)
                     :t_pick("Diagnostics   correctness checks for kernels, decoder, tokenizer and QLM weights",NULL,n,sel);
         if(s<0) return; sel=s;
-        if(ids[s]>=0) t_form(&T_CMDS[ids[s]]); else if(ids[s]==-2) t_manage(); else if(ids[s]==-3) t_roots(); } }
+        if(ids[s]>=0) t_form(&T_CMDS[ids[s]]); else if(ids[s]==-2) t_manage(); else if(ids[s]==-3) t_roots(); else if(ids[s]==-4) t_hf(); } }
 /* tuicheck [model]: every form's command line from its defaults (model fields = model), no console needed */
 /* tuicheck [model] ["Form:label=value" ...]: every form's command line, plus the live panel of the data forms */
 static int tui_check(int argc,char**argv){
+    if(argc>3&&!strcmp(argv[2],"hf")){ t_hfd[0].id[0]=0; int n=hf_search(argv[3],t_hfd,5); for(int i=0;i<n;i++){ t_hf_pv(i); printf("\n"); } return n<0; }
     const char*model=argc>2&&!strchr(argv[2],':')?argv[2]:NULL;
     for(int i=model?3:2;i<argc;i++){ char t[600]; snprintf(t,sizeof t,"%s",argv[i]); char*l=strchr(t,':'),*v=l?strchr(l,'='):NULL;
         if(!v){ fprintf(stderr,"tuicheck: expected Form:label=value, got %s\n",argv[i]); return 1; } *l++=0; *v++=0; t_set(t,l,v); }
