@@ -114,10 +114,11 @@ static void jesc(FILE*f,const char*s){ fputc('"',f);
     fputc('"',f); }
 
 /* ---------------- docs: JSON object -> text (chat rendered with the chatml markers) ---------------- */
-typedef struct { DBuf o,t,m,a; } DWs;
+typedef struct { DBuf o,t,m,a,x,y; } DWs;
 static const char* d_role(const char*r,size_t l){
-    static const char*m[][2]={{"system","system"},{"human","user"},{"user","user"},{"prompter","user"},{"gpt","assistant"},
-        {"assistant","assistant"},{"chatgpt","assistant"},{"tool","result"},{"observation","result"},{"function_response","result"},
+    static const char*m[][2]={{"system","system"},{"developer","system"},{"human","user"},{"user","user"},{"prompter","user"},{"gpt","assistant"},
+        {"assistant","assistant"},{"chatgpt","assistant"},{"model","assistant"},{"bot","assistant"},{"ai","assistant"},
+        {"tool","result"},{"observation","result"},{"function_response","result"},{"function","result"},{"ipython","result"},
         {"function_call","call"},{"tool_call","call"}};
     for(size_t i=0;i<sizeof m/sizeof m[0];i++) if(strlen(m[i][0])==l && !_strnicmp(r,m[i][0],l)) return m[i][1];
     return NULL; }
@@ -146,6 +147,64 @@ static void jval(const char*v,DBuf*o){
             db_put(o,"\"",1); free(t.p); p=jstr_end(p); if(!p) return; continue; }
         if(*p==',') db_s(o,", "); else if(*p==':') db_s(o,": "); else if(!(*p==' '||*p=='\n'||*p=='\r'||*p=='\t')) db_put(o,p,1);
         p++; } }
+/* chats already rendered with another model's template -> turns (twin of fetch.py split_chat / chat_fin).
+ * header templates: <open>ROLE<role-end>CONTENT<end>; marker templates: fixed marker -> role (ls = only at a line start).
+ * The first D_STRICT marker templates (and all header ones) are unambiguous special tokens, also tried on plain text. */
+typedef struct { const char*m,*role; int ls; } DMk;
+static const struct { const char*name,*op,*rt,*end; } D_HDR[]={{"ChatML","<|im_start|>","\n","<|im_end|>"},
+    {"Llama-3","<|start_header_id|>","<|end_header_id|>","<|eot_id|>"},{"Gemma","<start_of_turn>","\n","<end_of_turn>"}};
+static const DMk D_MK0[]={{"<\xe7\x94\xa8\xe6\x88\xb7>","user",0},{"<AI>","assistant",0},{0}},
+    D_MK1[]={{"[INST]","user",0},{"[/INST]","assistant",0},{"<<SYS>>","system",0},{"<</SYS>>","user",0},{0}},
+    D_MK2[]={{"### Instruction:","user",1},{"### Input:","user",1},{"### Response:","assistant",1},{0}},
+    D_MK3[]={{"SYSTEM:","system",1},{"USER:","user",1},{"ASSISTANT:","assistant",1},{0}},
+    D_MK4[]={{"Human:","user",1},{"Assistant:","assistant",1},{0}};
+static const struct { const char*name; const DMk*mk; } D_MKS[]={{"MiniCPM",D_MK0},{"Mistral",D_MK1},{"Alpaca",D_MK2},
+    {"USER:/ASSISTANT:",D_MK3},{"Human:/Assistant:",D_MK4}};
+#define D_STRICT 2
+static long d_find(const char*s,size_t n,const char*p,size_t from){ size_t l=strlen(p); const char*e=s+n;
+    for(const char*q=s+from;q+l<=e&&(q=(const char*)memchr(q,p[0],e-q))&&q+l<=e;q++) if(!memcmp(q,p,l)) return (long)(q-s); return -1; }
+typedef struct { const char*r,*s; size_t n; } DRaw;
+#define D_MAXT 2048
+static int d_chat_fin(const DRaw*raw,int nr,DWs*w,int*np){   /* clean, drop empty, merge same-role neighbours -> parts in w->o */
+    static const char*junk[]={"<|begin_of_text|>","<|endoftext|>","<s>","</s>","<|im_end|>","<|eot_id|>","<end_of_turn>"};
+    const char**R=(const char**)malloc(sizeof(char*)*D_MAXT); size_t*O=(size_t*)malloc(sizeof(size_t)*D_MAXT),*L=(size_t*)malloc(sizeof(size_t)*D_MAXT);
+    int c=0,hu=0,ha=0; w->x.n=0; db_s(&w->x,"");
+    for(int i=0;i<nr;i++){ if(!raw[i].r) continue; w->y.n=0; db_put(&w->y,raw[i].s,raw[i].n);
+        for(size_t j=0;j<sizeof junk/sizeof junk[0];j++){ size_t jl=strlen(junk[j]),o=0; char*b=w->y.p;
+            for(size_t k=0;k<w->y.n;){ if(k+jl<=w->y.n&&!memcmp(b+k,junk[j],jl)) k+=jl; else b[o++]=b[k++]; } w->y.n=o; b[o]=0; }
+        const char*t=w->y.p; size_t n=w->y.n; d_trim(&t,&n); if(!n) continue;
+        if(c&&!strcmp(R[c-1],raw[i].r)){ db_s(&w->x,"\n\n"); db_put(&w->x,t,n); L[c-1]+=2+n; }
+        else if(c<D_MAXT){ R[c]=raw[i].r; O[c]=w->x.n; L[c]=n; db_put(&w->x,t,n); c++; } }
+    for(int i=0;i<c;i++){ hu|=!strcmp(R[i],"user"); ha|=!strcmp(R[i],"assistant"); }
+    if(hu&&ha) for(int i=0;i<c;i++) d_part(&w->o,np,R[i],w->x.p+O[i],L[i]);
+    free(R); free(O); free(L); return hu&&ha; }
+static int d_split_chat(const char*s,size_t n,int strict,DWs*w,int*np,const char**name){
+    DRaw*raw=(DRaw*)malloc(sizeof(DRaw)*D_MAXT); int ok=0;
+    for(size_t h=0;h<sizeof D_HDR/sizeof D_HDR[0]&&!ok;h++){ const char*op=D_HDR[h].op,*rt=D_HDR[h].rt; size_t lo=strlen(op),lr=strlen(rt);
+        long i=d_find(s,n,op,0); int nr=0;
+        while(i>=0&&nr<D_MAXT){ long j=d_find(s,n,rt,i+lo); if(j<0) break;
+            size_t k=j+lr; long nx=d_find(s,n,op,k),e=d_find(s,n,D_HDR[h].end,k); size_t st=n;
+            if(e>=0&&(size_t)e<st) st=e; if(nx>=0&&(size_t)nx<st) st=nx;
+            const char*r=s+i+lo; size_t rn=j-i-lo; d_trim(&r,&rn);
+            raw[nr].r=d_role(r,rn); raw[nr].s=s+k; raw[nr].n=st-k; nr++; i=nx; }
+        if(nr&&d_chat_fin(raw,nr,w,np)){ ok=1; if(name) *name=D_HDR[h].name; } }
+    for(size_t t=0;t<(strict?D_STRICT:sizeof D_MKS/sizeof D_MKS[0])&&!ok;t++){
+        typedef struct { long i; size_t l; const char*r; } Hit; Hit*hs=(Hit*)malloc(sizeof(Hit)*D_MAXT); int nh=0,as=0;
+        for(const DMk*m=D_MKS[t].mk;m->m;m++){ size_t ml=strlen(m->m);
+            for(long i=d_find(s,n,m->m,0);i>=0&&nh<D_MAXT;i=d_find(s,n,m->m,i+1)) if(!m->ls||i==0||s[i-1]=='\n'){
+                int q=nh++; while(q>0&&(hs[q-1].i>i||(hs[q-1].i==i&&hs[q-1].l<ml))){ hs[q]=hs[q-1]; q--; }
+                hs[q].i=i; hs[q].l=ml; hs[q].r=m->role; as|=!strcmp(m->role,"assistant"); } }
+        if(as){ int nr=0; raw[nr].r="system"; raw[nr].s=s; raw[nr].n=hs[0].i; nr++;
+            for(int q=0;q<nh&&nr<D_MAXT;q++){ size_t b=hs[q].i+hs[q].l, e=q+1<nh?(size_t)hs[q+1].i:n; raw[nr].r=hs[q].r; raw[nr].s=s+b; raw[nr].n=e>b?e-b:0; nr++; }
+            if(d_chat_fin(raw,nr,w,np)){ ok=1; if(name) *name=D_MKS[t].name; } }
+        free(hs); }
+    free(raw); return ok; }
+/* content given as [{type, text}, ...] parts -> the text fields joined by \n (as fetch.py ctext); 0 = not that shape */
+static int d_parts(const char*c,DBuf*o){
+    if(*c!='[') return 0; const char*e=jfirst(c); if(!e) return 0;
+    for(const char*x=e;x;x=jnext(x)) if(*x!='{') return 0;
+    int k=0; for(const char*x=e;x;x=jnext(x)){ const char*t=jget(x,"text"); if(!t||*t!='"') continue; if(k++) db_put(o,"\n",1); jdec(t,o); }
+    if(!o->p) db_put(o,"",0); return 1; }
 static int d_render(const char*obj,DWs*w){
     int np=0; const char*v; w->o.n=0;
     if((v=jget(obj,"system"))&&*v=='"'){ w->t.n=0; jdec(v,&w->t); d_part(&w->o,&np,"system",w->t.p,w->t.n); }
@@ -155,20 +214,28 @@ static int d_render(const char*obj,DWs*w){
         if(!d_field(obj,qk,3,&w->t)||!d_field(obj,ak,3,&w->a)) return 0;      /* alpaca-style pair */
         if(d_field(obj,ik,2,&w->m)){ db_s(&w->t,"\n\n"); db_put(&w->t,w->m.p,w->m.n); }
         d_part(&w->o,&np,"user",w->t.p,w->t.n); d_part(&w->o,&np,"assistant",w->a.p,w->a.n); return np>=2; }
-    if(*a=='"'){ w->a.n=0; jdec(a,&w->a); a=w->a.p; }           /* parquet exports store the list as a JSON string */
+    if(*a=='"'){ w->a.n=0; jdec(a,&w->a); a=w->a.p;            /* parquet exports store the list as a JSON string */
+        if(!jfirst(a)||*jws(a)!='['){ d_split_chat(w->a.p,w->a.n,0,w,&np,NULL); return np>=2; } }  /* or a chat rendered with a template */
     for(const char*e=jfirst(a);e;e=jnext(e)){ if(*e!='{') continue;
         const char*r=jget(e,"from"); if(!r) r=jget(e,"role");
         const char*c=jget(e,"value"); if(!c) c=jget(e,"content");
         if(!r||*r!='"'||!c||*c=='n') continue;
         w->t.n=0; jdec(r,&w->t); const char*role=d_role(w->t.p,w->t.n); if(!role) continue;
-        w->t.n=0; jval(c,&w->t); d_part(&w->o,&np,role,w->t.p,w->t.n); }
+        w->t.n=0; if(!d_parts(c,&w->t)) jval(c,&w->t); d_part(&w->o,&np,role,w->t.p,w->t.n); }
     return np>=2; }
+/* any column holding a chat in a special-token template (auto's last resort, as fetch.py auto_doc); *kp = its key */
+static int d_chatcol(const char*obj,DWs*w,const char**name,const char**kp){
+    for(const char*k=jfirst(obj);k&&*k=='"';k=jobj_next(k)){ const char*v=jobj_val(k); if(!v) break; if(*v!='"') continue;
+        w->t.n=0; jdec(v,&w->t); const char*s=w->t.p; size_t n=w->t.n; d_trim(&s,&n); int np=0; w->o.n=0; db_s(&w->o,"");
+        if(d_split_chat(s,n,1,w,&np,name)){ if(kp) *kp=k; return 1; } }
+    return 0; }
 /* text of one JSON object + its category ("kind/cat" or "cat"); 0 = no usable doc */
 static int d_doc(const char*obj,DWs*w,const char**txt,size_t*n,char*cat,size_t ccap){
     static const char*tk[]={"text"},*ck[]={"content","code","markdown","body"};
     const char*v=jget(obj,"text");
-    if(v&&*v=='"'){ if(!d_field(obj,tk,1,&w->o)) return 0; }
-    else if(!d_render(obj,w)&&!d_field(obj,ck,4,&w->o)) return 0;
+    if(v&&*v=='"'){ int np=0; if(!d_field(obj,tk,1,&w->t)) return 0;             /* plain text, unless a chat in a known template */
+        w->o.n=0; db_s(&w->o,""); if(!d_split_chat(w->t.p,w->t.n,1,w,&np,NULL)){ w->o.n=0; db_put(&w->o,w->t.p,w->t.n); } }
+    else if(!d_render(obj,w)&&!d_field(obj,ck,4,&w->o)&&!d_chatcol(obj,w,NULL,NULL)) return 0;
     *txt=w->o.p; *n=w->o.n; cat[0]=0;
     const char*k=jget(obj,"kind"),*c=jget(obj,"cat");
     if(k&&*k=='"'&&c&&*c=='"'){ w->m.n=0; jdec(k,&w->m); db_put(&w->m,"/",1); jdec(c,&w->m); snprintf(cat,ccap,"%s",w->m.p); }
@@ -182,7 +249,8 @@ static int d_textfile(const char*n){ return d_ends(n,".jsonl")||d_ends(n,".json"
 static void d_walk(DFiles*l,const char*dir){
     char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",dir); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
     if(h==INVALID_HANDLE_VALUE) return;
-    do{ if(fd.cFileName[0]=='.'||fd.cFileName[0]=='_'||!_stricmp(fd.cFileName,"sources.json")) continue;   /* fetch.py's metadata */
+    do{ if(fd.cFileName[0]=='.'||fd.cFileName[0]=='_'||!_stricmp(fd.cFileName,"sources.json")||!_stricmp(fd.cFileName,"meta.json")   /* metadata of */
+           ||!_stricmp(fd.cFileName,"tokenizer.json")||!_stricmp(fd.cFileName,"template.txt")) continue;                        /* fetch.py / a corpus */
         char p[1200]; snprintf(p,sizeof p,"%s\\%s",dir,fd.cFileName);
         if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) d_walk(l,p);
         else if(d_textfile(fd.cFileName)) d_addf(l,p); else if(d_ends(fd.cFileName,".parquet")) l->npq++;
@@ -768,13 +836,18 @@ static int tpl_render(const char*row,const char*tpl,DWs*w,const char**txt,size_t
     char cat[96],e[200]; DTpl t; if(!tpl||!*tpl) return d_doc(row,w,txt,n,cat,sizeof cat);
     if(!tpl_parse(tpl,&t,e,sizeof e)) return 0; static DBuf ob; tpl_obj(row,&t,&ob); return d_doc(ob.p,w,txt,n,cat,sizeof cat); }
 static const char* tpl_auto(const char*row){                       /* what auto-detect picks for this row (d_doc order) */
-    static char how[160]; const char*v=jget(row,"text"); if(v&&*v=='"') return "text column 'text'";
+    static char how[160]; static DWs w; const char*v=jget(row,"text"),*nm=NULL; int np=0;
+    if(v&&*v=='"'){ w.a.n=0; jdec(v,&w.a); w.o.n=0; if(d_split_chat(w.a.p,w.a.n,1,&w,&np,&nm)){ snprintf(how,sizeof how,"chat (%s template) in 'text'",nm); return how; }
+        return "text column 'text'"; }
     static const char*ck[]={"messages","conversations","conversation"},*qk[]={"instruction","prompt","question"},*ak[]={"output","response","answer"},
         *tk[]={"content","code","markdown","body"};
-    for(int k=0;k<3;k++) if(jget(row,ck[k])){ snprintf(how,sizeof how,"chat turns in '%s'",ck[k]); return how; }
+    for(int k=0;k<3;k++) if((v=jget(row,ck[k]))){ w.a.n=0; if(*v=='"') jdec(v,&w.a); np=0; w.o.n=0;
+        if(*v=='"'&&*jws(w.a.p)!='['&&d_split_chat(w.a.p,w.a.n,0,&w,&np,&nm)) snprintf(how,sizeof how,"chat (%s template) in '%s'",nm,ck[k]);
+        else snprintf(how,sizeof how,"chat turns in '%s'",ck[k]); return how; }
     for(int q=0;q<3;q++) if((v=jget(row,qk[q]))&&*v=='"') for(int a=0;a<3;a++) if((v=jget(row,ak[a]))&&*v=='"'){
         snprintf(how,sizeof how,"prompt '%s' + answer '%s'",qk[q],ak[a]); return how; }
     for(int k=0;k<4;k++) if((v=jget(row,tk[k]))&&*v=='"'){ snprintf(how,sizeof how,"text column '%s'",tk[k]); return how; }
+    const char*kp; if(d_chatcol(row,&w,&nm,&kp)){ char c[64]; d_jstr(kp,c,sizeof c); snprintf(how,sizeof how,"chat (%s template) in '%s'",nm,c); return how; }
     return NULL; }
 static int d_cols(const char*row,char nm[][64],char*kind,int cap){  /* column names + kinds: s text, l list, o object, n other */
     int n=0; for(const char*k=jfirst(row);k&&*k=='"'&&n<cap;k=jobj_next(k)){ const char*v=jobj_val(k); if(!v) break; d_jstr(k,nm[n],64);
