@@ -162,6 +162,11 @@ static const TCmd T_CMDS[]={
    {"sample MB","300",F_TEXT,0,0,0,"MB of text read, an equal share from each file. More = slightly better merges, slower.\n"
      "300 MB: a few minutes, a few GB of RAM."}},
   "Run: count words, then repeatedly merge the most frequent pair until the vocab is full.\nAll current v3 models use v3tok (V=16384); a new tokenizer means new models trained from scratch.",1},
+ {"data tokenizer-from","Tokenizer from model","a model's own tokenizer -> tokenizer folder (tokenizer.bin + tokenizer.json + canon.bin)",
+  {{"model","",F_MODEL,0,0,0,"The model you will finetune. Its .bin carries the exact tokenizer it was trained with."},
+   {"out name","",F_TEXT,0,0,0,"Folder for the tokenizer (a bare name goes under the data root with most free space).\n"
+     "Use it as the tokenizer in Build corpus so the finetune data gets the model's own token ids."}},
+  "Run: write the model's tokenizer as a folder (seconds).\nNext: Build corpus with this folder as tokenizer, then Train the model on that corpus.",1},
  {"data encode","Build corpus","tokenize text into train.bin / val.bin for Train and Eval (new corpus, or append)",
   {{"mode","new",F_CHOICE,"new|append",0,0,"new = create a corpus folder (refused if it already holds one).\n"
      "append = add docs to an existing corpus's train.bin (val.bin unchanged); needs the identical tokenizer."},
@@ -169,7 +174,7 @@ static const TCmd T_CMDS[]={
      "append: pick the existing corpus."},
    {"text","",F_PATH,0,0,T_TEXTIN,"Input .jsonl / .json / .txt files or folders, several separated by ';'. JSON needs \"text\" or a chat\n"
      "(\"messages\" / \"conversations\"), rendered with the chatml markers. Parquet: Convert files first."},
-   {"tokenizer","v3tok",F_TOKD,0,0,0,"Folder with tokenizer.bin: one from Train tokenizer, or any corpus.\n"
+   {"tokenizer","v3tok",F_TOKD,0,0,0,"Folder with tokenizer.bin: one from Train tokenizer or Tokenizer from model, or any corpus.\n"
      "Must be the tokenizer of the model you will train (v3tok = all v3 models)."},
    {"val %","1",F_TEXT,0,0,0,"Share of docs held out in val.bin (every Nth doc), used by Eval and the training val loss. 0 = none."},
    {"dedup","1",F_CHOICE,"1|0",0,0,"1 = skip docs whose exact text already appeared in this run."},
@@ -205,7 +210,7 @@ static const TCmd T_CMDS[]={
 static const struct { const char*title; int n; } T_REQ[]={
  {"Train",2},{"Generate",1},{"Serve",1},{"Chatbench",2},{"LM eval",1},{"Probe",2},{"Eval",2},{"New model",2},{"Model info",1},
  {"Bench",1},{"Grow",2},{"Quantize",2},{"Export GGUF",1},{"QLM check",1},{"Decode check",1},{"Tokenizer check",2},
- {"Download text",2},{"Convert files",2},{"Train tokenizer",2},{"Build corpus",4},{"Mix corpora",6},{"Corpus info",1},
+ {"Download text",2},{"Convert files",2},{"Train tokenizer",2},{"Tokenizer from model",2},{"Build corpus",4},{"Mix corpora",6},{"Corpus info",1},
  {"Canon map",1},{"Loss weights",2}};
 static int t_req(const TCmd*c){ for(size_t i=0;i<sizeof T_REQ/sizeof T_REQ[0];i++) if(!strcmp(T_REQ[i].title,c->title)) return T_REQ[i].n; return 0; }
 enum { K_UP=1072, K_DOWN=1080, K_LEFT=1075, K_RIGHT=1077, K_PGUP=1073, K_PGDN=1081, K_HOME=1071, K_END=1079, K_F2=1060, K_F5=1063, K_DEL=1083 };
@@ -671,7 +676,7 @@ static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the
             else if(t_is(c,"Download text")&&_strnicmp(v[0],"hf:",3)&&_strnicmp(v[0],"http",4)) t_prob(draw,"'template' applies to hf: and URL sources, not the built-in profiles"); } }
     for(int i=0;i<T_NF&&c->f[i].label;i++){ const TFld*f=&c->f[i]; if(!v[i][0]||!t_vis(f,mode)||t_mixhide(c,v,i)) continue;
         if(f->kind==F_TOKD){ data_resolve(v[i],r,sizeof r);
-            if(!t_tokhash(r)) t_prob(draw,"'%s': no tokenizer.bin in %s - Enter to pick one%s",f->label,r,t_is(c,"Build corpus")?", or make one with Train tokenizer":""); }
+            if(!t_tokhash(r)) t_prob(draw,"'%s': no tokenizer.bin in %s - Enter to pick one%s",f->label,r,t_is(c,"Build corpus")?", or make one with Train tokenizer or Tokenizer from model":""); }
         else if(f->kind==F_DATA && !(t_is(c,"Build corpus")&&isnew)){ data_resolve(v[i],r,sizeof r); snprintf(q,sizeof q,"%s\\train.bin",r);
             if(!d_exists(q)) t_prob(draw,"'%s': no corpus (train.bin) in %s",f->label,r); }
         else if(f->kind==F_PATH && !follow){ char sp[1024]; snprintf(sp,sizeof sp,"%s",v[i]);

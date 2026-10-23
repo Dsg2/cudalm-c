@@ -377,6 +377,8 @@ static void cfg_from_hdr(Cfg*c,const int*h,int ver){
 /* defined below, next to the rest of the quantization code */
 static int dequantize_params(Rd*r,float*P,size_t n,int qtype,int group);
 
+static uint8_t*g_tokblob; static int g_tokblobl;     /* raw TLTK blob of the last model_load_full (data tokenizer-from) */
+static void tok_keep(const uint8_t*p,int n){ free(g_tokblob); g_tokblob=(uint8_t*)malloc(n); memcpy(g_tokblob,p,n); g_tokblobl=n; }
 static float* model_load_full(const char*path,Cfg*c,Tok**tk){
     size_t len; uint8_t*buf=read_file(path,&len); if(!buf){fprintf(stderr,"cannot open %s\n",path);exit(1);}
     Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
@@ -392,7 +394,7 @@ static float* model_load_full(const char*path,Cfg*c,Tok**tk){
         if(!rd(&r,&qtype,4)||!rd(&r,&group,4)||group<=0){fprintf(stderr,"%s: bad quant params\n",path);exit(1);}
         size_t n=param_count(c); float*P=(float*)malloc(n*4);
         if(!dequantize_params(&r,P,n,qtype,group)){fprintf(stderr,"%s: quantized body truncated\n",path);exit(1);}
-        *tk=NULL; { int tl=0; if(rd(&r,&tl,4)&&tl>0)*tk=tok_parse(r.p,tl,1); }
+        *tk=NULL; { int tl=0; if(rd(&r,&tl,4)&&tl>0&&r.p+tl<=r.end){ *tk=tok_parse(r.p,tl,1); tok_keep(r.p,tl); } }
         fprintf(stderr,"[load] %s: %s checkpoint, dequantized to fp32\n",path,qtype==3?"q4n":qtype==2?"q4":(qtype?"q8":"fp16"));
         free(buf); return P;
     }
@@ -401,7 +403,7 @@ static float* model_load_full(const char*path,Cfg*c,Tok**tk){
     if(!nh){fprintf(stderr,"bad model magic\n");exit(1);} int hdr[256]; rd(&r,hdr,4*nh);
     cfg_from_hdr(c,hdr,ver);
     size_t n=param_count(c); float*P=(float*)malloc(n*4); if(!rd(&r,P,n*4)){fprintf(stderr,"model body truncated\n");exit(1);}
-    *tk=NULL; if(ver>=2){ int tl=0; if(rd(&r,&tl,4)&&tl>0)*tk=tok_parse(r.p,tl,1); }
+    *tk=NULL; if(ver>=2){ int tl=0; if(rd(&r,&tl,4)&&tl>0&&r.p+tl<=r.end){ *tk=tok_parse(r.p,tl,1); tok_keep(r.p,tl); } }
     free(buf); return P;
 }
 static const char* exe_dir(void){ static char d[1024]; static int done=0; if(done)return d;
