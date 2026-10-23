@@ -108,7 +108,8 @@ again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press
 that has been trained before (e.g. chat SFT on a pretrained base) starts a new **stage**: the warmup and the LR schedule
 restart over the stage's steps, and sampling starts at epoch 0 of the new corpus. `models\<name>.bin.run` records the
 stage (start/end iteration, corpus), so re-running the same command after a stop or crash finishes that stage instead
-of adding more. For a stage on a trained model, set the peak LR with `CUDALM_LR` (1e-4 suits chat SFT) and the cooldown
+of adding more. A stage on a trained model defaults to a third of the from-scratch peak LR (re-warming a cooled-down
+model to the full peak makes the grad norm blow up); set it with `CUDALM_LR` (1e-4 suits chat SFT) and the cooldown
 share with `CUDALM_WSD_DECAY` (fraction of the stage). `CUDALM_ITERS=N` keeps the old behaviour: one schedule over
 iterations 0..N of the model's whole life (`runs\sft.bat` uses it). `CUDALM_ITERS`, `CUDALM_WSD_DECAY`,
 `CUDALM_REWARMUP` and `CUDALM_PERM_BASE` are per-run settings: they are not saved to `.bin.env`, and old `.bin.env`
@@ -117,8 +118,8 @@ files that contain them are ignored for those keys.
 **Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every) runs `lmeval` on the checkpoint saved
 at or after every N steps of the stage, and once more at the end. It runs as a child process; training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
-Tasks default to the index set (HellaSwag, ARC-E, ARC-C, PIQA, ArithMark; `CUDALM_BENCH_TASKS` overrides), with
-`CUDALM_BENCH_N` items each (default 500, 0 = full sets).
+By default it runs every task (HellaSwag, ARC-E, ARC-C, PIQA, LAMBADA, ArithMark) on its full set; `CUDALM_BENCH_TASKS`
+(comma list) and `CUDALM_BENCH_N` (items per task) narrow it.
 
 In the menu every command is a form (required fields are checked before Run). Its output is shown live and also
 saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the input for `bench\judgerun.bat`. Diagnostics

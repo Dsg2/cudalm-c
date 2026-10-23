@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: clarify default stage LR and benchmark task behavior
+- cudalm.cu: change default_lr_for to 1/3 of from-scratch peak for new stages
+- tui.cuh: update default CUDALM_BENCH_N to 0 and CUDALM_BENCH_TASKS to all tasks
+
+## Unreleased - 2026-10-23
+
 - README.md: add speed switches section
 - cudalm.cu: add cp.async tile prefetch support and CUDALM_* flags
 

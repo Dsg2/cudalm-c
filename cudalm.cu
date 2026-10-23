@@ -6495,7 +6495,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MOE_BIAS_SLOT","1","moe","per-slot bias",0},
  {"CUDALM_MOE_RCAP","0","moe","capacity reroute factor (>=1, train only)",0},
  {"CUDALM_MOE_SINK","0","moe","Sinkhorn selection (train only)",0},
- {"CUDALM_LR","auto","optim","peak LR (auto from model size)",0},
+ {"CUDALM_LR","auto","optim","peak LR (auto: by model width; a new stage on a trained model gets 1/3 of it)",0},
  {"CUDALM_WARMUP","100","optim","warmup iters",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
  {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
@@ -6530,8 +6530,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_BATCH","auto","train","batch size",0},
  {"CUDALM_SAVE_EVERY","auto","train","checkpoint interval (>=10)",0},
  {"CUDALM_BENCH_EVERY","0","train","lmeval the checkpoint every N steps (0 = off) -> <model>.bench.tsv",0},
- {"CUDALM_BENCH_TASKS","","train","bench tasks (default hellaswag,arc_easy,arc_challenge,piqa,arithmark)",0},
- {"CUDALM_BENCH_N","500","train","items per bench task (0 = all)",0},
+ {"CUDALM_BENCH_TASKS","all","train","bench tasks (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)",0},
+ {"CUDALM_BENCH_N","0","train","items per bench task (0 = full sets)",0},
  {"CUDALM_KEEP_EVERY","20000","train","keep *_itN snapshots every N (0 = off)",0},
  {"CUDALM_DIVSTOP","0.3","train","divergence stop threshold",0},
  {"CUDALM_MASK_PROMPT","1","train","chatml: loss on assistant tokens only",0},
@@ -7464,8 +7464,14 @@ static int mask_apply(const MaskSpec*ms,const int*tok,int*tgt,int n,int eot){
     return n-masked;
 }
 
-static float default_lr_for(const Cfg*c){ if(c->D<=64)return 6e-4f; if(c->D<=96)return 4e-4f; if(c->D<=192)return 3e-4f;
-    if(c->D<=256)return 2.5e-4f; return 1e-3f; }   /* D>=384: 3k-iter sweep 5e-4..1e-3 flat, 1.5e-3 worse */
+/* Peak LR for long runs. Short sweeps favour hotter peaks than long runs survive: D>=384 swept flat 5e-4..1e-3 at
+ * 3k it, but s8w diverged at 1e-3/7e-4 (LRS settled at ~9e-5) and mod230 collapsed at 7e-4 (3.5e-4 stable);
+ * LS-Micro (D192) at 3e-4 grew gn <1 -> 40 with NaNs late in its epoch. */
+static float default_lr_for(const Cfg*c){ if(c->D<=64)return 4e-4f; if(c->D<=96)return 3e-4f; if(c->D<=192)return 2e-4f;
+    if(c->D<=256)return 1.75e-4f; return 3e-4f; }
+/* A new stage on a trained model (CPT/SFT) re-warms out of a cooled-down minimum: LS-Micro-Base CPT at 1.5e-4
+ * blew up (gn 30 -> 400+ in 5k it, loss rising), 7.5e-5 held. Default to a third of the from-scratch peak. */
+#define LR_STAGE_MUL (1.0f/3.0f)
 /* pick B so activations fit in the free VRAM (leaving room for P/G/M/V) */
 static int auto_batch(const Cfg*c,size_t np){
     const char*e=getenv("CUDALM_BATCH"); if(e){ int v=atoi(e); if(v>=1)return v; }
@@ -7531,16 +7537,16 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
 #include "data.cuh"
 /* CUDALM_BENCH_EVERY=N: every N steps of the stage, score the checkpoint just saved with `lmeval` in a
  * child process (training waits; the time is left out of tok/s) and append a row to <model>.bench.tsv.
- * CUDALM_BENCH_TASKS (default: the index tasks), CUDALM_BENCH_N items per task (default 500, 0 = all). */
+ * CUDALM_BENCH_TASKS (default all tasks), CUDALM_BENCH_N items per task (default 0 = full sets). */
 static double train_bench(const char*mpath,int it,double ep){
     const char*ts=getenv("CUDALM_BENCH_TASKS"),*nn=getenv("CUDALM_BENCH_N"); double t=wall(),ix=NAN;
     char cmd[3200],ln[600],res[800]="",tsv[1200],exe[1024]; int lo=0,sum=0;
 #ifdef _WIN32
     GetModuleFileNameA(0,exe,sizeof exe);
-    snprintf(cmd,sizeof cmd,"\"\"%s\" lmeval \"%s\" %s %s 2>&1\"",exe,mpath,ts&&*ts?ts:"hellaswag,arc_easy,arc_challenge,piqa,arithmark",nn&&*nn?nn:"500");
+    snprintf(cmd,sizeof cmd,"\"\"%s\" lmeval \"%s\" %s %s 2>&1\"",exe,mpath,ts&&*ts?ts:"all",nn&&*nn?nn:"0");
     FILE*p=_popen(cmd,"r");
 #else
-    snprintf(cmd,sizeof cmd,"/proc/%d/exe lmeval \"%s\" %s %s 2>&1",(int)getpid(),mpath,ts&&*ts?ts:"hellaswag,arc_easy,arc_challenge,piqa,arithmark",nn&&*nn?nn:"500");
+    snprintf(cmd,sizeof cmd,"/proc/%d/exe lmeval \"%s\" %s %s 2>&1",(int)getpid(),mpath,ts&&*ts?ts:"all",nn&&*nn?nn:"0");
     FILE*p=popen(cmd,"r");
 #endif
     (void)exe;
@@ -7587,7 +7593,7 @@ static void cmd_train(int argc,char**argv){
         "  a new stage: warmup and LR schedule restart over the stage, sampling starts at epoch 0 of the corpus.\n"
         "  <name>.bin.run records the stage; re-running the same command after a stop resumes it instead of adding more.\n"
         "  CUDALM_ITERS=N instead pins one schedule over iters 0..N of the model's whole life (old behaviour).\n"
-        "  CUDALM_BENCH_EVERY=N scores the checkpoint with lmeval every N steps (index tasks, CUDALM_BENCH_N items each)\n"
+        "  CUDALM_BENCH_EVERY=N scores the checkpoint with lmeval every N steps (all tasks, full sets; CUDALM_BENCH_TASKS / CUDALM_BENCH_N narrow it)\n"
         "  and appends to <name>.bin.bench.tsv.\n"); exit(1); }
     const char*name=argv[2],*ddir=argv[3]; float epochs=argc>4?(float)atof(argv[4]):1.0f;
     char mpath[1024],optpath[1100]; model_path(name,mpath,sizeof(mpath)); snprintf(optpath,sizeof(optpath),"%s.opt",mpath);
@@ -7791,7 +7797,7 @@ static void cmd_train(int argc,char**argv){
      * Saves are atomic+fsynced so a frequent cadence is safe, it just costs
      * ~1.5 s of I/O each time. CUDALM_SAVE_EVERY overrides. */
     { const char*e=getenv("CUDALM_SAVE_EVERY"); if(e){ int v=atoi(e); if(v>=10) save_every=v; } }
-    float lr=default_lr_for(&c), warmup=100.0f;
+    float lr=default_lr_for(&c)*(g_stage0>0?LR_STAGE_MUL:1.0f), warmup=100.0f;
     /* CUDALM_LR overrides the peak. Needed after `grow`: a grown checkpoint has
      * no optimizer state, so training restarts at iter 0 and would otherwise ramp
      * back to the full from-scratch peak (2e-4 here) and wash out the weights the

@@ -27,8 +27,8 @@ static const TCmd T_CMDS[]={
     "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models\\<name>.bin.run)."},
    {"bench every","0",F_ENV,"CUDALM_BENCH_EVERY",0,0,"0 = off. N = every N steps of this stage, lmeval the checkpoint just saved (training waits,\n"
     "the time is left out of tok/s) and log the index + per-task scores to models\\<name>.bin.bench.tsv. Also runs at the end."},
-   {" bench items","500",F_ENV,"CUDALM_BENCH_N",0,0,"Items per task (0 = full sets). 500 of each index task takes ~10 s for a 10M model.\n"
-    "Tasks: CUDALM_BENCH_TASKS (default hellaswag,arc_easy,arc_challenge,piqa,arithmark)."}}},
+   {" bench items","0",F_ENV,"CUDALM_BENCH_N",0,0,"Items per task (0 = full sets, the default).\n"
+    "Tasks: CUDALM_BENCH_TASKS (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)."}}},
  {"run","Generate","sample one continuation of a prompt",
   {{"model","",F_MODEL},{"prompt","Once upon a time",F_TEXT},{"tokens","120",F_TEXT},{"temp","0.8",F_TEXT},{"top-k","40",F_TEXT}}},
  {"serve","Serve","HTTP /completion server for the model (used by agentenv)",
