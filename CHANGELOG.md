@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased - 2026-10-24
+
+- add cudalm.cu and qlm.cuh support for CUDALM_LOOP
+
 ## Unreleased - 2026-10-23
 
 - README.md: document CUDALM_DATA_QA=1 behavior
