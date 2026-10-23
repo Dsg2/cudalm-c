@@ -476,7 +476,7 @@ static void qlm_gpu_init(Qlm*q, const Cfg*c, const Off*o, float*P, size_t np){
 
     q->spanH=(QSpanD*)calloc(QLM_MAXSPAN,sizeof(QSpanD));
     int PE=0, pl=0;
-    for(int l=0;l<c->L;l++){ int t=lyT(c,l);
+    for(int l=0;l<c->L;l++){ int t=lyT(c,l); if(lyA(c,l)) continue;   /* loop repeat: weights already spanned */
         qlm_add_span(q,o->wq[l],(unsigned long long)c->D*c->D);
         qlm_add_span(q,o->wk[l],(unsigned long long)c->D*c->KD);
         qlm_add_span(q,o->wv[l],(unsigned long long)c->D*c->KD);
@@ -744,10 +744,11 @@ static int qlm_load(Qlm*q, const char*path, int*iter){
     if(fread(hdr,4,6,f)!=6 || fread(&nq,8,1,f)!=1 || fread(&ng,8,1,f)!=1
        || fread(&nf,8,1,f)!=1){ fclose(f); return 0; }
     if(hdr[0]!=q->dmax || hdr[1]!=q->group || hdr[2]!=q->adam || hdr[4]!=q->packed
-       || nq!=q->nq || ng!=q->ngrp || nf!=q->nfloat){
+       || nq!=q->nq || ng!=q->ngrp || nf>q->nfloat){   /* nf<: loop norms appended last, their moments start at 0 */
         fprintf(stderr,"[qlm] %s has a different shape (bits/group/opt) -- ignoring\n",path);
         fclose(f); return 0;
     }
+    if(nf<q->nfloat) fprintf(stderr,"[qlm] %s: %llu new float params (loop norms) start with zero moments\n",path,q->nfloat-nf);
     if(iter) *iter=hdr[5];
     unsigned long long nd=qd_bytes(nq,q->packed);
     signed char *hd=(signed char*)malloc(nd), *hr=(signed char*)malloc(nq),

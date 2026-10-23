@@ -253,6 +253,12 @@ fp16/f32 keep floats; a quantized model exports as its own type.
   - If 20 steps in a row are non-finite, the trainer exits with code 3, and the script resumes from the last checkpoint.
 - **`runs\sft.bat base sft chat_corpus <base_iters> <sft_iters>`:** copies the base model, re-warms to LR 1e-4, and
   decays over the last 40% of the SFT steps. `<base_iters>` is the base run's final iteration.
+- **Looped layers** (`CUDALM_LOOP=a-bxk`, e.g. `1-4x2`): layers a..b run k times with shared weights, so a 6-layer
+  model runs at depth 10 with the same matrices. Each repeat pass gets its own norm gains (2·D floats per repeated
+  layer, stored after all other weights). Put it in `<model>.bin.env` of an existing fp32 checkpoint: the first load
+  copies the repeat norms from the shared layers and its QLM state resumes. The header keeps the physical depth, so
+  a looped checkpoint needs `CUDALM_LOOP` to load. Not combinable with QLM_FUSED, Muon, LR_BOOST_LAYERS, ATTN_GATE,
+  SHARED_F, CANON or quantize.
 - **Measuring SFT:** use `bench\chatbench.bat` (accuracy) and `bench\judgerun.bat` (coherence). Validation loss alone
   is a poor guide.
 - **Speed switches:** each of these is on by default and has an off switch for A/B runs. On a 5060 Ti, LS-Micro (top-1) went from

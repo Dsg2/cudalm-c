@@ -148,11 +148,26 @@ static float *dzero(size_t n){ float *p=(float*)dmalloc(n*4); ck(cudaMemset(p,0,
  * Nth layer ignores the window and attends to the whole prefix (0 = never),
  * which restores exact long-range retrieval that pure SWA approximates. */
 typedef struct { int V,D,L,H,KV,F,T,hd,KD,half,eot,tmpl,n_mtp,n_exp,win,full_every,pool; float rope_base;
-                 int mod,lt[64],lE[64],lF[64]; } Cfg;   /* mod: TLM7 per-layer FFN (lt 0 dense/1 MoE/2 pool) */
+                 int mod,lt[64],lE[64],lF[64]; int lp,lb,lmap[64]; } Cfg;   /* mod: TLM7 per-layer FFN (lt 0 dense/1 MoE/2 pool); lp/lb/lmap: CUDALM_LOOP */
 static void cfg_derive(Cfg*c){ c->hd=c->D/c->H; c->KD=c->KV*c->hd; c->half=c->hd/2; }
 static int lyT(const Cfg*c,int l){ return c->mod?c->lt[l]:c->n_exp>0?(c->pool?2:1):0; }
 static int lyE(const Cfg*c,int l){ return c->mod?c->lE[l]:c->n_exp; }
 static int lyF(const Cfg*c,int l){ return c->mod?c->lF[l]:c->F; }
+/* CUDALM_LOOP="a-bxk": layers a..b run k times with shared weights (L becomes the virtual depth,
+ * lp the physical one). Each repeat pass keeps its own norm gains, appended after all other params. */
+static int lyA(const Cfg*c,int v){ return c->lp&&v>c->lb&&c->lmap[v]<=c->lb; }   /* v is a repeat of an earlier layer */
+static size_t loop_xn(const Cfg*c){ size_t n=0; for(int v=0;v<c->L;v++) n+=lyA(c,v); return n*2*c->D; }
+static void loop_apply(Cfg*c){
+    const char*s=getenv("CUDALM_LOOP"); int a,b,k;
+    if(!s||!*s||!strcmp(s,"0")||c->lp) return;
+    if(sscanf(s,"%d-%dx%d",&a,&b,&k)!=3||k<2||a<0||b<a||b>=c->L||c->L+(b-a+1)*(k-1)>64){
+        fprintf(stderr,"CUDALM_LOOP=%s: want a-bxk with 0<=a<=b<L=%d, k>=2, total depth <=64\n",s,c->L); exit(1); }
+    Cfg p=*c; int n=0, m[64];
+    for(int l=0;l<a;l++) m[n++]=l;
+    for(int r=0;r<k;r++) for(int l=a;l<=b;l++) m[n++]=l;
+    for(int l=b+1;l<p.L;l++) m[n++]=l;
+    for(int v=0;v<n;v++){ c->lmap[v]=m[v]; c->lt[v]=p.lt[m[v]]; c->lE[v]=p.lE[m[v]]; c->lF[v]=p.lF[m[v]]; }
+    c->lp=p.L; c->lb=b; c->L=n; }
 static int NPOOL(const Cfg*c){ int n=0; for(int l=0;l<c->L;l++) n+=lyT(c,l)==2; return n; }
 static int NSPARSE(const Cfg*c){ int n=0; for(int l=0;l<c->L;l++) n+=lyT(c,l)!=0; return n; }
 static int FXW(const Cfg*c){ int m=c->F; for(int l=0;l<c->L;l++) if(!lyT(c,l)&&lyF(c,l)>m) m=lyF(c,l); return m; }
@@ -220,6 +235,8 @@ typedef struct { size_t emb; size_t an1[64],wq[64],wk[64],wv[64],wo[64],an2[64],
 static size_t calc_offsets(const Cfg*c, Off*o){
     size_t p=0, D=c->D, PE=0; o->emb=p; p+=(size_t)c->V*D;
     for(int l=0;l<c->L;l++){ int t=lyT(c,l);
+        if(lyA(c,l)){ int s=c->lmap[l]; o->wq[l]=o->wq[s]; o->wk[l]=o->wk[s]; o->wv[l]=o->wv[s]; o->wo[l]=o->wo[s];
+            o->wr[l]=o->wr[s]; o->w1[l]=o->w1[s]; o->w3[l]=o->w3[s]; o->w2[l]=o->w2[s]; continue; }
         o->an1[l]=p;p+=D; o->wq[l]=p;p+=D*D; o->wk[l]=p;p+=D*c->KD;
         o->wv[l]=p;p+=D*c->KD; o->wo[l]=p;p+=D*D; o->an2[l]=p;p+=D;
         o->wr[l]=p; if(t) p+=D*lyE(c,l);
@@ -232,6 +249,7 @@ static size_t calc_offsets(const Cfg*c, Off*o){
     if(PE){ size_t B=PE*D*c->F;                     /* UniPool: P layers alias one pool, after MTP */
         for(int l=0;l<c->L;l++) if(lyT(c,l)==2){ o->w1[l]=p; o->w3[l]=p+B; o->w2[l]=p+2*B; }
         p+=3*B; }
+    for(int l=0;l<c->L;l++) if(lyA(c,l)){ o->an1[l]=p; p+=D; o->an2[l]=p; p+=D; }
     return p;
 }
 static size_t param_count(const Cfg*c){ Off o; return calc_offsets(c,&o); }
@@ -390,6 +408,7 @@ static float* model_load_full(const char*path,Cfg*c,Tok**tk){
         int nh = qz==1 ? 11 : 13, ver = qz==1 ? 4 : 5;
         int hdr[256]; if(!rd(&r,hdr,4*nh)){fprintf(stderr,"%s: bad quantized header\n",path);exit(1);}
         cfg_from_hdr(c,hdr,ver);
+        if(getenv("CUDALM_LOOP")&&strcmp(getenv("CUDALM_LOOP"),"0")){ fprintf(stderr,"%s: CUDALM_LOOP needs an fp32 checkpoint\n",path); exit(1); }
         int qtype=0,group=0;
         if(!rd(&r,&qtype,4)||!rd(&r,&group,4)||group<=0){fprintf(stderr,"%s: bad quant params\n",path);exit(1);}
         size_t n=param_count(c); float*P=(float*)malloc(n*4);
@@ -401,8 +420,16 @@ static float* model_load_full(const char*path,Cfg*c,Tok**tk){
     int ver,nh=hdr_ints(m,&ver);
     /* must be >= the largest hdr_ints() return (TLM5 = 13) or the read overruns */
     if(!nh){fprintf(stderr,"bad model magic\n");exit(1);} int hdr[256]; rd(&r,hdr,4*nh);
-    cfg_from_hdr(c,hdr,ver);
-    size_t n=param_count(c); float*P=(float*)malloc(n*4); if(!rd(&r,P,n*4)){fprintf(stderr,"model body truncated\n");exit(1);}
+    cfg_from_hdr(c,hdr,ver); loop_apply(c);
+    size_t n=param_count(c); float*P=(float*)malloc(n*4);
+    if(c->lp){   /* a model saved without the repeat-pass norms grows them, copied from the shared layer */
+        size_t x=loop_xn(c), rem=r.end-r.p; int tl=-1; if(rem>=n*4+4) memcpy(&tl,r.p+n*4,4);
+        if(tl!=(long long)(rem-n*4-4)){ if(!rd(&r,P,(n-x)*4)){fprintf(stderr,"model body truncated\n");exit(1);}
+            Off o; calc_offsets(c,&o);
+            for(int v=0;v<c->L;v++) if(lyA(c,v)){ memcpy(P+o.an1[v],P+o.an1[c->lmap[v]],c->D*4); memcpy(P+o.an2[v],P+o.an2[c->lmap[v]],c->D*4); }
+            fprintf(stderr,"[loop] %s: %d physical layers -> depth %d, repeat-pass norms initialized from the shared layers\n",path,c->lp,c->L); }
+        else if(!rd(&r,P,n*4)){fprintf(stderr,"model body truncated\n");exit(1);}
+    } else if(!rd(&r,P,n*4)){fprintf(stderr,"model body truncated\n");exit(1);}
     *tk=NULL; if(ver>=2){ int tl=0; if(rd(&r,&tl,4)&&tl>0&&r.p+tl<=r.end){ *tk=tok_parse(r.p,tl,1); tok_keep(r.p,tl); } }
     free(buf); return P;
 }
@@ -481,6 +508,7 @@ static int save_rename(const char*tmp,const char*path){
 }
 static void model_save_bundle(const char*path,const Cfg*c,const float*P,size_t n,const uint8_t*blob,int bl){
     char tmp[1200]; FILE*f=save_open(path,tmp,sizeof(tmp));
+    Cfg pc; if(c->lp){ pc=*c; pc.L=c->lp; for(int v=c->L-1;v>=0;v--){ int l=c->lmap[v]; pc.lt[l]=c->lt[v]; pc.lE[l]=c->lE[v]; pc.lF[l]=c->lF[v]; } c=&pc; }
     int hdr[14+3*64]={c->V,c->D,c->L,c->H,c->KV,c->F,c->T,c->eot,c->tmpl,c->n_mtp,c->n_exp,c->win,c->full_every,c->pool};
     for(int l=0;l<64;l++){ hdr[14+l]=c->lt[l]; hdr[78+l]=c->lE[l]; hdr[142+l]=c->lF[l]; }
     if(c->mod){ fwrite("TLM7",1,4,f); fwrite(hdr,4,14+3*64,f); }   /* per-layer FFN layout: CUDA-only */
@@ -4716,15 +4744,16 @@ static void t1_load(const char*optpath){
     char m[4]; int hdr[9];
     if(fread(m,1,4,f)!=4||memcmp(m,"T1S1",4)||fread(hdr,4,9,f)!=9){ fclose(f); return; }
     int gate=g_ngram_on&&g_ng_gate, tri=g_ngram_on&&g_ng_tri;
-    if(hdr[0]!=g_attg||hdr[1]!=gC.L||hdr[2]!=gC.D||hdr[3]!=gate||(gate&&hdr[4]!=g_ng_De)||hdr[6]!=tri||hdr[7]!=g_ng_layer){
+    if(hdr[0]!=g_attg||(hdr[1]!=gC.L&&!(gC.lp&&hdr[1]==gC.lp))||hdr[2]!=gC.D||hdr[3]!=gate||(gate&&hdr[4]!=g_ng_De)||hdr[6]!=tri||hdr[7]!=g_ng_layer){
         fprintf(stderr,"[t1] %s mismatch: file attg=%d gate=%d tri=%d layer=%d vs env attg=%d gate=%d tri=%d layer=%d\n",
                 path,hdr[0],hdr[3],hdr[6],hdr[7],g_attg,gate,tri,g_ng_layer); fclose(f); exit(1); }
     int ok=1;
     if(g_attg){ size_t n=(size_t)gC.L*gC.D*gC.D; ok=t1_rw(f,g_Wg,n*4,0)&&t1_rw(f,g_WgM,n*2,0)&&t1_rw(f,g_WgV,n*2,0); }
     if(ok&&gate){ size_t n=(size_t)g_ng_De*gC.D; ok=t1_rw(f,g_ngWk,n*4,0)&&t1_rw(f,g_ngWkM,n*2,0)&&t1_rw(f,g_ngWkV,n*2,0); }
     if(ok&&hdr[5]) g_mbias_slot=hdr[5]>gC.n_exp;   /* file decides per-slot vs shared bias */
-    if(ok&&hdr[5]&&hdr[5]==mb_S()*gC.n_exp){ size_t n=(size_t)gC.L*hdr[5]; float*b=(float*)malloc(n*4);
-        if((ok=fread(b,4,n,f)==n)){ g_mbias_ld=1; mbias(0); memcpy(g_mbiasH,b,n*4);
+    if(ok&&hdr[5]&&hdr[5]==mb_S()*gC.n_exp){ size_t n=(size_t)hdr[1]*hdr[5]; float*b=(float*)malloc((size_t)gC.L*hdr[5]*4);
+        if((ok=fread(b,4,n,f)==n)){ if(hdr[1]!=gC.L){ n=(size_t)gC.L*hdr[5];   /* loop: expand per-layer bias to the virtual depth */
+                for(int v=gC.L-1;v>=0;v--) memmove(b+(size_t)v*hdr[5],b+(size_t)gC.lmap[v]*hdr[5],hdr[5]*4); } g_mbias_ld=1; mbias(0); memcpy(g_mbiasH,b,n*4);
             ck(cudaMemcpy(g_mbiasD,b,n*4,cudaMemcpyHostToDevice),"t1 mbias"); }
         free(b); }
     fclose(f);
@@ -6481,6 +6510,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_ATTN_GATE","0","model","per-layer attention output gate (+L*D*D)",0},
  {"CUDALM_CANON","","model","Canon layers: A (after norm1), C (after norm2), AC (+L*4*D each)",0},
  {"CUDALM_SHARED_F","0","moe","shared always-on SwiGLU expert width (MoE only, <= F, +L*3*D*Fs)",0},
+ {"CUDALM_LOOP","","model","looped layers a-bxk: run layers a..b k times, shared weights (e.g. 1-4x2)",0},
  {"CUDALM_DOCMASK","0","train","mask attention/canon across eot (pretraining; not for eot-separated chat turns)",1},
  {"CUDALM_UNIPOOL","0","model","at new: one expert pool shared by all layers",0},
  {"CUDALM_TOPK","2","moe","experts routed per token (1..8)",0},
@@ -7725,6 +7755,10 @@ static void cmd_train(int argc,char**argv){
       g_pscratch = (pe && atoi(pe)!=0 && g_fused);
       if(pe && atoi(pe)!=0 && !g_fused)
           printf("[qlm] CUDALM_QLM_PSCRATCH ignored: needs CUDALM_QLM_FUSED=1\n"); }
+    if(c.lp){
+        if(g_fused||g_muon||getenv("CUDALM_LR_BOOST_LAYERS")||env_i("CUDALM_ATTN_GATE",0)||env_i("CUDALM_SHARED_F",0)||(getenv("CUDALM_CANON")&&*getenv("CUDALM_CANON"))){
+            fprintf(stderr,"[loop] CUDALM_LOOP does not combine with QLM_FUSED, MUON, LR_BOOST_LAYERS, ATTN_GATE, SHARED_F or CANON\n"); exit(1); }
+        printf("[loop] depth %d from %d physical layers:",c.L,c.lp); for(int v=0;v<c.L;v++) printf(" %d",c.lmap[v]); printf("\n"); }
     ngram_setup(&c);
     { MemCfg m; mem_live(&m); side_write(mpath,&m); }
     if(g_ngram_on) ngram_load(optpath);
@@ -8969,8 +9003,8 @@ static int cmd_quantize(int argc,char**argv){
     int ver,nh=hdr_ints(m,&ver);
     if(!nh){ fprintf(stderr,"%s: not a tinylm/cudalm model\n",inpath); free(buf); return 1; }
     int hdr[256]; if(!rd(&r,hdr,4*nh)){ fprintf(stderr,"bad header\n"); free(buf); return 1; }
-    Cfg c; cfg_from_hdr(&c,hdr,ver);
-    if(c.pool||c.mod){ fprintf(stderr,"quantize: UniPool / per-layer-layout (TLM7) models not supported yet\n"); free(buf); return 1; }
+    Cfg c; cfg_from_hdr(&c,hdr,ver); loop_apply(&c);
+    if(c.pool||c.mod||c.lp){ fprintf(stderr,"quantize: UniPool / per-layer-layout (TLM7) / looped models not supported yet\n"); free(buf); return 1; }
     size_t n=param_count(&c); float*P=(float*)malloc(n*4);
     if(!rd(&r,P,n*4)){ fprintf(stderr,"bad params\n"); free(buf); return 1; }
     int tl=0; const uint8_t*blob=NULL;
@@ -9068,6 +9102,7 @@ static int cmd_qlmcheck(int argc,char**argv){
     { FILE*e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof path,"%s",argv[2]); }
     Cfg c; Tok*qtk=NULL; float*P=model_load_full(path,&c,&qtk);
     if(!P){ fprintf(stderr,"cannot load %s\n",path); return 1; }
+    if(c.lp){ fprintf(stderr,"looped models not supported here\n"); return 1; }
     Off o; calc_offsets(&c,&o); size_t np=param_count(&c);
     int E = c.n_exp>0 ? c.n_exp : 1;
     struct { const char*nm; size_t off, n; } sp[16*7]; int ns=0;
