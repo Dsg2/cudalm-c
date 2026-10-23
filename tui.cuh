@@ -140,7 +140,8 @@ static const TCmd T_CMDS[]={
      "Get 10-20% more than you plan to train on."},
    {"template","",F_OPT,"--template",0,0,"Which columns become each document. Enter opens the editor: the columns, and the first rows exactly as the model will see them.\n"
      "Empty = auto (text, messages / conversations, instruction + output, content / code). Or type: text=a+b | chat=col |\n"
-     "user=q+ctx,assistant=a  (+ system=col, tools=col)."}},
+     "user=q+ctx,assistant=a  (+ system=col, tools=col). Chats already rendered with ChatML / Llama-3 / Gemma / Mistral / MiniCPM\n"
+     "markers (and Alpaca / USER:-ASSISTANT: strings in chat=) are split into turns and get cudalm's markers."}},
   "Run: download and parse each source in turn (raw shards are deleted once parsed).\nNext: Build corpus with this folder as text (tokenizer v3tok), or Train tokenizer first for a new vocab.",1},
  {"data fetch","Convert files","parquet / json / jsonl from elsewhere -> plain .jsonl text (python + pyarrow)",
   {{"source","",F_PATH,0,0,".parquet;.json;.jsonl","A .parquet / .json / .jsonl file, or a folder (every such file inside, recursively).\n"
@@ -150,7 +151,8 @@ static const TCmd T_CMDS[]={
    {"category","",F_TEXT,0,0,0,"Category stored with every doc and shown in the corpus stats. Empty = the file name."},
    {"template","",F_OPT,"--template",0,0,"Which columns become each document. Enter opens the editor: the columns, and the first rows exactly as the model will see them.\n"
      "Empty = auto (text, messages / conversations, instruction + output, content / code). Or type: text=a+b | chat=col |\n"
-     "user=q+ctx,assistant=a  (+ system=col, tools=col)."}},
+     "user=q+ctx,assistant=a  (+ system=col, tools=col). Chats already rendered with ChatML / Llama-3 / Gemma / Mistral / MiniCPM\n"
+     "markers (and Alpaca / USER:-ASSISTANT: strings in chat=) are split into turns and get cudalm's markers."}},
   "Run: convert. .jsonl/.json that already has \"text\" or chat fields needs no conversion:\nBuild corpus reads it directly.",1},
  {"data tokenizer","Train tokenizer","byte-level BPE from your text -> tokenizer.json (HF) + tokenizer.bin + canon.bin",
   {{"out name","mytok",F_TEXT,0,0,0,"Folder for the new tokenizer (a bare name goes under the data root with most free space).\n"

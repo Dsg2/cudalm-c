@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-23
 
+- data.cuh: new d_chat_fin, d_split_chat, d_chatcol functions and d_doc logic
+- tui.cuh: updated --template help text for ChatML markers
+
+## Unreleased - 2026-10-23
+
 - README.md: add documentation for chat template splitting and rendering
 - prep/fetch.py: add split_chat, text_doc, ctext functions and update conv_turns, auto_doc, tpl_doc
 
