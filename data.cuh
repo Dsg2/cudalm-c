@@ -229,12 +229,28 @@ static int d_chatcol(const char*obj,DWs*w,const char**name,const char**kp){
         w->t.n=0; jdec(v,&w->t); const char*s=w->t.p; size_t n=w->t.n; d_trim(&s,&n); int np=0; w->o.n=0; db_s(&w->o,"");
         if(d_split_chat(s,n,1,w,&np,name)){ if(kp) *kp=k; return 1; } }
     return 0; }
+/* CUDALM_DATA_QA=1: "passage \n\nQuestion: q Answer: a \n\nQuestion: ..." (Ultra-FineWeb-L3 qa) -> chat turns:
+ * user = passage + q1, assistant = a1, user = q2, ... Every question needs an answer, else the doc stays plain text. */
+static long long g_dqa;
+static int d_qa_on(void){ static int on=-1; if(on<0){ const char*e=getenv("CUDALM_DATA_QA"); on=e&&atoi(e); } return on; }
+static long d_qa_ans(const char*s,size_t n,size_t from){ long a=d_find(s,n," Answer: ",from),b=d_find(s,n,"\nAnswer: ",from);
+    return a<0?b:b<0?a:a<b?a:b; }
+static int d_split_qa(const char*s,size_t n,DWs*w,int*np){
+    long q=d_find(s,n,"\nQuestion: ",0); if(q<=0) return 0;
+    const char*ps=s; size_t pn=q; d_trim(&ps,&pn); if(!pn) return 0;
+    w->o.n=0; db_s(&w->o,""); *np=0;
+    for(int k=0;q>=0;k++){ size_t qs=q+11; long nx=d_find(s,n,"\nQuestion: ",qs); size_t e=nx<0?n:(size_t)nx;
+        long a=d_qa_ans(s,n,qs); if(a<0||(size_t)a>=e){ w->o.n=0; *np=0; return 0; }
+        const char*qt=s+qs,*at=s+a+9; size_t qn=a-qs,an=e-a-9; d_trim(&qt,&qn); d_trim(&at,&an); if(!qn||!an){ w->o.n=0; *np=0; return 0; }
+        w->x.n=0; if(!k){ db_put(&w->x,ps,pn); db_s(&w->x,"\n\n"); } db_put(&w->x,qt,qn);
+        d_part(&w->o,np,"user",w->x.p,w->x.n); d_part(&w->o,np,"assistant",at,an); q=nx; }
+    g_dqa++; return 1; }
 /* text of one JSON object + its category ("kind/cat" or "cat"); 0 = no usable doc */
 static int d_doc(const char*obj,DWs*w,const char**txt,size_t*n,char*cat,size_t ccap){
     static const char*tk[]={"text"},*ck[]={"content","code","markdown","body"};
     const char*v=jget(obj,"text");
     if(v&&*v=='"'){ int np=0; if(!d_field(obj,tk,1,&w->t)) return 0;             /* plain text, unless a chat in a known template */
-        w->o.n=0; db_s(&w->o,""); if(!d_split_chat(w->t.p,w->t.n,1,w,&np,NULL)){ w->o.n=0; db_put(&w->o,w->t.p,w->t.n); } }
+        w->o.n=0; db_s(&w->o,""); if(!d_split_chat(w->t.p,w->t.n,1,w,&np,NULL)&&!(d_qa_on()&&d_split_qa(w->t.p,w->t.n,w,&np))){ w->o.n=0; db_put(&w->o,w->t.p,w->t.n); } }
     else if(!d_render(obj,w)&&!d_field(obj,ck,4,&w->o)&&!d_chatcol(obj,w,NULL,NULL)) return 0;
     *txt=w->o.p; *n=w->o.n; cat[0]=0;
     const char*k=jget(obj,"kind"),*c=jget(obj,"cat");
@@ -475,7 +491,8 @@ static int cmd_data_encode(int argc,char**argv){
     printf("[encode] %s %s <- %d file(s), tokenizer %s (V=%d), %d threads, val %s, dedup %s%s\n",append?"append to":"new",out,fl.n,tokd,t->V,c.T,
            append?"unchanged (append adds to train.bin only)":vp>0?"every Nth doc":"none",c.dedup?"on":"off",follow?", follow":"");
     if(!append&&vp>0) printf("         val = every %d-th doc (%.2f%%)\n",c.vN,100.0/c.vN);
-    c.t0=c.tl=GetTickCount(); g_dbad=0;
+    if(d_qa_on()) printf("         Q/A docs -> chat turns (CUDALM_DATA_QA=1)\n");
+    c.t0=c.tl=GetTickCount(); g_dbad=0; g_dqa=0;
     d_read(&fl,follow,d_enc_doc,d_enc_idle,&c); d_flush(&c);
     fclose(c.ft); if(c.fv) fclose(c.fv);
     { if(inputs.n) db_s(&inputs,", "); DBuf e={0}; db_s(&e,"\"");
@@ -486,6 +503,7 @@ static int cmd_data_encode(int argc,char**argv){
     d_meta_write(out,t,tokd,&c,&inputs,&hist);
     printf("[encode] done in %.1f s: %lld docs (%lld duplicates skipped, %lld unreadable lines), +%lld train, +%lld val tokens -> %s\n",
            (GetTickCount()-c.t0)/1000.0,c.kept,c.dups,g_dbad,c.ntr,c.nva,out);
+    if(d_qa_on()) printf("  %lld docs converted from Q/A to chat turns\n",g_dqa);
     for(int i=0;i<c.ncat;i++) if(c.cat[i].docs) printf("  %-28s %9lld docs %12lld tok %7.0f tok/doc\n",c.cat[i].k,c.cat[i].docs,c.cat[i].tok,(double)c.cat[i].tok/c.cat[i].docs);
     return 0; }
 

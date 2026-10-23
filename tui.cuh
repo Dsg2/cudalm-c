@@ -181,7 +181,9 @@ static const TCmd T_CMDS[]={
    {"val %","1",F_TEXT,0,0,0,"Share of docs held out in val.bin (every Nth doc), used by Eval and the training val loss. 0 = none."},
    {"dedup","1",F_CHOICE,"1|0",0,0,"1 = skip docs whose exact text already appeared in this run."},
    {"follow","0",F_CHOICE,"0|1",4,0,"1 = keep reading a .jsonl another program is still writing, until <file>.done appears\n"
-     "(e.g. teacher generation). 0 = stop at the end of the input."}},
+     "(e.g. teacher generation). 0 = stop at the end of the input."},
+   {"Q/A -> chat","0",F_ENV,"CUDALM_DATA_QA",0,0,"1 = docs shaped \"passage \\n\\nQuestion: q Answer: a ...\" (Ultra-FineWeb-L3 qa) become chat turns:\n"
+     "user = passage + 1st question, assistant = its answer, then one user/assistant pair per question. Other docs stay as they are."}},
   "Run: tokenize on all CPU cores (token-exact with the HF tokenizer).\nNext: Corpus info to check it, then Train with this corpus as data dir.",1},
  {"data mix","Mix corpora","weighted, shuffled blend of corpora that share one tokenizer",
   {{"out name","mix",F_TEXT,0,0,0,"New corpus folder (a bare name goes under the data root with most free space)."},

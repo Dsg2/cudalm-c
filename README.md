@@ -176,6 +176,11 @@ saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the inpu
   `bot`, `ai` count as assistant, `developer` as system; content given as `[{type, text}]` parts is joined. Peek names
   the template it found, e.g. `chat (ChatML template) in 'text'`.
 
+  **Q/A text → chat** (`CUDALM_DATA_QA=1` on `data encode`, TUI: Build corpus > Q/A -> chat): docs shaped
+  `passage \n\nQuestion: q Answer: a \n\nQuestion: ...` (Ultra-FineWeb-L3 qa) become turns: user = passage + first
+  question, assistant = its answer, then one user/assistant pair per question. A doc with an unanswered question stays
+  plain text. For continued pretraining on such a corpus, train with `CUDALM_MASK_PROMPT=0` so the passages still count.
+
   `cudalm data peek <file|folder|hf:spec> [template]` prints the columns and the first rows exactly as the model will
   see them. The TUI editor shows the same live, with keys T text, P prompt + answer, C chat, S system, O tools, A auto.
 - **Any Hugging Face dataset:** `cudalm data fetch hf:<user/dataset>[:config[:split]] <out> [tokens] [--template T]` downloads

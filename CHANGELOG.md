@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: document CUDALM_DATA_QA=1 behavior
+- data.cuh: new d_qa_on, d_split_qa, d_qa_ans functions; updated d_doc, cmd_data_encode
+- tui.cuh: new Q/A -> chat command with CUDALM_DATA_QA env flag
+
+## Unreleased - 2026-10-23
+
 - data.cuh: new d_chat_fin, d_split_chat, d_chatcol functions and d_doc logic
 - tui.cuh: updated --template help text for ChatML markers
 
