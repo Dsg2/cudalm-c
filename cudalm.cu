@@ -7535,12 +7535,56 @@ static const char* py_cmd(void){ const char*p=getenv("CUDALM_PYTHON"); return p&
     "python3"; }
 #endif
 #include "data.cuh"
+/* lmeval per-item dumps (CUDALM_LMEVAL_ITEMS): task \t item \t correct \t margin. Margin = logP/byte of the gold
+ * continuation minus the best wrong one (MC), or logP/byte of the target (LAMBADA). le_vs pairs two dumps item by item. */
+typedef struct { char t[32]; int n; float*m; signed char*c; } LeT;
+static int le_load(const char*p,LeT*T){
+    FILE*f=fopen(p,"rb"); if(!f) return -1; char l[256]; int nt=0;
+    while(fgets(l,sizeof l,f)){ char tn[32]; int it,c; float m;
+        if(sscanf(l,"%31[^\t]\t%d\t%d\t%f",tn,&it,&c,&m)!=4||it<0) continue;
+        int k=0; while(k<nt&&strcmp(T[k].t,tn)) k++;
+        if(k==nt){ if(nt==16) continue; memset(&T[nt],0,sizeof *T); snprintf(T[nt].t,32,"%s",tn); nt++; }
+        LeT*x=&T[k]; if(it>=x->n){ int nn=it+1>2*x->n?it+1:2*x->n;
+            x->m=(float*)realloc(x->m,4*(size_t)nn); x->c=(signed char*)realloc(x->c,nn); memset(x->c+x->n,-1,nn-x->n); x->n=nn; }
+        x->m[it]=m; x->c[it]=(signed char)(c!=0); }
+    fclose(f); return nt; }
+/* prints the paired comparison B - A; returns z of the margin-index change (NAN if it has < 2 components) */
+static double le_vs(const char*pa,const char*pb,const char*pre,double*dix){
+    LeT A[16],B[16]; int na=le_load(pa,A),nb=le_load(pb,B); double z=NAN;
+    if(na<0||nb<0){ printf("%scannot read %s\n",pre,na<0?pa:pb); goto out; }
+    {   static const char*ixn[5]={"hellaswag","arc_easy","arc_challenge","piqa","arithmark"};
+        double dm[5],ds[5]; int h[5]={0};
+        for(int i=0;i<na;i++){ int j=0; while(j<nb&&strcmp(A[i].t,B[j].t)) j++; if(j==nb) continue;
+            int n=0,up=0,dn=0,L=A[i].n<B[j].n?A[i].n:B[j].n; double s=0,q=0;
+            for(int k=0;k<L;k++) if(A[i].c[k]>=0&&B[j].c[k]>=0){ double d=B[j].m[k]-A[i].m[k]; s+=d; q+=d*d; n++;
+                up+=B[j].c[k]>A[i].c[k]; dn+=B[j].c[k]<A[i].c[k]; }
+            if(!n) continue; double mu=s/n, se=n>1?sqrt((q/n-mu*mu)/(n-1)):0;
+            printf("%s%-13s %6d   acc %+6.2f%% (+%d/-%d)   margin %+.4f +-%.4f   z %+5.1f\n",pre,A[i].t,n,100.0*(up-dn)/n,up,dn,mu,se,se>0?mu/se:0);
+            for(int q2=0;q2<5;q2++) if(!strcmp(A[i].t,ixn[q2])){ dm[q2]=mu; ds[q2]=se; h[q2]=1; } }
+        double w[4]={1,1,1,0.65},m4[4],s4[4],num=0,den=0,var=0; int h4[4]={h[0],h[1]||h[2],h[3],h[4]},nc=0;
+        m4[0]=dm[0]; s4[0]=ds[0]; m4[2]=dm[3]; s4[2]=ds[3]; m4[3]=dm[4]; s4[3]=ds[4];
+        if(h[1]&&h[2]){ m4[1]=(dm[1]+dm[2])/2; s4[1]=0.5*sqrt(ds[1]*ds[1]+ds[2]*ds[2]); }
+        else if(h4[1]){ m4[1]=h[1]?dm[1]:dm[2]; s4[1]=h[1]?ds[1]:ds[2]; }
+        for(int q2=0;q2<4;q2++) if(h4[q2]){ num+=w[q2]*m4[q2]; var+=w[q2]*w[q2]*s4[q2]*s4[q2]; den+=w[q2]; nc++; }
+        if(nc>=2){ double d=100*num/den, se=100*sqrt(var)/den; z=se>0?d/se:0; if(dix) *dix=d;
+            printf("%smargin index %+.3f +-%.3f   z %+.1f   -> %s\n",pre,d,se,z,fabs(z)<2?"no clear change (|z| < 2)":z>0?"better":"worse"); }
+    }
+out:for(int i=0;i<na;i++){ free(A[i].m); free(A[i].c); } for(int i=0;i<nb;i++){ free(B[i].m); free(B[i].c); }
+    return z; }
+static void cmd_lmeval_vs(int argc,char**argv){
+    if(argc<4){ fprintf(stderr,"usage: cudalm lmeval-vs <A.items.tsv> <B.items.tsv>\n"
+        "  paired comparison of two per-item dumps (CUDALM_LMEVAL_ITEMS=<file> on lmeval, or <model>.items/ from CUDALM_BENCH_EVERY):\n"
+        "  per task the accuracy flips and the mean margin change B - A +- paired SE; then the margin-index change and its z\n"); exit(1); }
+    printf("[lmeval-vs] B = %s\n           A = %s\n",argv[3],argv[2]); le_vs(argv[2],argv[3],"  ",NULL); }
 /* CUDALM_BENCH_EVERY=N: every N steps of the stage, score the checkpoint just saved with `lmeval` in a
  * child process (training waits; the time is left out of tok/s) and append a row to <model>.bench.tsv.
  * CUDALM_BENCH_TASKS (default all tasks), CUDALM_BENCH_N items per task (default 0 = full sets). */
 static double train_bench(const char*mpath,int it,double ep){
     const char*ts=getenv("CUDALM_BENCH_TASKS"),*nn=getenv("CUDALM_BENCH_N"); double t=wall(),ix=NAN;
-    char cmd[3200],ln[600],res[800]="",tsv[1200],exe[1024]; int lo=0,sum=0;
+    char cmd[3200],ln[600],res[800]="",tsv[1200],exe[1024],idir[1100],ipath[1200]; int lo=0,sum=0; double mi=NAN;
+    static char prev[1200];      /* previous bench's per-item dump: each bench is compared against it */
+    snprintf(idir,sizeof idir,"%s.items",mpath); lm_mkdir(idir);
+    snprintf(ipath,sizeof ipath,"%s" PSEP "it%d.tsv",idir,it); lm_setenv("CUDALM_LMEVAL_ITEMS",ipath);
 #ifdef _WIN32
     GetModuleFileNameA(0,exe,sizeof exe);
     snprintf(cmd,sizeof cmd,"\"\"%s\" lmeval \"%s\" %s %s 2>&1\"",exe,mpath,ts&&*ts?ts:"all",nn&&*nn?nn:"0");
@@ -7556,17 +7600,24 @@ static double train_bench(const char*mpath,int it,double ep){
         if(strstr(ln,"[lmeval] summary")) sum=1;
         else if(sum&&a&&sscanf(ln," %63s",tn)==1) lo+=snprintf(res+lo,sizeof res-lo,"%s%s %.2f",lo?"  ":"",tn,atof(a+8));
         else if(sum&&strstr(ln,"ppl")&&sscanf(ln," %63s",tn)==1) lo+=snprintf(res+lo,sizeof res-lo,"%s%s %.2f",lo?"  ":"",tn,atof(strstr(ln,"acc")+3));
-        if(x) ix=atof(x+19); }
+        if(x) ix=atof(x+19);
+        if((x=strstr(ln,"margin index "))) mi=atof(x+13); }
+    lm_setenv("CUDALM_LMEVAL_ITEMS",NULL);
 #ifdef _WIN32
     _pclose(p);
 #else
     pclose(p);
 #endif
     if(!lo){ printf("[bench] lmeval produced no scores (out of memory? missing bench files?) - skipped\n"); fflush(stdout); return wall()-t; }
-    printf("[bench] iter %d (ep %.2f): index %.2f | %s  (%.0fs)\n",it,ep,ix,res,wall()-t); fflush(stdout);
+    printf("[bench] iter %d (ep %.2f): index %.2f  margin index %.3f | %s  (%.0fs)\n",it,ep,ix,mi,res,wall()-t);
+    if(!*prev){ /* resumed run: the newest older dump in <model>.items */
+        int bi=-1; for(int k=it-1;k>0&&bi<0;k--){ char q[1200]; snprintf(q,sizeof q,"%s" PSEP "it%d.tsv",idir,k); if(lm_exists(q)){ bi=k; snprintf(prev,sizeof prev,"%s",q); } } }
+    if(*prev&&lm_exists(ipath)){ printf("[bench] vs %s:\n",prev); le_vs(prev,ipath,"[bench]   ",NULL); }
+    if(lm_exists(ipath)) snprintf(prev,sizeof prev,"%s",ipath);
+    fflush(stdout);
     snprintf(tsv,sizeof tsv,"%s.bench.tsv",mpath); int nw=!lm_exists(tsv); FILE*f=fopen(tsv,"a");
-    if(f){ if(nw) fprintf(f,"iter\tepoch\tindex\tscores (acc_norm %%; lambada acc %%)\n");
-        fprintf(f,"%d\t%.3f\t%.2f\t%s\n",it,ep,ix,res); fclose(f); }
+    if(f){ if(nw) fprintf(f,"iter\tepoch\tindex\tscores (acc_norm %%; lambada acc %%)\tmargin_index\n");
+        fprintf(f,"%d\t%.3f\t%.2f\t%s\t%.3f\n",it,ep,ix,res,mi); fclose(f); }
     return wall()-t; }
 /* [nan] locator: per tensor, non-finite grad count, max|G| and max|P| (first few events only) */
 static void nan_where(const float*P,const float*G,const Off*o,size_t np){
@@ -8545,7 +8596,8 @@ static void cmd_lmeval(int argc,char**argv){
         "  tasks: comma list of hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark (files $CUDALM_BENCH_DIR/<task>.tsv, default dir bench)\n"
         "         or .tsv paths; n>0 scores only the first n items of each task\n"
         "  ends with the Open SLM intelligence index (acc_norm, chance-normalised:\n"
-        "  (HellaSwag + mean(ARC-E,ARC-C) + PIQA + 0.65 ArithMark-3) / 3.65; missing tasks drop out, >=2 needed)\n"); exit(1); }
+        "  (HellaSwag + mean(ARC-E,ARC-C) + PIQA + 0.65 ArithMark-3) / 3.65; missing tasks drop out, >=2 needed)\n"
+        "  also a margin index (logP/byte gold - best wrong, same weights); CUDALM_LMEVAL_ITEMS=<file> dumps per-item margins for lmeval-vs\n"); exit(1); }
     g_fp8gemm=0;    /* per-tensor FP8 scales see the whole batch (padding included): scores would depend on batching */
     char path[1024]; model_path(argv[2],path,sizeof(path));
     FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
@@ -8574,9 +8626,11 @@ static void cmd_lmeval(int argc,char**argv){
     int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4),*tok=(int*)malloc((size_t)N*4),*tgt=(int*)malloc((size_t)N*4);
     float*lp=(float*)malloc((size_t)N*4),*lg=(float*)malloc((size_t)CH_ROWS*V*4);
     printf("[lmeval] %s | Tmax %d | %d tokens per forward | tasks %s\n",argv[2],Tm,N,tl);
-    char sum[16][200]; int ns=0; double t0=wall();
+    char sum[16][260]; int ns=0; double t0=wall();
     /* Open SLM intelligence index inputs (acc_norm %): hellaswag, arc_easy, arc_challenge, piqa, arithmark */
-    static const char*ixn[5]={"hellaswag","arc_easy","arc_challenge","piqa","arithmark"}; double ixs[5]; int ixh[5]={0};
+    static const char*ixn[5]={"hellaswag","arc_easy","arc_challenge","piqa","arithmark"}; double ixs[5],ixm[5],ixe[5]; int ixh[5]={0};
+    const char*ip=getenv("CUDALM_LMEVAL_ITEMS"); FILE*itf=ip&&*ip?fopen(ip,"w"):NULL;
+    if(itf) fprintf(itf,"task\titem\tcorrect\tmargin\n");
     for(char*tn=tl,*tc; tn&&*tn; tn=tc){
         tc=strchr(tn,','); if(tc) *tc++=0;
         char fp[1200]; if(strstr(tn,".tsv")) snprintf(fp,sizeof fp,"%s",tn); else snprintf(fp,sizeof fp,"%s/%s.tsv",bd,tn);
@@ -8625,17 +8679,20 @@ static void cmd_lmeval(int argc,char**argv){
                     gr[k]=(char)ok; }
                 i0=i1; }
         }
-        double A=0,AN=0,CH=0,LL=0;
-        for(int i=0;i<ni;i++){ int k=q0[i];
-            if(greedy){ A+=gr[k]; LL+=ll[k]; continue; }
-            int bs=0,bn=0; for(int j=1;j<nc[i];j++){ if(ll[k+j]>ll[k+bs]) bs=j; if(ll[k+j]/by[k+j]>ll[k+bn]/by[k+bn]) bn=j; }
-            A+=bs==gold[i]; AN+=bn==gold[i]; CH+=1.0/nc[i]; }
-        double p=A/ni,pn=AN/ni;
-        if(!greedy){ const char*b=tn+strlen(tn); while(b>tn&&b[-1]!='/'&&b[-1]!='\\') b--; size_t bl=strcspn(b,".");
-            for(int q=0;q<5;q++) if(strlen(ixn[q])==bl&&!strncmp(b,ixn[q],bl)){ ixs[q]=100*pn; ixh[q]=1; } }
-        if(greedy) snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),T,wall()-tt,trunc?", truncated":"");
-        else snprintf(sum[ns],200,"  %-13s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   (T %d, %.1fs)",tn,ni,
-                      100*p,100*sqrt(p*(1-p)/ni),100*pn,100*sqrt(pn*(1-pn)/ni),100*CH/ni,T,wall()-tt);
+        double A=0,AN=0,CH=0,LL=0,MS=0,MQ=0;
+        const char*b=tn+strlen(tn); while(b>tn&&b[-1]!='/'&&b[-1]!='\\') b--; int bl=(int)strcspn(b,".");
+        for(int i=0;i<ni;i++){ int k=q0[i],ok; double m;
+            if(greedy){ A+=gr[k]; LL+=ll[k]; ok=gr[k]; m=ll[k]/(by[k]>0?by[k]:1); }
+            else{ int bs=0,bn=0; double bw=-1e30;    /* margin: gold logP/byte minus the best wrong one */
+                for(int j=0;j<nc[i];j++){ if(ll[k+j]>ll[k+bs]) bs=j; if(ll[k+j]/by[k+j]>ll[k+bn]/by[k+bn]) bn=j;
+                    if(j!=gold[i]&&ll[k+j]/by[k+j]>bw) bw=ll[k+j]/by[k+j]; }
+                A+=bs==gold[i]; AN+=bn==gold[i]; CH+=1.0/nc[i]; ok=bn==gold[i]; m=ll[k+gold[i]]/by[k+gold[i]]-bw; }
+            MS+=m; MQ+=m*m; if(itf) fprintf(itf,"%.*s\t%d\t%d\t%.6f\n",bl,b,i,ok,m); }
+        double p=A/ni,pn=AN/ni,mm=MS/ni,me=ni>1?sqrt(fmax(MQ/ni-mm*mm,0)/(ni-1)):0;
+        if(!greedy) for(int q=0;q<5;q++) if((int)strlen(ixn[q])==bl&&!strncmp(b,ixn[q],bl)){ ixs[q]=100*pn; ixm[q]=mm; ixe[q]=me; ixh[q]=1; }
+        if(greedy) snprintf(sum[ns],260,"  %-13s %6d   acc %6.2f%% +-%.2f   ppl %9.2f          logP/B %+.4f +-%.4f   (T %d, %.1fs%s)",tn,ni,100*p,100*sqrt(p*(1-p)/ni),exp(-LL/ni),mm,me,T,wall()-tt,trunc?", truncated":"");
+        else snprintf(sum[ns],260,"  %-13s %6d   acc %6.2f%% +-%.2f   acc_norm %6.2f%% +-%.2f   chance %4.1f%%   margin %+.4f +-%.4f   (T %d, %.1fs)",tn,ni,
+                      100*p,100*sqrt(p*(1-p)/ni),100*pn,100*sqrt(pn*(1-pn)/ni),100*CH/ni,mm,me,T,wall()-tt);
         printf("%s\n",sum[ns]); fflush(stdout); if(ns<15) ns++;
         for(int k=0;k<nq;k++) free(sq[k]); free(sq); free(ln); free(st); free(by); free(gold); free(nc); free(q0); free(ll); free(gr);
     }
@@ -8651,7 +8708,15 @@ static void cmd_lmeval(int argc,char**argv){
         if(nc>=2) printf("\n[lmeval] Open SLM intelligence index %.2f   (normalised:%s%s%s)\n",num/den,line,
                          ch[1]&&!(ixh[1]&&ixh[2])?"; ARC from one of ARC-E/ARC-C only":"",nc<4?"; partial":"");
         else printf("\n[lmeval] Open SLM intelligence index: needs at least 2 of HellaSwag, ARC, PIQA, ArithMark-3\n");
+        /* margin index: the same weights over mean margins (100 x nats/byte); far less noisy than accuracy near chance */
+        double mn=0,mv=0,md=0,m4[4],e4[4];
+        m4[0]=ixm[0]; e4[0]=ixe[0]; m4[2]=ixm[3]; e4[2]=ixe[3]; m4[3]=ixm[4]; e4[3]=ixe[4];
+        if(ixh[1]&&ixh[2]){ m4[1]=(ixm[1]+ixm[2])/2; e4[1]=0.5*sqrt(ixe[1]*ixe[1]+ixe[2]*ixe[2]); }
+        else if(ch[1]){ m4[1]=ixh[1]?ixm[1]:ixm[2]; e4[1]=ixh[1]?ixe[1]:ixe[2]; }
+        for(int q=0;q<4;q++) if(ch[q]){ mn+=cw[q]*m4[q]; mv+=cw[q]*cw[q]*e4[q]*e4[q]; md+=cw[q]; }
+        if(nc>=2) printf("[lmeval] margin index %.3f +-%.3f   (100 x mean logP/byte gold - best wrong; same weights)\n",100*mn/md,100*sqrt(mv)/md);
     }
+    if(itf){ fclose(itf); printf("[lmeval] per-item margins -> %s\n",ip); }
 }
 
 /* ===================== bench ============================================ */
@@ -9981,6 +10046,7 @@ int main(int argc,char**argv){
         "  cudalm bench    <preset> [iters] [batch]\n"
         "  cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp] [T]\n"
         "  cudalm lmeval   <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]\n"
+        "  cudalm lmeval-vs <A.items.tsv> <B.items.tsv>   paired per-item comparison of two lmeval dumps\n"
         "  cudalm grow    <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
         "  cudalm gguf     <name> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]\n"
@@ -9999,6 +10065,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"probe"))    { cmd_probe(argc,argv); return 0; }
     if(!strcmp(argv[1],"chatbench")){ cmd_chatbench(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval"))   { cmd_lmeval(argc,argv); return 0; }
+    if(!strcmp(argv[1],"lmeval-vs")){ cmd_lmeval_vs(argc,argv); return 0; }
     if(!strcmp(argv[1],"bench"))    { cmd_bench(argc,argv); return 0; }
     if(!strcmp(argv[1],"grow"))     { return cmd_grow(argc,argv); }
     if(!strcmp(argv[1],"quantize")) { return cmd_quantize(argc,argv); }

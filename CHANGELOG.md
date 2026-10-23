@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: document new `cudalm lmeval-vs` command and margin reporting
+- cudalm.cu: implement `le_load`, `le_vs`, `cmd_lmeval_vs`, and margin index in `cmd_lmeval`
+
+## Unreleased - 2026-10-23
+
 - Add template parsing and rendering functions to data.cuh
 - Add data peek command to data.cuh
 - Update data.cuh hf_rows usage to support template

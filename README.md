@@ -87,6 +87,7 @@ cudalm eval      <name> <corpus> [batches] [batch_size]
 cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]
 cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp]
 cudalm lmeval    <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]
+cudalm lmeval-vs <A.items.tsv> <B.items.tsv>       paired per-item comparison of two lmeval dumps
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>
@@ -99,6 +100,13 @@ cudalm help                                        all commands + every environm
 N(s, c) = 100 × (s − c) ÷ (100 − c), using acc_norm: HellaSwag (c 25), ARC = mean of ARC-Easy and ARC-Challenge (c 25),
 PIQA (c 50), ArithMark-3 (c 25, weight 0.65). Index = (HS + ARC + PIQA + 0.65 × ArithMark) ÷ 3.65. A task that wasn't
 run drops out of both sums (at least two components needed), and scores below chance count as negative.
+
+Near chance, accuracy is mostly noise, so `lmeval` also reports a **margin** per task: per item, the log-probability per
+byte of the right answer minus the best wrong one (LAMBADA: log-probability per byte of the target word), averaged ± SE.
+The **margin index** combines them with the same weights (× 100). `CUDALM_LMEVAL_ITEMS=<file>` writes every item's
+margin and correctness; `cudalm lmeval-vs A.tsv B.tsv` pairs two such dumps item by item and prints, per task, the
+accuracy flips each way and the mean margin change ± paired SE, then the margin-index change with its z. Treat |z| < 2
+as no change.
 
 Training options are `CUDALM_*`, `QLM_*` and `NGRAM_*` environment variables (`cudalm help` lists them all).
 `cudalm new` and `cudalm train` save the ones in effect to `models\<name>.bin.env`, so later commands don't need them
@@ -119,7 +127,9 @@ files that contain them are ignored for those keys.
 at or after every N steps of the stage, and once more at the end. It runs as a child process; training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
 By default it runs every task (HellaSwag, ARC-E, ARC-C, PIQA, LAMBADA, ArithMark) on its full set; `CUDALM_BENCH_TASKS`
-(comma list) and `CUDALM_BENCH_N` (items per task) narrow it.
+(comma list) and `CUDALM_BENCH_N` (items per task) narrow it. Each bench also saves its per-item dump to
+`models\<name>.bin.items\it<N>.tsv`, prints the paired comparison with the previous bench, and adds the margin index as
+the last column of `bench.tsv`.
 
 In the menu every command is a form (required fields are checked before Run). Its output is shown live and also
 saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the input for `bench\judgerun.bat`. Diagnostics
