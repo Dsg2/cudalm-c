@@ -78,6 +78,16 @@ bench\chatbench.bat mymodel
 `python prep\fetch.py list` prints the available download profiles. `cudalm data fetch <file|folder> <out>` converts
 your own parquet, json or jsonl files instead.
 
+To finetune an existing model, encode the data with that model's own tokenizer. `cudalm data tokenizer-from <model> <out>`
+(TUI: Data tools > Tokenizer from model) writes the tokenizer embedded in the model's `.bin` as a tokenizer folder
+(tokenizer.bin + tokenizer.json + canon.bin), ready for `data encode`:
+
+```
+cudalm data tokenizer-from mymodel mymodel_tok
+cudalm data encode new mysft text_sft mymodel_tok
+cudalm train mymodel mysft 1
+```
+
 ## CLI
 
 ```

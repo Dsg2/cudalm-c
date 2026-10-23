@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-23
 
+- README.md: Add usage example for `cudalm data tokenizer-from`
+- cudalm.cu: Add `g_tokblob`/`g_tokblobl` globals and `tok_keep()` function
+- cudalm.cu: Update `model_load_full()` to call `tok_keep()` after tokenizer parse
+- cudalm.cu: Update `info()` to call `tok_keep()` after tokenizer parse
+- data.cuh: Add `d_tokjson()` function to generate tokenizer.json
+
+## Unreleased - 2026-10-23
+
 - README.md: document new `cudalm lmeval-vs` command and margin reporting
 - cudalm.cu: implement `le_load`, `le_vs`, `cmd_lmeval_vs`, and margin index in `cmd_lmeval`
 

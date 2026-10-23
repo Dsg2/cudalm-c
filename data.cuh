@@ -468,6 +468,28 @@ static void d_b2u(unsigned*u){ int n=0; for(int b=0;b<256;b++) u[b]=((b>='!'&&b<
 static void d_jtok(FILE*f,const unsigned*u,const uint8_t*s,int n){       /* token bytes -> HF ByteLevel string, JSON-quoted */
     fputc('"',f); for(int i=0;i<n;i++){ unsigned c=u[s[i]]; if(c=='"'||c=='\\') fprintf(f,"\\%c",c); else if(c<0x80) fputc(c,f); else { fputc(0xC0|c>>6,f); fputc(0x80|(c&63),f); } }
     fputc('"',f); }
+/* <dir>\tokenizer.json (HF ByteLevel BPE) from <dir>\tokenizer.bin, so HF tools and fetch.py can read the tokenizer */
+static int d_tokjson(const char*dir){
+    char p[1200]; size_t n; snprintf(p,sizeof p,"%s\\tokenizer.bin",dir); uint8_t*b=read_file(p,&n);
+    if(!b||n<16||memcmp(b,"TLTK",4)){ free(b); fprintf(stderr,"[tokenizer] %s is not a TLTK tokenizer\n",p); return 0; }
+    int V,eot,m; memcpy(&V,b+4,4); memcpy(&eot,b+8,4); memcpy(&m,b+12,4);
+    const uint8_t**t=(const uint8_t**)malloc(sizeof(*t)*V); int*tl=(int*)malloc(4*V); const uint8_t*q=b+16,*e=b+n;
+    for(int i=0;i<V;i++){ if(q+4>e) break; memcpy(&tl[i],q,4); t[i]=q+4; q+=4+tl[i]; }
+    q+=4*256; unsigned u[256]; d_b2u(u);
+    snprintf(p,sizeof p,"%s\\tokenizer.json",dir); FILE*f=fopen(p,"wb"); if(!f){ free(t); free(tl); free(b); return 0; }
+    fprintf(f,"{\n  \"version\": \"1.0\",\n  \"truncation\": null,\n  \"padding\": null,\n  \"added_tokens\": [\n    {\n      \"id\": %d,\n"
+              "      \"content\": \"<|endoftext|>\",\n      \"single_word\": false,\n      \"lstrip\": false,\n      \"rstrip\": false,\n"
+              "      \"normalized\": false,\n      \"special\": true\n    }\n  ],\n  \"normalizer\": null,\n"
+              "  \"pre_tokenizer\": {\n    \"type\": \"ByteLevel\",\n    \"add_prefix_space\": false,\n    \"trim_offsets\": true,\n    \"use_regex\": true\n  },\n"
+              "  \"post_processor\": null,\n"
+              "  \"decoder\": {\n    \"type\": \"ByteLevel\",\n    \"add_prefix_space\": true,\n    \"trim_offsets\": true,\n    \"use_regex\": true\n  },\n"
+              "  \"model\": {\n    \"type\": \"BPE\",\n    \"dropout\": null,\n    \"unk_token\": null,\n    \"continuing_subword_prefix\": null,\n"
+              "    \"end_of_word_suffix\": null,\n    \"fuse_unk\": false,\n    \"byte_fallback\": false,\n    \"ignore_merges\": false,\n    \"vocab\": {",eot);
+    for(int i=0;i<V;i++){ fprintf(f,"%s\n      ",i?",":""); if(i==eot) fprintf(f,"\"<|endoftext|>\""); else d_jtok(f,u,t[i],tl[i]); fprintf(f,": %d",i); }
+    fprintf(f,"\n    },\n    \"merges\": [");
+    for(int i=0;i<m&&q+12<=e;i++,q+=12){ int x,y; memcpy(&x,q,4); memcpy(&y,q+4,4); if(x<0||y<0||x>=V||y>=V) continue;
+        fprintf(f,"%s\n      [\n        ",i?",":""); d_jtok(f,u,t[x],tl[x]); fprintf(f,",\n        "); d_jtok(f,u,t[y],tl[y]); fprintf(f,"\n      ]"); }
+    fprintf(f,"\n    ]\n  }\n}"); fclose(f); free(t); free(tl); free(b); return 1; }
 static int cmd_data_tokenizer(int argc,char**argv){
     if(argc<5){ fprintf(stderr,"usage: cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]\n"); return 1; }
     char out[1200],p[1200]; data_outdir(argv[3],out,sizeof out); DFiles fl;
@@ -526,21 +548,7 @@ static int cmd_data_tokenizer(int argc,char**argv){
     for(int i=0;i<V;i++){ fwrite(&tlen[i],4,1,f); fwrite(tb.p+toff[i],1,tlen[i],f); }
     fwrite(base,4,256,f); for(int i=0;i<m;i++){ fwrite(&ma[i],4,1,f); fwrite(&mb2[i],4,1,f); fwrite(&mz[i],4,1,f); }
     fclose(f);
-    snprintf(p,sizeof p,"%s\\tokenizer.json",out); f=fopen(p,"wb");
-    fprintf(f,"{\n  \"version\": \"1.0\",\n  \"truncation\": null,\n  \"padding\": null,\n  \"added_tokens\": [\n    {\n      \"id\": 0,\n"
-              "      \"content\": \"<|endoftext|>\",\n      \"single_word\": false,\n      \"lstrip\": false,\n      \"rstrip\": false,\n"
-              "      \"normalized\": false,\n      \"special\": true\n    }\n  ],\n  \"normalizer\": null,\n"
-              "  \"pre_tokenizer\": {\n    \"type\": \"ByteLevel\",\n    \"add_prefix_space\": false,\n    \"trim_offsets\": true,\n    \"use_regex\": true\n  },\n"
-              "  \"post_processor\": null,\n"
-              "  \"decoder\": {\n    \"type\": \"ByteLevel\",\n    \"add_prefix_space\": true,\n    \"trim_offsets\": true,\n    \"use_regex\": true\n  },\n"
-              "  \"model\": {\n    \"type\": \"BPE\",\n    \"dropout\": null,\n    \"unk_token\": null,\n    \"continuing_subword_prefix\": null,\n"
-              "    \"end_of_word_suffix\": null,\n    \"fuse_unk\": false,\n    \"byte_fallback\": false,\n    \"ignore_merges\": false,\n    \"vocab\": {\n"
-              "      \"<|endoftext|>\": 0");
-    for(int i=1;i<V;i++){ fprintf(f,",\n      "); d_jtok(f,u,(const uint8_t*)tb.p+toff[i],tlen[i]); fprintf(f,": %d",i); }
-    fprintf(f,"\n    },\n    \"merges\": [");
-    for(int i=0;i<m;i++){ fprintf(f,"%s\n      [\n        ",i?",":""); d_jtok(f,u,(const uint8_t*)tb.p+toff[ma[i]],tlen[ma[i]]);
-        fprintf(f,",\n        "); d_jtok(f,u,(const uint8_t*)tb.p+toff[mb2[i]],tlen[mb2[i]]); fprintf(f,"\n      ]"); }
-    fprintf(f,"\n    ]\n  }\n}"); fclose(f);
+    d_tokjson(out);
     d_template(out);
     snprintf(p,sizeof p,"%s\\meta.json",out); f=fopen(p,"wb");
     fprintf(f,"{\n  \"vocab_size\": %d,\n  \"eot_id\": 0,\n  \"built_by\": \"cudalm data tokenizer\",\n  \"sample_bytes\": %lld,\n  \"inputs\": [",V,x.used);
@@ -548,6 +556,25 @@ static int cmd_data_tokenizer(int argc,char**argv){
     DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s\\canon.bin",out); d_canon(t,p);
     printf("[tokenizer] %s: V=%d (%d merges%s), %.1f s\n",out,V,m,V<Vwant?" - ran out of pairs seen twice":"",(GetTickCount()-t0)/1000.0);
     return 0; }
+
+/* tokenizer-from: a model's embedded tokenizer as a tokenizer folder, for `data encode` (finetune data must use it) */
+static int cmd_data_tokfrom(int argc,char**argv){
+    if(argc<5){ fprintf(stderr,"usage: cudalm data tokenizer-from <model|model.bin> <out>\n"); return 1; }
+    char mp[1024],out[1200],p[1200]; model_path(argv[3],mp,sizeof mp); if(!d_exists(mp)) snprintf(mp,sizeof mp,"%s",argv[3]);
+    if(!d_exists(mp)){ fprintf(stderr,"[tokenizer-from] no model %s\n",argv[3]); return 1; }
+    data_outdir(argv[4],out,sizeof out);
+    snprintf(p,sizeof p,"%s\\tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer-from] %s already has a tokenizer - pick a new name\n",out); return 1; }
+    Cfg c; Tok*tk=NULL; float*P=model_load_full(mp,&c,&tk); free(P);
+    if(!tk||!g_tokblob){ fprintf(stderr,"[tokenizer-from] %s has no tokenizer (untrained?)\n",mp); return 1; }
+    if(!CreateDirectoryA(out,NULL)&&!d_isdir(out)){ fprintf(stderr,"[tokenizer-from] cannot create %s\n",out); return 1; }
+    FILE*f=fopen(p,"wb"); if(!f||fwrite(g_tokblob,1,g_tokblobl,f)!=(size_t)g_tokblobl){ if(f) fclose(f); fprintf(stderr,"[tokenizer-from] cannot write %s\n",p); return 1; }
+    fclose(f);
+    if(!d_tokjson(out)) return 1;
+    d_template(out);
+    snprintf(p,sizeof p,"%s\\meta.json",out); f=fopen(p,"wb");
+    if(f){ fprintf(f,"{\n  \"vocab_size\": %d,\n  \"eot_id\": %d,\n  \"built_by\": \"cudalm data tokenizer-from\",\n  \"model\": ",tk->V,tk->eot); jesc(f,mp); fprintf(f,"\n}\n"); fclose(f); }
+    DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s\\canon.bin",out); d_canon(t,p);
+    printf("[tokenizer-from] %s -> %s: V=%d, %d merges, eot %d\n",mp,out,tk->V,tk->nmerges,tk->eot); return 0; }
 
 /* ---------------- mix: weighted blend of corpora (doc-level, shuffled) ---------------- */
 typedef struct { HANDLE f,m; const uint16_t*p; size_t n,nb; } DMap;
@@ -885,6 +912,7 @@ static int cmd_data(int argc,char**argv){
     const char*s=argc>2?argv[2]:"";
     if(!strcmp(s,"encode"))    return cmd_data_encode(argc,argv);
     if(!strcmp(s,"tokenizer")) return cmd_data_tokenizer(argc,argv);
+    if(!strcmp(s,"tokenizer-from")) return cmd_data_tokfrom(argc,argv);
     if(!strcmp(s,"mix"))       return cmd_data_mix(argc,argv);
     if(!strcmp(s,"info"))      return cmd_data_info(argc,argv);
     if(!strcmp(s,"canon"))     return cmd_data_canon(argc,argv);
@@ -901,6 +929,7 @@ static int cmd_data(int argc,char**argv){
         "  cudalm data peek      <file|folder|hf:spec> [template]   first rows as the model sees them\n"
         "  template (fetch --template, peek): text=a+b | chat=col | user=q+ctx,assistant=a (+ system=col, tools=col)\n"
         "  cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]  train a byte-level BPE (+ canon.bin)\n"
+        "  cudalm data tokenizer-from <model> <out>   a model's own tokenizer as a tokenizer folder (encode finetune data with it)\n"
         "  cudalm data encode    <new|append> <out> <inputs> <tokenizer> [val%%=1] [dedup=1] [follow=0]\n"
         "  cudalm data mix       <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> ...\n"
         "  token counts accept k / M / B suffixes (500M, 1B)\n"
