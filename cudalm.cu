@@ -6236,8 +6236,11 @@ static int gpu_adam(float*P,float*G,bf16*M,bf16*V,size_t np,float lr,int t){
     if(!isfinite(g_gn)) return 0;
     /* Muon reads G itself, so it still needs the scaled copy */
     if(g_muon) KL(k_scale_d,nblk(np,TPB),TPB)(G,np,gs);
-    float b1=0.9f,b2=0.95f,wd=0.1f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
-    { const char*e=getenv("CUDALM_QLM_WD"); if(e) wd=(float)atof(e); }
+    static float b1=-1,b2,wd; const char*e;
+    if(b1<0){ b1=(e=getenv("CUDALM_B1"))?(float)atof(e):0.9f; b2=(e=getenv("CUDALM_B2"))?(float)atof(e):0.95f;
+        wd=(e=getenv("CUDALM_WD"))||(e=getenv("CUDALM_QLM_WD"))?(float)atof(e):0.1f;
+        printf("[adam] b1 %g b2 %g wd %g\n",b1,b2,wd); }
+    float bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
     if(g_qlm_on){ qlm_gpu_update(&QQ,P,G,lr,b1,b2,wd,bc1,bc2,t,g_muon?NULL:gs); return 1; }
     MuSkip mu=MU_OFF;
     if(g_muon){
@@ -6294,11 +6297,12 @@ static void lr_boost_setup(const Cfg*c,const Off*o){
  * single decay at the end, so a run can be extended or branched without the
  * schedule fighting it (MiniCPM's WSD; Hagele et al. on constant-LR + cooldown,
  * which reports parity with cosine at equal budget). */
+static float lr_minf(void){ static float f=-1; if(f<0){ const char*e=getenv("CUDALM_LR_MIN"); f=e?(float)atof(e):0.1f; if(f<0) f=0; } return f; }
 static float lr_at(int it,int iters,float lr,float warmup,int wsd,float dfrac){
     float base; int ita=it; it-=g_stage0; iters-=g_stage0;
     if(it<warmup) base=lr*(it+1)/warmup;
     else {
-        float lo=0.1f*lr;
+        float lo=lr_minf()*lr;
         if(!wsd){
             float span=(float)(iters>warmup?iters-warmup:1);
             base=lo+0.5f*(1+cosf(3.14159265f*(it-warmup)/span))*(lr-lo);
@@ -6529,6 +6533,10 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MOE_SINK","0","moe","Sinkhorn selection (train only)",0},
  {"CUDALM_LR","auto","optim","peak LR (auto: by model width; a new stage on a trained model gets 1/3 of it)",0},
  {"CUDALM_WARMUP","100","optim","warmup iters",0},
+ {"CUDALM_LR_MIN","0.1","optim","LR floor at the end of the decay, as a fraction of peak",0},
+ {"CUDALM_B1","0.9","optim","AdamW beta1",0},
+ {"CUDALM_B2","0.95","optim","AdamW beta2",0},
+ {"CUDALM_WD","0.1","optim","AdamW weight decay (also QLM; CUDALM_QLM_WD is the old name)",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
  {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
  {"CUDALM_REWARMUP","0","optim","re-warmup iters after resume",1},
@@ -7931,8 +7939,8 @@ static void cmd_train(int argc,char**argv){
     g_start_iter=start_iter;
     { int S=iters-g_stage0, d=(int)(S*g_wsd_decay);
       if(g_wsd) printf("[cudalm train] schedule WSD: warmup %d, hold %g, cooldown over the last %.0f%% of the stage (%d iters, from iter %d) to %g\n",
-                       (int)warmup, lr, g_wsd_decay*100.0f, d, iters-d, 0.1f*lr);
-      else      printf("[cudalm train] schedule cosine: %g -> %g over iters %d..%d\n", lr, 0.1f*lr, g_stage0, iters); }
+                       (int)warmup, lr, g_wsd_decay*100.0f, d, iters-d, lr_minf()*lr);
+      else      printf("[cudalm train] schedule cosine: %g -> %g over iters %d..%d\n", lr, lr_minf()*lr, g_stage0, iters); }
     if(g_rewarm>0) printf("[cudalm train] re-warmup: ramping to the scheduled rate over %d iters from iter %d\n",
                           g_rewarm, start_iter);
     lr_boost_setup(&c,&o);

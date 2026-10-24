@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-24
 
+- Update README.md with new optimizer knobs
+- Add CUDALM_LR_MIN, B1, B2, WD env vars to README.md
+
+## Unreleased - 2026-10-24
+
 - add cudalm.cu and qlm.cuh support for CUDALM_LOOP
 
 ## Unreleased - 2026-10-23
