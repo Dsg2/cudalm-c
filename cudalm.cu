@@ -132,7 +132,7 @@ static int g_attn_chunk=128;
  * On by default where the head dim allows it; CUDALM_FP16=0 forces the fp32
  * kernels back (needed to reproduce a bit-exact CPU-parity run). */
 static int g_fp16=1;
-static int g_muon=0;                 /* Muon on 2-D tensors (env CUDALM_MUON) */
+static int g_muon=0, g_muon_exp=0;   /* Muon on 2-D tensors (env CUDALM_MUON, default on); exp: set explicitly */
 
 static void ck(cudaError_t e, const char *what){
     if(e != cudaSuccess){ fprintf(stderr,"CUDA error: %s at %s\n", cudaGetErrorString(e), what); exit(1); }
@@ -6237,7 +6237,7 @@ static int gpu_adam(float*P,float*G,bf16*M,bf16*V,size_t np,float lr,int t){
     /* Muon reads G itself, so it still needs the scaled copy */
     if(g_muon) KL(k_scale_d,nblk(np,TPB),TPB)(G,np,gs);
     static float b1=-1,b2,wd; const char*e;
-    if(b1<0){ b1=(e=getenv("CUDALM_B1"))?(float)atof(e):0.9f; b2=(e=getenv("CUDALM_B2"))?(float)atof(e):0.95f;
+    if(b1<0){ b1=(e=getenv("CUDALM_B1"))?(float)atof(e):0.9f; b2=(e=getenv("CUDALM_B2"))?(float)atof(e):g_qlm_on?0.95f:0.99f;
         wd=(e=getenv("CUDALM_WD"))||(e=getenv("CUDALM_QLM_WD"))?(float)atof(e):0.1f;
         printf("[adam] b1 %g b2 %g wd %g\n",b1,b2,wd); }
     float bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
@@ -6531,11 +6531,11 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MOE_BIAS_SLOT","1","moe","per-slot bias",0},
  {"CUDALM_MOE_RCAP","0","moe","capacity reroute factor (>=1, train only)",0},
  {"CUDALM_MOE_SINK","0","moe","Sinkhorn selection (train only)",0},
- {"CUDALM_LR","auto","optim","peak LR (auto: by model width; a new stage on a trained model gets 1/3 of it)",0},
+ {"CUDALM_LR","auto","optim","peak LR (auto: by width, x6 Muon / x24 AdamW vs QLM; a new stage on a trained model gets 1/3)",0},
  {"CUDALM_WARMUP","100","optim","warmup iters",0},
  {"CUDALM_LR_MIN","0.1","optim","LR floor at the end of the decay, as a fraction of peak",0},
  {"CUDALM_B1","0.9","optim","AdamW beta1",0},
- {"CUDALM_B2","0.95","optim","AdamW beta2",0},
+ {"CUDALM_B2","0.99","optim","AdamW beta2 (0.95 with QLM)",0},
  {"CUDALM_WD","0.1","optim","weight decay for AdamW, Muon and QLM (CUDALM_QLM_WD is the old name)",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
  {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
@@ -6548,11 +6548,11 @@ static const EnvReg g_envreg[]={
  {"CUDALM_LRS_ITERS","200","optim","LRS iters per probe",0},
  {"CUDALM_LRS_VB","8","optim","LRS val batches per probe",0},
  {"CUDALM_LRS_EPS","0.004","optim","LRS min gain to switch",0},
- {"CUDALM_MUON","0","optim","Muon on 2-D tensors (not with QLM)",0},
+ {"CUDALM_MUON","1","optim","Muon on 2-D tensors (default on; off by default for QLM / TLM7 / looped models)",0},
  {"CUDALM_MUON_MOM","0.95","optim","Muon momentum",0},
  {"CUDALM_MUON_LRMUL","5","optim","Muon LR multiplier",0},
  {"CUDALM_MUON_NS","5","optim","Muon Newton-Schulz steps",0},
- {"CUDALM_QLM","1","qlm","integer weights + int AdamW",0},
+ {"CUDALM_QLM","0","qlm","integer weights + int AdamW (was default before 2026-10-24)",0},
  {"QLM_BITS","4","qlm","weight bits",0},
  {"QLM_GROUP","128","qlm","quant group size",0},
  {"QLM_OPT","qadam","qlm","qadam | qlion",0},
@@ -7507,8 +7507,11 @@ static int mask_apply(const MaskSpec*ms,const int*tok,int*tgt,int n,int eot){
 /* Peak LR for long runs. Short sweeps favour hotter peaks than long runs survive: D>=384 swept flat 5e-4..1e-3 at
  * 3k it, but s8w diverged at 1e-3/7e-4 (LRS settled at ~9e-5) and mod230 collapsed at 7e-4 (3.5e-4 stable);
  * LS-Micro (D192) at 3e-4 grew gn <1 -> 40 with NaNs late in its epoch. */
-static float default_lr_for(const Cfg*c){ if(c->D<=64)return 4e-4f; if(c->D<=96)return 3e-4f; if(c->D<=192)return 2e-4f;
-    if(c->D<=256)return 1.75e-4f; return 3e-4f; }
+/* table = QLM rates. Without QLM the 2026-10-24 sweep (D=192, 262M tokens) put the optimum at 6x (Muon, 1.2e-3)
+ * and 24x (fp32 AdamW, 4.8e-3); other widths are scaled by the same factor, untested. */
+static float default_lr_for(const Cfg*c){ float m=g_qlm_on?1.0f:g_muon?6.0f:24.0f;
+    if(c->D<=64)return 4e-4f*m; if(c->D<=96)return 3e-4f*m; if(c->D<=192)return 2e-4f*m;
+    if(c->D<=256)return 1.75e-4f*m; return 3e-4f*m; }
 /* A new stage on a trained model (CPT/SFT) re-warms out of a cooled-down minimum: LS-Micro-Base CPT at 1.5e-4
  * blew up (gn 30 -> 400+ in 5k it, loss rising), 7.5e-5 held. Default to a third of the from-scratch peak. */
 #define LR_STAGE_MUL (1.0f/3.0f)
@@ -7748,7 +7751,10 @@ static void cmd_train(int argc,char**argv){
              ga_bytes(N,1)/1e9, opt_state_bytes(np)/1e9, B, c.T, use, tt/1e9, head-use);
       if(head-use < 0.8) printf("[cudalm train] WARNING: thin VRAM headroom - this GPU also drives the display.\n"
                                 "               If the driver resets, lower CUDALM_BATCH or raise CUDALM_VRAM_RESERVE_MB.\n"); }
-    { const char*qe=getenv("CUDALM_QLM"); g_qlm_on = qe ? atoi(qe)!=0 : 1; }
+    { const char*qe=getenv("CUDALM_QLM"); g_qlm_on = qe ? atoi(qe)!=0 : 0; }
+    /* default Muon steps aside where it is unsupported or untested; an explicit CUDALM_MUON=1 keeps the old errors */
+    if(g_muon && !g_muon_exp && (g_qlm_on||c.mod||c.lp)){ g_muon=0; printf("[cudalm train] Muon off (default) for a %s model: AdamW\n",g_qlm_on?"QLM":c.mod?"per-layer layout":"looped"); }
+    lm_setenv("CUDALM_QLM",g_qlm_on?"1":"0"); lm_setenv("CUDALM_MUON",g_muon?"1":"0");   /* pin both in the model config */
     /* CUDALM_QLM_FUSED=1 consumes each layer's gradients during the backward
      * pass, so G holds ONE layer instead of the whole model. Needs qlm, because
      * the quantized update is what runs per layer. */
@@ -10073,7 +10079,7 @@ int main(int argc,char**argv){
       const char*y=getenv("CUDALM_NOSYNC"); if(y) g_sync=atoi(y)==0;
       y=getenv("CUDALM_CH_ROWS"); if(y&&atoi(y)>=CH_ROWS) g_chrows=atoi(y)&~15;
       const char*f=getenv("CUDALM_FP16"); if(f) g_fp16=(atoi(f)!=0);
-      const char*mu=getenv("CUDALM_MUON"); if(mu&&*mu!='0') g_muon=1;
+      const char*mu=getenv("CUDALM_MUON"); g_muon=mu?*mu!='0':1; g_muon_exp=mu!=NULL;
       const char*mm=getenv("CUDALM_MUON_MOM"); if(mm){ float v=(float)atof(mm); if(v>=0&&v<1) g_muon_mom=v; }
       const char*ml=getenv("CUDALM_MUON_LRMUL"); if(ml){ float v=(float)atof(ml); if(v>0) g_muon_lrmul=v; }
       const char*mns=getenv("CUDALM_MUON_NS"); if(mns){ int v=atoi(mns); if(v>=1&&v<=20) g_muon_ns=v; } }
