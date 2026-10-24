@@ -32,7 +32,7 @@ static const TCmd T_CMDS[]={
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT,0,0,0,
     "Passes over THIS corpus from now on. A model trained before starts a new stage here (warmup + LR schedule\n"
     "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models\\<name>.bin.run)."},
-   {"bench every","0",F_ENV,"CUDALM_BENCH_EVERY",0,0,"0 = off. N = every N steps of this stage, lmeval the checkpoint just saved (training waits,\n"
+   {"bench every","10000",F_ENV,"CUDALM_BENCH_EVERY",0,0,"0 = off (default 10000). N = every N steps of this stage, lmeval the checkpoint just saved (training waits,\n"
     "the time is left out of tok/s) and log the index + per-task scores to models\\<name>.bin.bench.tsv. Also runs at the end."},
    {" bench items","0",F_ENV,"CUDALM_BENCH_N",0,0,"Items per task (0 = full sets, the default).\n"
     "Tasks: CUDALM_BENCH_TASKS (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)."}}},

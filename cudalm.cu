@@ -6574,7 +6574,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_QLM_NOREUSE","","qlm","disable buffer reuse",0},
  {"CUDALM_BATCH","auto","train","batch size",0},
  {"CUDALM_SAVE_EVERY","auto","train","checkpoint interval (>=10)",0},
- {"CUDALM_BENCH_EVERY","0","train","lmeval the checkpoint every N steps (0 = off) -> <model>.bench.tsv",0},
+ {"CUDALM_BENCH_EVERY","10000","train","lmeval the checkpoint every N steps (0 = off) -> <model>.bench.tsv",0},
  {"CUDALM_BENCH_TASKS","all","train","bench tasks (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)",0},
  {"CUDALM_BENCH_N","0","train","items per bench task (0 = full sets)",0},
  {"CUDALM_KEEP_EVERY","20000","train","keep *_itN snapshots every N (0 = off)",0},
@@ -7696,7 +7696,7 @@ static void cmd_train(int argc,char**argv){
         "  a new stage: warmup and LR schedule restart over the stage, sampling starts at epoch 0 of the corpus.\n"
         "  <name>.bin.run records the stage; re-running the same command after a stop resumes it instead of adding more.\n"
         "  CUDALM_ITERS=N instead pins one schedule over iters 0..N of the model's whole life (old behaviour).\n"
-        "  CUDALM_BENCH_EVERY=N scores the checkpoint with lmeval every N steps (all tasks, full sets; CUDALM_BENCH_TASKS / CUDALM_BENCH_N narrow it)\n"
+        "  CUDALM_BENCH_EVERY=N scores the checkpoint with lmeval every N steps (default 10000, 0 = off; all tasks, full sets; CUDALM_BENCH_TASKS / CUDALM_BENCH_N narrow it)\n"
         "  and appends to <name>.bin.bench.tsv.\n"); exit(1); }
     const char*name=argv[2],*ddir=argv[3]; float epochs=argc>4?(float)atof(argv[4]):1.0f;
     char mpath[1024],optpath[1100]; model_path(name,mpath,sizeof(mpath)); snprintf(optpath,sizeof(optpath),"%s.opt",mpath);
@@ -7977,7 +7977,7 @@ static void cmd_train(int argc,char**argv){
     double tmax=0; { const char*e=getenv("CUDALM_MAX_SECONDS"); if(e){ double v=atof(e); if(v>0) tmax=v; } }
     double t0=wall();   /* tok/s reporting */
     double tstart=wall();                       /* session wall clock */
-    int bench_every=0; { const char*e=getenv("CUDALM_BENCH_EVERY"); if(e) bench_every=atoi(e); }
+    int bench_every=10000; { const char*e=getenv("CUDALM_BENCH_EVERY"); if(e) bench_every=atoi(e); }   /* default on since 20f */
     int next_bench=bench_every>0?((start_iter-g_stage0)/bench_every+1)*bench_every:0;
     if(bench_every>0) printf("[cudalm train] lmeval every %d steps at the next checkpoint (CUDALM_BENCH_EVERY) -> %s.bench.tsv\n",bench_every,mpath);
     int stop_it=iters;

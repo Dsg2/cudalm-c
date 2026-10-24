@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - 2026-10-25
+
+- README.md: document new default of 10000 for CUDALM_BENCH_EVERY
+- cudalm.cu: change default value from 0 to 10000
+- tui.cuh: change default value from 0 to 10000
+
 ## Unreleased - 2026-10-24
 
 - Add CUDALM_D, CUDALM_L, CUDALM_H, CUDALM_KV, CUDALM_F to g_envreg

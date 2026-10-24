@@ -133,7 +133,7 @@ iterations 0..N of the model's whole life (`runs\sft.bat` uses it). `CUDALM_ITER
 `CUDALM_REWARMUP` and `CUDALM_PERM_BASE` are per-run settings: they are not saved to `.bin.env`, and old `.bin.env`
 files that contain them are ignored for those keys.
 
-**Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every) runs `lmeval` on the checkpoint saved
+**Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every; default 10000 since 20f, 0 turns it off) runs `lmeval` on the checkpoint saved
 at or after every N steps of the stage, and once more at the end. It runs as a child process; training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
 By default it runs every task (HellaSwag, ARC-E, ARC-C, PIQA, LAMBADA, ArithMark) on its full set; `CUDALM_BENCH_TASKS`
