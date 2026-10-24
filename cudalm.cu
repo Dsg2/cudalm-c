@@ -386,6 +386,7 @@ static int hdr_ints(const char*m,int*v){ if(!memcmp(m,"TLM7",4)){*v=7;return 14+
     if(!memcmp(m,"TLM4",4)){*v=4;return 11;} if(!memcmp(m,"TLM3",4)){*v=3;return 10;}
     if(!memcmp(m,"TLM2",4)){*v=2;return 9;} if(!memcmp(m,"TLM1",4)){*v=1;return 8;} *v=0; return 0; }
 static void cfg_from_hdr(Cfg*c,const int*h,int ver){
+    memset(c,0,sizeof *c);   /* lp/lb/lmap (CUDALM_LOOP) are not in the header: stack garbage made info/load alias layers */
     c->V=h[0];c->D=h[1];c->L=h[2];c->H=h[3];c->KV=h[4];c->F=h[5];c->T=h[6];c->eot=h[7];
     c->tmpl=ver>=2?h[8]:0; c->n_mtp=ver>=3?h[9]:0; c->n_exp=ver>=4?h[10]:0;
     c->win=ver>=5?h[11]:0; c->full_every=ver>=5?h[12]:0;

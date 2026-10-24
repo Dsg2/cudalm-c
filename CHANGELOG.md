@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-25
 
+- Add memset to clear cuda config before parsing header fields in cudalm.cu
+- Prevent stack garbage from header parsing in cudalm.cu
+
+## Unreleased - 2026-10-25
+
 - README.md: document new default of 10000 for CUDALM_BENCH_EVERY
 - cudalm.cu: change default value from 0 to 10000
 - tui.cuh: change default value from 0 to 10000
