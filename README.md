@@ -253,8 +253,15 @@ fp16/f32 keep floats; a quantized model exports as its own type.
   - If 20 steps in a row are non-finite, the trainer exits with code 3, and the script resumes from the last checkpoint.
 - **`runs\sft.bat base sft chat_corpus <base_iters> <sft_iters>`:** copies the base model, re-warms to LR 1e-4, and
   decays over the last 40% of the SFT steps. `<base_iters>` is the base run's final iteration.
-- **Optimizer knobs:** `CUDALM_B1` (0.9), `CUDALM_B2` (0.95), `CUDALM_WD` (0.1, applies to fp32 AdamW and QLM),
-  `CUDALM_LR_MIN` (0.1: end of the WSD/cosine decay as a fraction of peak). `CUDALM_QLM=0` trains fp32 AdamW.
+- **Default optimizer (since 20d): Muon + fp32 AdamW, QLM off.** An optimizer sweep on the LS-Micro shape (D=192,
+  262M tokens of v3pre, from scratch) gave val loss 3.873 for the old QLM recipe at LR 2e-4, 3.277 for fp32 AdamW at
+  4.8e-3 and 3.235-3.239 (2 seeds) for Muon at 1.2e-3. The width-based default LR is therefore 6x the old QLM table
+  with Muon and 24x with plain AdamW (`CUDALM_MUON=0`); widths other than 192 use the same factor untested. Muon
+  turns itself off (AdamW) for QLM, per-layer-layout and looped models unless `CUDALM_MUON=1` is set explicitly.
+  Both choices are pinned in `<model>.bin.env`, so older QLM models keep training as QLM.
+- **Optimizer knobs:** `CUDALM_B1` (0.9), `CUDALM_B2` (0.99; 0.95 with QLM), `CUDALM_WD` (0.1, AdamW, Muon and QLM),
+  `CUDALM_LR_MIN` (0.1: end of the WSD/cosine decay as a fraction of peak). In the sweep, B2 0.98/0.99, WD 0.05/0.2
+  and LR_MIN 0 all landed within 0.011 of the defaults.
 - **Looped layers** (`CUDALM_LOOP=a-bxk`, e.g. `1-4x2`): layers a..b run k times with shared weights, so a 6-layer
   model runs at depth 10 with the same matrices. Each repeat pass gets its own norm gains (2·D floats per repeated
   layer, stored after all other weights). Put it in `<model>.bin.env` of an existing fp32 checkpoint: the first load
