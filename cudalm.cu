@@ -6514,6 +6514,11 @@ static const EnvReg g_envreg[]={
  {"CUDALM_ATTN_GATE","0","model","per-layer attention output gate (+L*D*D)",0},
  {"CUDALM_CANON","","model","Canon layers: A (after norm1), C (after norm2), AC (+L*4*D each)",0},
  {"CUDALM_SHARED_F","0","moe","shared always-on SwiGLU expert width (MoE only, <= F, +L*3*D*Fs)",0},
+ {"CUDALM_D","","model","at new: override the preset width",1},
+ {"CUDALM_L","","model","at new: override the preset depth",1},
+ {"CUDALM_H","","model","at new: override the preset head count",1},
+ {"CUDALM_KV","","model","at new: override the preset KV head count",1},
+ {"CUDALM_F","","model","at new: override the preset FFN / expert width",1},
  {"CUDALM_LOOP","","model","looped layers a-bxk: run layers a..b k times, shared weights (e.g. 1-4x2)",0},
  {"CUDALM_DOCMASK","0","train","mask attention/canon across eot (pretraining; not for eot-separated chat turns)",1},
  {"CUDALM_UNIPOOL","0","model","at new: one expert pool shared by all layers",0},
@@ -7055,6 +7060,7 @@ static int cmd_new(int argc,char**argv){
         "             Receptive field = layers * window, so pick window >= ctx/layers.\n"
         "  full_every: every Nth layer ignores the window and attends to the whole\n"
         "             prefix (0 = never). Restores exact long-range retrieval.\n"
+        "  CUDALM_D / _L / _H / _KV / _F: override the preset shape (e.g. D=160 L=15 H=5 KV=1 F=432)\n"
         "  CUDALM_UNIPOOL=1: n_experts becomes ONE pool shared by all layers\n"
         "  CUDALM_LAYOUT=D2560,M28,P,...: per-layer FFN (dense F / MoE E / UniPool), overrides L and n_experts;\n"
         "             with CUDALM_EXP_F (expert width) and CUDALM_POOL_E (pool size)\n"
@@ -7067,6 +7073,9 @@ static int cmd_new(int argc,char**argv){
         return 1; }
     const char *name=argv[2], *ps=argv[3];
     Cfg c; if(!preset(ps,&c)){ fprintf(stderr,"unknown preset '%s'\n",ps); return 1; }
+    { int*f[5]={&c.D,&c.L,&c.H,&c.KV,&c.F}; const char*k[5]={"CUDALM_D","CUDALM_L","CUDALM_H","CUDALM_KV","CUDALM_F"};   /* shape overrides */
+      for(int i=0;i<5;i++){ const char*e=getenv(k[i]); if(e&&atoi(e)>0) *f[i]=atoi(e); }
+      if(c.L>64||c.D%c.H||c.H%c.KV||(c.D/c.H)&1){ fprintf(stderr,"new: bad shape D=%d L=%d H=%d KV=%d (need D%%H==0, H%%KV==0, even head dim, L<=64)\n",c.D,c.L,c.H,c.KV); return 1; } }
     c.n_mtp=0;                                 /* MTP is not trained on the CUDA path */
     c.n_exp = argc>4 ? atoi(argv[4]) : 0; if(c.n_exp==1) c.n_exp=0;
     if(c.n_exp>256){ fprintf(stderr,"n_experts %d > 256\n",c.n_exp); return 1; }
