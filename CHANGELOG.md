@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-24
 
+- Add CUDALM_D, CUDALM_L, CUDALM_H, CUDALM_KV, CUDALM_F to g_envreg
+- Update cmd_new to parse env overrides for preset shape
+- Add validation for shape constraints (D%H==0, H%KV==0, even dim, L<=64)
+
+## Unreleased - 2026-10-24
+
 - README.md: document new default optimizer sweep results and QLM behavior
 - cudalm.cu: update default LR, B2, WD, and QLM defaults in env reg table
 - cudalm.cu: add g_muon_exp flag and default Muon off for QLM/looped models
