@@ -6139,7 +6139,7 @@ static void muon_alloc(size_t np){
            (2.0*mxA+2.0*mxX)*4/1e6);
 }
 static void gpu_muon(float*P,float*G,float lr){
-    const float wd=0.1f;
+    static float wd=-1; if(wd<0){ const char*e=getenv("CUDALM_WD"); wd=e?(float)atof(e):0.1f; }
     for(int i=0;i<g_nmut;i++){
         MuT*t=&g_mut[i];
         int m=t->m,n=t->n,B=t->batch,mn=m*n;
@@ -6536,7 +6536,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_LR_MIN","0.1","optim","LR floor at the end of the decay, as a fraction of peak",0},
  {"CUDALM_B1","0.9","optim","AdamW beta1",0},
  {"CUDALM_B2","0.95","optim","AdamW beta2",0},
- {"CUDALM_WD","0.1","optim","AdamW weight decay (also QLM; CUDALM_QLM_WD is the old name)",0},
+ {"CUDALM_WD","0.1","optim","weight decay for AdamW, Muon and QLM (CUDALM_QLM_WD is the old name)",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
  {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
  {"CUDALM_REWARMUP","0","optim","re-warmup iters after resume",1},

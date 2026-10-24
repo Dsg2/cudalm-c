@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-24
 
+- In gpu_muon(): replace hardcoded wd=0.1f with env-based lookup
+- In g_envreg[]: update CUDALM_WD description to include Muon and QLM
+
+## Unreleased - 2026-10-24
+
 - Update README.md with new optimizer knobs
 - Add CUDALM_LR_MIN, B1, B2, WD env vars to README.md
 
