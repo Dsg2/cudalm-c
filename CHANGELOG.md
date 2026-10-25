@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - 2026-10-26
+
+- Add FILTER_PLAN.md with block probe results and doc-level filter criteria
+- Add CUDALM_EVAL_SPANS flag to cudalm.cu for per-document scoring
+- Add prep/docsel.py and prep/fdocsum.py for arm selection and replicate reporting
+
 ## Unreleased - 2026-10-25
 
 - Add filtering plan and new pipeline scripts
