@@ -531,7 +531,10 @@ static int opt_load(const char*path,bf16*M,bf16*V,size_t n){
     int v2=!memcmp(m,"TOP2",4), v1=!memcmp(m,"TOPT",4);
     if(!v2&&!v1){fclose(f);return 0;}
     if(fread(&it,4,1,f)!=1){fclose(f);return 0;}
-    if(v2){ if(fread(M,2,n,f)!=n||fread(V,2,n,f)!=n){fclose(f);return 0;} fclose(f); return it; }
+    if(v2){ size_t n0=n; long long c0=lm_ftell64(f); lm_fseek64(f,0,SEEK_END); long long e=lm_ftell64(f); lm_fseek64(f,c0,SEEK_SET);
+        if(e>c0&&(size_t)((e-c0)/4)<n) n0=(size_t)((e-c0)/4);   /* a looped model grew per-pass norms: their moments stay 0 */
+        if(fread(M,2,n0,f)!=n0||fread(V,2,n0,f)!=n0){fclose(f);return 0;} fclose(f);
+        if(n0<n) printf("[opt] %s holds %zu of %zu params: the new ones start with zero moments\n",path,n0,n); return it; }
     /* legacy fp32: stream it in a chunk at a time rather than allocating a
      * second full-size host buffer next to the one the caller already holds */
     { const size_t CH=1u<<22; float*buf=(float*)malloc(CH*4);
@@ -6128,8 +6131,10 @@ static void muon_build_table(const Cfg*c,const Off*o){
     #undef MUADD
 }
 static void muon_alloc(size_t np){
-    Off o; calc_offsets(&gC,&o);
-    muon_build_table(&gC,&o);
+    /* looped: the table walks the PHYSICAL layers (repeat passes alias them and their grads already sum into them) */
+    Cfg pc=gC; if(gC.lp){ pc.L=gC.lp; pc.lp=0; for(int v=gC.L-1;v>=0;v--){ int l=gC.lmap[v]; pc.lt[l]=gC.lt[v]; pc.lE[l]=gC.lE[v]; pc.lF[l]=gC.lF[v]; } }
+    Off o; calc_offsets(&pc,&o);
+    muon_build_table(&pc,&o);
     size_t mxA=0,mxX=0; int mxB=1;
     for(int i=0;i<g_nmut;i++){ MuT*t=&g_mut[i]; int p=t->m<t->n?t->m:t->n;
         size_t A=(size_t)t->batch*p*p, X=(size_t)t->batch*t->m*t->n;
@@ -6182,11 +6187,11 @@ static void mu_load(const char*optpath,size_t np,int start_iter){
     char path[1200]; snprintf(path,sizeof path,"%s.mu",optpath);
     FILE*f=fopen(path,"rb"); if(!f){ printf("[muon] no %s - momentum starts at zero\n",path); return; }
     char m[4]; int it=0; unsigned long long n=0;
-    if(fread(m,1,4,f)!=4||memcmp(m,"MUM1",4)||fread(&it,4,1,f)!=1||fread(&n,8,1,f)!=1||n!=(unsigned long long)np){
+    if(fread(m,1,4,f)!=4||memcmp(m,"MUM1",4)||fread(&it,4,1,f)!=1||fread(&n,8,1,f)!=1||n>(unsigned long long)np){
         fclose(f); fprintf(stderr,"[muon] %s: bad header or size - momentum starts at zero\n",path); return; }
     if(it!=start_iter){ fclose(f);   /* e.g. a stretch trained without Muon, or a failed save */
         fprintf(stderr,"[muon] %s is from iter %d but the optimizer state is from %d - momentum starts at zero\n",path,it,start_iter); return; }
-    float*h=(float*)malloc(np*4); int ok=h&&fread(h,4,np,f)==np; fclose(f);
+    float*h=(float*)calloc(np,4); int ok=h&&fread(h,4,(size_t)n,f)==(size_t)n; fclose(f);   /* n < np: looped model's extra norms */
     if(ok){ if(!gMuM) muon_alloc(np); ck(cudaMemcpy(gMuM,h,np*4,cudaMemcpyHostToDevice),"mu h2d");
             printf("[muon] loaded momentum %s (iter %d)\n",path,it); }
     else fprintf(stderr,"[muon] truncated %s - momentum starts at zero\n",path);
@@ -6250,7 +6255,7 @@ static int gpu_adam(float*P,float*G,bf16*M,bf16*V,size_t np,float lr,int t){
     MuSkip mu=MU_OFF;
     if(g_muon){
         if(!gMuM) muon_alloc(np);
-        mu.on=1; mu.l0=g_mu_l0; mu.per=g_mu_per; mu.L=gC.L; mu.D=gC.D; mu.a2r=g_mu_a2r;
+        mu.on=1; mu.l0=g_mu_l0; mu.per=g_mu_per; mu.L=gC.lp?gC.lp:gC.L; mu.D=gC.D; mu.a2r=g_mu_a2r;
     }
     KL(k_adamw,nblk(np,TPB),TPB)(P,G,M,V,np,lr,b1,b2,wd,bc1,bc2,
                                   g_lmul,g_lay0,g_layper,gC.L,mu,g_muon?NULL:gs);
@@ -7789,7 +7794,7 @@ static void cmd_train(int argc,char**argv){
                                 "               If the driver resets, lower CUDALM_BATCH or raise CUDALM_VRAM_RESERVE_MB.\n"); }
     { const char*qe=getenv("CUDALM_QLM"); g_qlm_on = qe ? atoi(qe)!=0 : 0; }
     /* default Muon steps aside where it is unsupported or untested; an explicit CUDALM_MUON=1 keeps the old errors */
-    if(g_muon && !g_muon_exp && (g_qlm_on||c.mod||c.lp)){ g_muon=0; printf("[cudalm train] Muon off (default) for a %s model: AdamW\n",g_qlm_on?"QLM":c.mod?"per-layer layout":"looped"); }
+    if(g_muon && !g_muon_exp && (g_qlm_on||c.mod)){ g_muon=0; printf("[cudalm train] Muon off (default) for a %s model: AdamW\n",g_qlm_on?"QLM":"per-layer layout"); }
     lm_setenv("CUDALM_QLM",g_qlm_on?"1":"0"); lm_setenv("CUDALM_MUON",g_muon?"1":"0");   /* pin both in the model config */
     /* CUDALM_QLM_FUSED=1 consumes each layer's gradients during the backward
      * pass, so G holds ONE layer instead of the whole model. Needs qlm, because
@@ -7806,8 +7811,8 @@ static void cmd_train(int argc,char**argv){
       if(pe && atoi(pe)!=0 && !g_fused)
           printf("[qlm] CUDALM_QLM_PSCRATCH ignored: needs CUDALM_QLM_FUSED=1\n"); }
     if(c.lp){
-        if(g_fused||g_muon||getenv("CUDALM_LR_BOOST_LAYERS")||env_i("CUDALM_ATTN_GATE",0)||env_i("CUDALM_SHARED_F",0)||(getenv("CUDALM_CANON")&&*getenv("CUDALM_CANON"))){
-            fprintf(stderr,"[loop] CUDALM_LOOP does not combine with QLM_FUSED, MUON, LR_BOOST_LAYERS, ATTN_GATE, SHARED_F or CANON\n"); exit(1); }
+        if(g_fused||getenv("CUDALM_LR_BOOST_LAYERS")||env_i("CUDALM_ATTN_GATE",0)||env_i("CUDALM_SHARED_F",0)||(getenv("CUDALM_CANON")&&*getenv("CUDALM_CANON"))){
+            fprintf(stderr,"[loop] CUDALM_LOOP does not combine with QLM_FUSED, LR_BOOST_LAYERS, ATTN_GATE, SHARED_F or CANON\n"); exit(1); }
         printf("[loop] depth %d from %d physical layers:",c.L,c.lp); for(int v=0;v<c.L;v++) printf(" %d",c.lmap[v]); printf("\n"); }
     ngram_setup(&c);
     { MemCfg m; mem_live(&m); side_write(mpath,&m); }

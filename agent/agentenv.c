@@ -9,7 +9,7 @@
  *   agentenv gen-tool <out.jsonl> <n>  [opts]   lookup (needs -store), compute, file/multi, none, recover
  *   agentenv gen-steps <out.jsonl> <n> [-seed S]   procedural step-by-step calc trajectories for SFT (no server)
  *   agentenv gen-arith <out.jsonl> <n> [-seed S -store arithmark.tsv]   one-step word problems (no server)
- *   agentenv arith <problems.jsonl> <rows.jsonl> [-n G -temp T]   GRPO rollouts, reward = correct first integer
+ *   agentenv arith <problems.jsonl> <rows.jsonl> [-n G -temp T -shape]   GRPO rollouts, reward = correct first integer (-shape: partial credit)
  *   agentenv traj  <tasks.jsonl> <out.jsonl> [opts]   teacher rollouts -> verified trajectories (student format)
  *   agentenv mkstore <in.jsonl|txt> <store.tsv> [words=120]  "text" docs -> title\tpassage lines for search
  * opts: -port N (8090) -teacher (wrap with the server's /apply-template chat template) -temp T -n samples
@@ -87,7 +87,7 @@ static double jgn(J *j, const char *k, double d){ J *v=jget(j,k); return v&&(v->
 
 /* ---------------- options ---------------- */
 static int o_port=8090, o_teacher=0, o_n=1, o_steps=6, o_max=384, o_v=0, o_trajout=0, o_student=0, o_all=0, o_mix[5]={70,60,70,50,50}; static double o_temp=-1; static unsigned long long o_seed=1;
-static const char *o_store=NULL; static int o_numf=0;   /* arith: ask the server for a number as the first token */
+static const char *o_store=NULL; static int o_numf=0, o_shape=0;   /* arith: ask the server for a number as the first token */
 static const char *PY(void){ const char *e=getenv("AGENT_PYTHON"); return e&&*e?e:"python"; }
 
 /* ---------------- HTTP ---------------- */
@@ -843,10 +843,12 @@ static void cmd_arith(const char *in, const char *outp){
     for(int i=0;i<n;i++){
         J *t=jload(L[i]); const char *pr=jgs(t,"prompt",""); int ans=(int)jgn(t,"answer",-1); char *gs[64]; double r[64], mu=0;
         complete_n(pr,8,temp,o_seed+(unsigned long long)i*1000003,ST,2,G,gs);
-        for(int g=0;g<G;g++){ const char *c=gs[g]; if(*c==' ') c++; r[g]=isdigit((unsigned char)*c)&&atoi(c)==ans; mu+=r[g]; }
-        okn+=(long)mu; mu/=G; int mix=mu>0&&mu<1; mixed+=mix;
+        int ok=0;
+        for(int g=0;g<G;g++){ const char *c=gs[g]; if(*c==' ') c++; int d=isdigit((unsigned char)*c)?abs(atoi(c)-ans):-1;
+            r[g]=d==0?1.0:d<0||!o_shape?0.0:0.5*exp(-d/(1.0+0.1*abs(ans))); ok+=d==0; mu+=r[g]; }   /* -shape: near misses earn up to 0.5 */
+        okn+=ok; mu/=G; int mix=0; for(int g=0;g<G;g++) if(fabs(r[g]-mu)>1e-6) mix=1; mixed+=mix;
         for(int g=0;g<G;g++){
-            if(mix){ Buf b={0}; bfmt(&b,"{\"i\":%d,\"r\":%.0f,\"w\":%.4f,\"cat\":\"%s\",\"text\":\"",i,r[g],r[g]-mu,jgs(t,"cat",""));
+            if(mix){ Buf b={0}; bfmt(&b,"{\"i\":%d,\"r\":%.3f,\"w\":%.4f,\"cat\":\"%s\",\"text\":\"",i,r[g],r[g]-mu,jgs(t,"cat",""));
                 besc(&b,pr); besc(&b,gs[g]); bstr(&b,".\"}\n"); fwrite(b.p,1,b.n,o); free(b.p); rows++; }
             free(gs[g]); }
         jfree(t); if((i&63)==63||i==n-1) fprintf(stderr,"\r[arith] %d/%d  pass %.1f%%  mixed groups %ld  rows %ld   ",i+1,n,100.0*okn/((double)(i+1)*G),mixed,rows);
@@ -878,7 +880,7 @@ int main(int argc, char **argv){
     if(argc<3){ fprintf(stderr,
         "usage: agentenv try \"<task>\" | tool <tasks> <out> | code <tasks> <out> | gen-code <out> <n> | gen-tool <out> <n> [-mix L,C,F,N,R] | gen-steps <out> <n>\n"
         "       | traj <tasks> <out> | group <tasks> <out> [-all] | tscore <rows> <out> | mkstore <in> <store.tsv> [words]\n"
-        "       | gen-arith <out> <n> [-store arithmark.tsv] | arith <problems> <rows> [-n G -temp T]\n"
+        "       | gen-arith <out> <n> [-store arithmark.tsv] | arith <problems> <rows> [-n G -temp T -shape]\n"
         "opts: -port N -teacher -temp T -n samples -seed S -store file -steps N -max N -v\n"); return 1; }
     char *pos[8]; int np=0;
     for(int i=1;i<argc;i++){
@@ -886,7 +888,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"-temp")&&i+1<argc) o_temp=atof(argv[++i]); else if(!strcmp(argv[i],"-n")&&i+1<argc) o_n=atoi(argv[++i]);
         else if(!strcmp(argv[i],"-seed")&&i+1<argc) o_seed=strtoull(argv[++i],0,10); else if(!strcmp(argv[i],"-store")&&i+1<argc) o_store=argv[++i];
         else if(!strcmp(argv[i],"-steps")&&i+1<argc) o_steps=atoi(argv[++i]); else if(!strcmp(argv[i],"-max")&&i+1<argc) o_max=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"-traj")) o_trajout=1; else if(!strcmp(argv[i],"-student")) o_student=1; else if(!strcmp(argv[i],"-all")) o_all=1; else if(!strcmp(argv[i],"-mix")&&i+1<argc) sscanf(argv[++i],"%d,%d,%d,%d,%d",o_mix,o_mix+1,o_mix+2,o_mix+3,o_mix+4); else if(!strcmp(argv[i],"-v")) o_v=1; else if(!strcmp(argv[i],"-vv")) o_v=2; else if(np<8) pos[np++]=argv[i]; }
+        else if(!strcmp(argv[i],"-traj")) o_trajout=1; else if(!strcmp(argv[i],"-student")) o_student=1; else if(!strcmp(argv[i],"-all")) o_all=1; else if(!strcmp(argv[i],"-mix")&&i+1<argc) sscanf(argv[++i],"%d,%d,%d,%d,%d",o_mix,o_mix+1,o_mix+2,o_mix+3,o_mix+4); else if(!strcmp(argv[i],"-shape")) o_shape=1; else if(!strcmp(argv[i],"-v")) o_v=1; else if(!strcmp(argv[i],"-vv")) o_v=2; else if(np<8) pos[np++]=argv[i]; }
     const char *cmd=pos[0];
     if(!strcmp(cmd,"mkstore")&&np>=3){ cmd_mkstore(pos[1],pos[2],np>3?atoi(pos[3]):120); return 0; }
     if(o_store) store_load(o_store);

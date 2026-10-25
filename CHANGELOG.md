@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-25
 
+- add(arith): adjust reward calculation for near misses
+- add(cudalm): fix looped model parameter reading
+- add(cudalm): adjust Muon loading for n < np
+- add(cudalm): adjust g_muon default for per-layer models
+
+## Unreleased - 2026-10-25
+
 - Add num_first support to cudalm serve
 - Add gen-arith and arith command handlers to agentenv
 - Update README.md with new commands
