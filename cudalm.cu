@@ -6719,9 +6719,12 @@ static void pstats(const Cfg*c,const MemCfg*m,int topk,const int*kl,int attg,PSt
         s->tbl=(double)S*((m->R+al-1)/al*al)*m->De;
         s->w=m->np*((double)S*m->De*c->D*(1+m->gate)+(m->conv?5.0*c->D:0)); s->mact=(double)S*m->De+s->w; }
     s->tot=s->bb+s->attg+s->tbl+s->w; s->act=s->bb-s->moe_off+s->attg+s->mact; }
+static const char*pcomma(double v){   /* exact count with thousands separators; 4 rotating buffers */
+    static char b[4][32]; static int r; char*o=b[r++&3], t[32]; int n=snprintf(t,sizeof t,"%.0f",v), k=0;
+    for(int i=0;i<n;i++){ if(i&&(n-i)%3==0) o[k++]=','; o[k++]=t[i]; } o[k]=0; return o; }
 static void pstats_print(const Cfg*c,const MemCfg*m,int topk,const int*kl,int attg){
     PStats s; pstats(c,m,topk,kl,attg,&s);
-    printf("  backbone    %9.2fM",s.bb/1e6);
+    printf("  backbone    %9.2fM %12s",s.bb/1e6,pcomma(s.bb));
     if(c->mod){ double ef=3.0*c->D*c->F, dn=0, mo=0, po=0; int PE=0;
         for(int l=0;l<c->L;l++){ int t=lyT(c,l); if(!t) dn+=3.0*c->D*lyF(c,l); else if(t==1) mo+=lyE(c,l)*ef; else PE=lyE(c,l); }
         po=PE*ef; printf("   layout:");
@@ -6731,19 +6734,19 @@ static void pstats_print(const Cfg*c,const MemCfg*m,int topk,const int*kl,int at
     else if(c->n_exp>0) printf("   %d experts%s, top-%d%s (%.2fM in experts)",c->n_exp,c->pool?" UniPool":"",topk,
                           kl&&kl[0]?" max, per-layer":"",(c->pool?1.0:c->L)*c->n_exp*3.0*c->D*c->F/1e6);
     printf("\n");
-    if(attg) printf("  attn gate   %9.2fM\n",s.attg/1e6);
-    if(m->mode==1) printf("  ngram       %9.2fM   table %.2fM (%d rows x %d, order %d%s, %s) + proj%s %.2fM at layer %d\n",
-        (s.tbl+s.w)/1e6,s.tbl/1e6,m->R,m->De,m->order,m->tri?"+tri":"",m->q4?"q4":"fp32",m->gate?"+gate":"",s.w/1e6,m->layer);
+    if(attg) printf("  attn gate   %9.2fM %12s\n",s.attg/1e6,pcomma(s.attg));
+    if(m->mode==1) printf("  ngram       %9.2fM %12s   table %.2fM (%d rows x %d, order %d%s, %s) + proj%s %.2fM at layer %d\n",
+        (s.tbl+s.w)/1e6,pcomma(s.tbl+s.w),s.tbl/1e6,m->R,m->De,m->order,m->tri?"+tri":"",m->q4?"q4":"fp32",m->gate?"+gate":"",s.w/1e6,m->layer);
     else if(m->mode==2){ char o[32]="", ly[48]=""; for(int i=0;i<m->no&&i<4;i++) snprintf(o+strlen(o),sizeof o-strlen(o),"%s%d",i?",":"",m->ord[i]);
         for(int i=0;i<m->np;i++) snprintf(ly+strlen(ly),sizeof ly-strlen(ly),"%s%d",i?",":"",m->lay[i]);
-        printf("  engram      %9.2fM   table %.2fM (%d heads x orders %s = %d sub-tables x %d rows x %d, %s)\n"
+        printf("  engram      %9.2fM %12s   table %.2fM (%d heads x orders %s = %d sub-tables x %d rows x %d, %s)\n"
                "                           + proj%s%s %.2fM at layers %s%s\n",
-            (s.tbl+s.w)/1e6,s.tbl/1e6,m->H,o,m->H*m->no,m->R,m->De,m->q4?"q4":"fp32",
+            (s.tbl+s.w)/1e6,pcomma(s.tbl+s.w),s.tbl/1e6,m->H,o,m->H*m->no,m->R,m->De,m->q4?"q4":"fp32",
             m->gate?"+gate":"",m->conv?"+conv":"",s.w/1e6,ly,m->canon?", canon map":""); }
     else printf("  ngram/engram off\n");
-    printf("  total       %9.2fM\n",s.tot/1e6);
-    printf("  active      %9.2fM / token  (backbone %.2fM + memory %.2fM; embedding %.2fM included)\n",
-           s.act/1e6,(s.bb-s.moe_off+s.attg)/1e6,s.mact/1e6,(double)c->V*c->D/1e6); }
+    printf("  total       %9.2fM %12s\n",s.tot/1e6,pcomma(s.tot));
+    printf("  active      %9.2fM %12s / token  (backbone %s + memory %s; embedding %s included)\n",
+           s.act/1e6,pcomma(s.act),pcomma(s.bb-s.moe_off+s.attg),pcomma(s.mact),pcomma((double)c->V*c->D)); }
 /* model config: every saved env var that is set, with the memory section written from m
  * so it is always complete (a resumed model whose .ng decided still gets its full config) */
 static void side_write(const char*mp,const MemCfg*m){

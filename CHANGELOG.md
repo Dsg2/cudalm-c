@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-25
 
+- Add static const char*pcomma(double v) function to format numbers with thousands separators
+- Update pstats_print to use pcomma for numeric values in stat lines
+- Modify stat output lines to append formatted numbers to existing values
+
+## Unreleased - 2026-10-25
+
 - Add memset to clear cuda config before parsing header fields in cudalm.cu
 - Prevent stack garbage from header parsing in cudalm.cu
 
