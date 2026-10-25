@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-25
 
+- Add num_first support to cudalm serve
+- Add gen-arith and arith command handlers to agentenv
+- Update README.md with new commands
+
+## Unreleased - 2026-10-25
+
 - Add static const char*pcomma(double v) function to format numbers with thousands separators
 - Update pstats_print to use pcomma for numeric values in stat lines
 - Modify stat output lines to append formatted numbers to existing values

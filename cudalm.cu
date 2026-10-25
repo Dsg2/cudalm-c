@@ -4545,12 +4545,16 @@ static void ng_build_touched(int N){
     ck(cudaMemcpyAsync(g_ng_cidxD,g_ng_hcidx,(size_t)N*4,cudaMemcpyHostToDevice,0),"ng cidx h2d");
     if(Gt) ck(cudaMemcpyAsync(g_ng_tgiD,g_ng_htgi,(size_t)Gt*4,cudaMemcpyHostToDevice,0),"ng tgi h2d");
 }
-static void ngram_forward(GA*a,const int*tokG,int N){
+/* dtw/dpos (decoder): keys from each slot's last tokens instead of the token rows */
+__global__ void k_dec_ngkey(const int*tokw,int*key,const int*pos,int B,int R,int order,int base);
+static void ngram_forward(GA*a,const int*tokG,int N,const int*dtw=NULL,const int*dpos=NULL){
     int De=g_ng_De, D=gC.D, nk=g_ng_tri?2:1, R=g_ng_R/nk;
     float*h=a->a_in[g_ng_layer];
     ngram_ensure(N);
-    KL(k_ngram_key,nblk(N,TPB),TPB)(tokG,g_ngkey,N,gC.T,R,g_ng_order,0);
-    if(g_ng_tri) KL(k_ngram_key,nblk(N,TPB),TPB)(tokG,g_ngkey+N,N,gC.T,R,g_ng_order+1,R);   /* (order+1)-gram half */
+    if(dtw){ KL(k_dec_ngkey,nblk(N,TPB),TPB)(dtw,g_ngkey,dpos,N,R,g_ng_order,0);
+        if(g_ng_tri) KL(k_dec_ngkey,nblk(N,TPB),TPB)(dtw,g_ngkey+N,dpos,N,R,g_ng_order+1,R); }
+    else { KL(k_ngram_key,nblk(N,TPB),TPB)(tokG,g_ngkey,N,gC.T,R,g_ng_order,0);
+        if(g_ng_tri) KL(k_ngram_key,nblk(N,TPB),TPB)(tokG,g_ngkey+N,N,gC.T,R,g_ng_order+1,R); }   /* (order+1)-gram half */
     kchk("ng key",-1);
     KL(k_ngram_gather,nblk((size_t)N*De,TPB),TPB)(g_ng,g_ngkey,g_ngbuf,N,De,nk); kchk("ng gather",-1);
     g_ab(g_ngbuf,g_ngW,g_ngproj,N,De,D);            /* ngproj[N,D]=buf@Wng */
@@ -6812,6 +6816,14 @@ __global__ void k_dec_canon(const float*x,const float*K,float*y,float*ring,const
     int b=(int)(i/D), d=(int)(i%D), p=pos[b], lo=ds?ds[b]:0; float xv=x[i], s=xv+K[d]*xv; float*r=ring+(size_t)b*4*D;
     for(int j=1;j<4;j++) if(p-j>=lo) s+=K[j*D+d]*r[(size_t)((p-j)&3)*D+d];
     r[(size_t)(p&3)*D+d]=xv; y[i]=s; }
+/* decoder: the same key from the slot's last tokens (tokw[b*4+3] = current), pos = position in the sequence */
+__global__ void k_dec_ngkey(const int*tokw,int*key,const int*pos,int B,int R,int order,int base){
+    int b=(int)(blockIdx.x*blockDim.x+threadIdx.x); if(b>=B)return;
+    if(pos[b]<order-1){ key[b]=-1; return; }
+    unsigned h=2166136261u;
+    for(int j=order-1;j>=0;j--) h=(h^(unsigned)tokw[b*4+3-j])*16777619u;
+    h^=h>>15;
+    key[b]=base+(int)(h%(unsigned)R); }
 __global__ void k_dec_egkey(const int*tokw,const unsigned short*cn,int*key,const int*pos,int B,int S,int Rp){
     int i=(int)(blockIdx.x*blockDim.x+threadIdx.x); if(i>=S*B) return;
     int s=i/B, b=i%B, o=c_eg_ord[s];
@@ -6870,7 +6882,7 @@ __global__ void __launch_bounds__(1024) k_dec_sample(const float*logits,int V,co
     for(int i=0;i<k;i++){ u-=__expf((sv[i]-sv[0])*it); if(u<=0){ pick=i; break; } }
     out[s]=si[pick]; lp[s]=sv[pick]-ls; }
 
-static int dec_ok(void){ return !g_ngram_on && !g_pscratch && gC.hd<=2*WARP; }
+static int dec_ok(void){ return (!g_ngram_on||g_ng_order+g_ng_tri<=4) && !g_pscratch && gC.hd<=2*WARP; }   /* tokw keeps 4 tokens */
 static Dec* dec_new(int B,int Tm){
     Dec*d=(Dec*)calloc(1,sizeof(Dec)); int L=gC.L,D=gC.D,KD=gC.KD; d->B=B; d->Tm=Tm; d->R=3*g_eg_dil+1;
     d->K=(float**)calloc(L,sizeof(float*)); d->V=(float**)calloc(L,sizeof(float*)); d->cA=(float**)calloc(L,sizeof(float*)); d->cC=(float**)calloc(L,sizeof(float*));
@@ -6923,8 +6935,10 @@ static void dec_step(Dec*d,const float*P,const Off*o,GA*a,int N,int sample){
     KL(k_embed,nblk((size_t)N*D,TPB),TPB)(P,rd->emb,d->tok,a->a_in[0],N,D);
     if(g_rpre){ rpre_ga(N); ck(cudaMemset(g_egc,0,(size_t)N*D*4),"egc0"); }
     if(g_eg_on) dec_eg(d,a,N,0);
+    if(g_ngram_on&&!g_ng_layer) ngram_forward(a,NULL,N,d->tokw,d->pos);
     for(int l=0;l<gC.L;l++){
         if(g_eg_on&&l) dec_eg(d,a,N,l);
+        if(g_ngram_on&&l&&l==g_ng_layer) ngram_forward(a,NULL,N,d->tokw,d->pos);
         e_rmsf(a->a_in[l],P,rd->an1[l],g_canA?a->cna[l]:a->a_norm[l],a->r1[l],N,D);
         if(g_canA) KL(k_dec_canon,nblk((size_t)N*D,TPB),TPB)(a->cna[l],XCAN(g_xP,l,0),a->a_norm[l],d->cA[l],d->pos,dsp,N,D);
         g_ab(a->a_norm[l],P+rd->wq[l],a->qh[l],N,D,D);
@@ -6976,7 +6990,7 @@ static int cmd_decheck(int argc,char**argv){
     char path[1024]; model_path(argv[2],path,sizeof(path)); FILE*e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
     Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk); gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
     size_t np=param_count(&c); float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P"); rope_tables(&c);
-    if(!dec_ok()){ fprintf(stderr,"decheck: legacy ngram / QLM scratch not supported by the decoder\n"); return 1; }
+    if(!dec_ok()){ fprintf(stderr,"decheck: ngram order > 4 / QLM scratch not supported by the decoder\n"); return 1; }
     int n=argc>3?atoi(argv[3]):200, k=argc>4?atoi(argv[4]):40; if(n+k>c.T){ n=c.T-k; }
     GA*a=ga_new(c.T,0); int*tokG=(int*)dmalloc((size_t)c.T*4);
     int*ids=(int*)malloc(sizeof(int)*2*(n+k)); uint64_t r=12345;
@@ -7211,7 +7225,7 @@ static void cmd_run(int argc,char**argv){
 
 /* ===================== serve ============================================ */
 /* cudalm serve <model> [port=8090]: a llama-server-compatible subset for agentenv/evals.
- * POST /completion {"prompt","n_predict","temperature","top_k","top_p","seed","stop":[..]} -> {"content",
+ * POST /completion {"prompt","n_predict","temperature","top_k","top_p","seed","stop":[..],"num_first"} -> {"content",
  * "tokens_predicted","stop_type":"eos|word|limit","stopped_eos","nll"}; GET /health; POST /shutdown (clean exit, never kill a CUDA process). Raw prompt (no template),
  * concurrent clients: continuous batching on the KV-cache decoder (CUDALM_SERVE_SLOTS, default 64), else one request at a
  * time with a full-context forward per token like `run`. Winsock is loaded at run time. */
@@ -7256,7 +7270,7 @@ static const char* js_key(const char*j,const char*k){
     char q[80]; snprintf(q,sizeof q,"\"%s\"",k); const char*p=strstr(j,q); if(!p) return NULL;
     p+=strlen(q); while(*p==' '||*p==':'||*p=='\n'||*p=='\r'||*p=='\t') p++; return p; }
 static double js_num(const char*j,const char*k,double d){ const char*p=js_key(j,k); return p&&(*p=='-'||(*p>='0'&&*p<='9'))?atof(p):d; }
-typedef struct { char*prompt,*stops[16]; int npred,n,topk,ns,greedy; float temp,topp; double sd; } SReq;
+typedef struct { char*prompt,*stops[16]; int npred,n,topk,ns,greedy,numf; float temp,topp; double sd; } SReq;
 static void sreq_parse(const char*body,SReq*r,int T,int nmax){
     memset(r,0,sizeof *r); const char*pp=js_key(body,"prompt"); r->prompt=pp&&*pp=='"'?js_str(pp+1,NULL):strdup("");
     r->npred=(int)js_num(body,"n_predict",js_num(body,"max_tokens",128)); if(r->npred<0) r->npred=T;
@@ -7265,7 +7279,16 @@ static void sreq_parse(const char*body,SReq*r,int T,int nmax){
     const char*sp=js_key(body,"stop");
     if(sp&&*sp=='"') r->stops[r->ns++]=js_str(sp+1,NULL);
     else if(sp&&*sp=='[') for(sp++;*sp&&*sp!=']'&&r->ns<16;){ if(*sp=='"'){ r->stops[r->ns]=js_str(sp+1,&sp); if(*r->stops[r->ns]) r->ns++; } else sp++; }
-    r->n=(int)js_num(body,"n",1); if(r->n<1) r->n=1; if(r->n>nmax) r->n=nmax; }
+    r->n=(int)js_num(body,"n",1); if(r->n<1) r->n=1; if(r->n>nmax) r->n=nmax;
+    r->numf=js_num(body,"num_first",0)!=0; }
+/* "num_first":1 -> the first sampled token is a number token (" 42", "7"): -inf on every other logit of prefill row 0 */
+static void num_mask(GA*a,const Tok*tk){
+    static float*m=NULL; int V=gC.V;
+    if(!m){ float*h=(float*)malloc((size_t)V*4);
+        for(int i=0;i<V;i++){ const unsigned char*t=tk->dec[i]; int n=tk->declen[i], j=n&&t[0]==' ', ok=j<n;
+            for(int k=j;k<n;k++) ok&=t[k]>='0'&&t[k]<='9'; h[i]=ok?0.0f:-1e30f; }
+        m=(float*)dmalloc((size_t)V*4); ck(cudaMemcpy(m,h,(size_t)V*4,cudaMemcpyHostToDevice),"nmask"); free(h); }
+    e_add(a->logits,m,(size_t)V); }
 static void sreq_free(SReq*r){ free(r->prompt); for(int q=0;q<r->ns;q++) free(r->stops[q]); }
 /* append token text; 1 if a stop string now appears (text cut before it) */
 static int sv_emit(SBuf*g,const Tok*tk,int t,const SReq*r){
@@ -7377,7 +7400,7 @@ static void sv_batched(Dec*dc,const float*P,const Off*o,GA*a,int*tokG,const Cfg*
             unsigned long long base=R->r.sd>=0?(unsigned long long)R->r.sd:(unsigned long long)urand64();
             for(int b=0;b<R->r.n;b++){ DSP q={R->r.greedy?0.f:R->r.temp,R->r.topp,R->r.topk,base+(unsigned long long)b*7919ULL,0};
                 dc->hsp[N+b]=q; Slot s={R,b,0,0}; sl[N+b]=s; }
-            dec_prefill(dc,P,o,a,tokG,ids,pn,N,R->r.n); dec_sample_rows(dc,a,N,R->r.n); N+=R->r.n; free(ids); }
+            dec_prefill(dc,P,o,a,tokG,ids,pn,N,R->r.n); if(R->r.numf) num_mask(a,tk); dec_sample_rows(dc,a,N,R->r.n); N+=R->r.n; free(ids); }
         if(!N){ if(quit) break; WaitForSingleObject(g_sqe,50); continue; }
         for(int b=0;b<N;b++){                             /* consume the sampled tokens */
             Slot*s=&sl[b]; BReq*R=s->r; int k=s->k, nxt=dc->hotok[b], fin=0; R->nll[k]-=dc->holp[b]; s->cnt++; ntok++;

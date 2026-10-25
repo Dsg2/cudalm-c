@@ -8,6 +8,8 @@
  *   agentenv gen-code <out.jsonl> <n>  [opts]   teacher writes tasks; kept if its solution passes and a stub fails
  *   agentenv gen-tool <out.jsonl> <n>  [opts]   lookup (needs -store), compute, file/multi, none, recover
  *   agentenv gen-steps <out.jsonl> <n> [-seed S]   procedural step-by-step calc trajectories for SFT (no server)
+ *   agentenv gen-arith <out.jsonl> <n> [-seed S -store arithmark.tsv]   one-step word problems (no server)
+ *   agentenv arith <problems.jsonl> <rows.jsonl> [-n G -temp T]   GRPO rollouts, reward = correct first integer
  *   agentenv traj  <tasks.jsonl> <out.jsonl> [opts]   teacher rollouts -> verified trajectories (student format)
  *   agentenv mkstore <in.jsonl|txt> <store.tsv> [words=120]  "text" docs -> title\tpassage lines for search
  * opts: -port N (8090) -teacher (wrap with the server's /apply-template chat template) -temp T -n samples
@@ -85,7 +87,7 @@ static double jgn(J *j, const char *k, double d){ J *v=jget(j,k); return v&&(v->
 
 /* ---------------- options ---------------- */
 static int o_port=8090, o_teacher=0, o_n=1, o_steps=6, o_max=384, o_v=0, o_trajout=0, o_student=0, o_all=0, o_mix[5]={70,60,70,50,50}; static double o_temp=-1; static unsigned long long o_seed=1;
-static const char *o_store=NULL;
+static const char *o_store=NULL; static int o_numf=0;   /* arith: ask the server for a number as the first token */
 static const char *PY(void){ const char *e=getenv("AGENT_PYTHON"); return e&&*e?e:"python"; }
 
 /* ---------------- HTTP ---------------- */
@@ -125,7 +127,8 @@ static char *complete(const char *prompt, int npred, double temp, unsigned long 
 /* n samples of one prompt: one batched request when the server returns "results" (cudalm serve), else n requests */
 static void complete_n(const char *prompt, int npred, double temp, unsigned long long seed, const char **stops, int ns, int n, char **outs){
     Buf b={0}; bstr(&b,"{\"prompt\":\""); besc(&b,prompt);
-    bfmt(&b,"\",\"n\":%d,\"n_predict\":%d,\"temperature\":%.3f,\"top_p\":0.95,\"top_k\":40,\"seed\":%llu,\"stop\":[",n,npred,temp,seed%2000000000ULL);
+    bfmt(&b,"\",%s\"n\":%d,\"n_predict\":%d,\"temperature\":%.3f,\"top_p\":0.95,\"top_k\":40,\"seed\":%llu,\"stop\":[",
+         o_numf?"\"num_first\":1,":"",n,npred,temp,seed%2000000000ULL);
     for(int i=0;i<ns;i++){ bstr(&b,i?",\"":"\""); besc(&b,stops[i]); bstr(&b,"\""); }
     bstr(&b,o_teacher?"],\"special\":true}":"]}");
     char *r=post("/completion",b.p); free(b.p);
@@ -795,6 +798,60 @@ static void cmd_group(const char *in, const char *outp){
     }
     fclose(o); fprintf(stderr,"\n");
 }
+/* gen-arith: procedural one-step word problems ending mid-sentence before the answer (ArithMark-3 style skills,
+ * own wording); -store <arithmark.tsv> drops any prompt identical to a test item. -> {"prompt","answer","cat"} */
+static const char *AN[]={"Nora","Felix","Iris","Omar","Zoe","Ravi","Lena","Tomas","Mei","Arlo","Dina","Kofi","Sara","Bruno","Hana","Ilya","June","Pablo","Rosa","Wes"};
+static const char *AO[][2]={{"pebble","pebbles"},{"sticker","stickers"},{"acorn","acorns"},{"card","cards"},{"shell","shells"},{"block","blocks"},
+    {"ribbon","ribbons"},{"stamp","stamps"},{"cookie","cookies"},{"bead","beads"},{"crayon","crayons"},{"coin","coins"},{"leaf","leaves"},{"book","books"},{"toy car","toy cars"}};
+static unsigned long long rs2=88172645463325252ULL;
+static unsigned r2(unsigned n){ rs2^=rs2<<13; rs2^=rs2>>7; rs2^=rs2<<17; return (unsigned)((rs2>>11)%n); }
+static int ri(int lo,int hi){ return lo+(int)r2((unsigned)(hi-lo+1)); }
+static int arith_one(Buf *p, int *ans, const char **cat){
+    const char *a=AN[r2(20)], *b=AN[r2(20)]; while(b==a) b=AN[r2(20)];
+    int oi=r2(15); const char *os=AO[oi][0], *op=AO[oi][1]; int x,y,k; p->n=0; bput(p,"",0);
+    switch(r2(16)){
+    case 0: x=ri(5,120); y=ri(2,80); *ans=x+y; *cat="add"; if(r2(2)) bfmt(p,"%s had %d %s and found %d more. Now %s has",a,x,op,y,a); else bfmt(p,"%s collected %d %s. Later %s got %d more. In total, %s had",a,x,op,a,y,a); break;
+    case 1: x=ri(10,150); y=ri(1,x); *ans=x-y; *cat="sub"; if(r2(2)) bfmt(p,"%s had %d %s and gave away %d. %s still had",a,x,op,y,a); else bfmt(p,"There were %d %s in a jar. %s took out %d. The jar then held",x,op,a,y); break;
+    case 2: x=ri(10,140); y=ri(1,30); *ans=x+y; *cat="more"; bfmt(p,"%s has %d %s. %s has %d more %s than %s. So %s has",a,x,op,b,y,op,a,b); break;
+    case 3: x=ri(10,140); y=ri(1,x-1>30?30:x-1); *ans=x-y; *cat="fewer"; bfmt(p,"%s owns %d %s. %s owns %d fewer than %s. So %s owns",a,x,op,b,y,a,b); break;
+    case 4: x=ri(10,99); y=ri(1,x-1); *ans=x-y; *cat="diff"; bfmt(p,"%s scored %d points and %s scored %d points. %s scored more by",a,x,b,y,a); break;
+    case 5: x=ri(5,95); y=x+ri(1,120); *ans=y-x; *cat="change"; bfmt(p,"%s paid %d cents for a snack that cost %d cents. %s got back",a,y,x,a); break;
+    case 6: x=ri(2,12); y=ri(2,12); *ans=x*y; *cat="mul"; if(r2(2)) bfmt(p,"%s made %d bags with %d %s in each bag. Altogether there were",a,x,y,op); else bfmt(p,"%s read %d pages a day for %d days. In all, %s read",a,x,y,a); break;
+    case 7: y=ri(2,10); k=ri(2,12); x=y*k; *ans=k; *cat="div"; if(r2(2)) bfmt(p,"%s split %d %s equally into %d piles. Each pile had",a,x,op,y); else bfmt(p,"%d %s were shared equally by %d children. Each child got",x,op,y); break;
+    case 8: x=ri(2,15); y=ri(2,15); *ans=x*y; *cat="area"; bfmt(p,"A garden bed is %d meters long and %d meters wide. Its area is",x,y); break;
+    case 9: x=ri(2,30); y=ri(2,30); *ans=2*(x+y); *cat="perim"; bfmt(p,"A rectangle has sides of %d cm and %d cm. Its perimeter is",x,y); break;
+    case 10: x=ri(1,60); k=ri(2,9); *ans=x+3*k; *cat="pattern"; bfmt(p,"The numbers go %d, %d, %d, and so on. The next number is",x,x+k,x+2*k); break;
+    case 11: x=ri(40,99); k=ri(2,9); *ans=x-3*k; *cat="pattern"; bfmt(p,"Count back: %d, %d, %d. The next number is",x,x-k,x-2*k); break;
+    case 12: x=ri(20,150); y=ri(1,x/2); k=ri(1,x-y); *ans=x-y-k; *cat="two-step"; bfmt(p,"A box held %d %s. %s took %d and %s took %d. The box then held",x,op,a,y,b,k); break;
+    case 13: x=ri(10,90); y=ri(10,90); *ans=x+y; *cat="length"; bfmt(p,"One rope is %d cm long and another is %d cm long. End to end, they measure",x,y); break;
+    case 14: x=ri(2,9); y=ri(2,9); k=ri(1,9); *ans=x*y+k; *cat="mul-add"; bfmt(p,"%s had %d rows of %d %s plus %d extra. In total, %s had",a,x,y,op,k,a); break;
+    default: x=ri(3,20); y=ri(1,x); *ans=x-y; *cat="pieces"; bfmt(p,"A pizza was cut into %d slices and %d were eaten. The slices left were",x,y); break; }
+    (void)os; return 1; }
+static void cmd_genarith(const char *outp, int n){
+    int nt=0; char **T=o_store?read_lines(o_store,&nt):NULL; rs2^=o_seed*0x9E3779B97F4A7C15ULL; r2(2);
+    FILE *o=fopen(outp,"wb"); int k=0, drop=0; Buf p={0};
+    while(k<n){ int ans; const char *cat; arith_one(&p,&ans,&cat); int hit=0;
+        for(int i=0;i<nt&&!hit;i++){ char *t=strchr(T[i],'\t'); if(t){ size_t L=strcspn(t+1,"\t"); hit=L==p.n&&!memcmp(t+1,p.p,L); } }
+        if(hit){ drop++; continue; }
+        Buf b={0}; bstr(&b,"{\"prompt\":\""); besc(&b,p.p); bfmt(&b,"\",\"answer\":%d,\"cat\":\"%s\"}\n",ans,cat); fwrite(b.p,1,b.n,o); free(b.p); k++; }
+    fclose(o); printf("[gen-arith] %d problems -> %s (%d test duplicates dropped)\n",k,outp,drop); }
+/* arith GRPO rollouts: -n G samples per problem (raw prompt, no template), reward 1 if the first integer of the
+ * completion equals "answer" (the server forces a number first token, "num_first"); mixed groups -> rows {"text": prompt+completion+".", "w": r-mean} (Dr. GRPO) */
+static void cmd_arith(const char *in, const char *outp){
+    int n; char **L=read_lines(in,&n); FILE *o=fopen(outp,"ab"); double temp=o_temp<0?1.0:o_temp; int G=o_n<2?8:o_n>64?64:o_n;
+    static const char *ST[]={".","\n"}; long rows=0, mixed=0, okn=0; o_numf=1;
+    for(int i=0;i<n;i++){
+        J *t=jload(L[i]); const char *pr=jgs(t,"prompt",""); int ans=(int)jgn(t,"answer",-1); char *gs[64]; double r[64], mu=0;
+        complete_n(pr,8,temp,o_seed+(unsigned long long)i*1000003,ST,2,G,gs);
+        for(int g=0;g<G;g++){ const char *c=gs[g]; if(*c==' ') c++; r[g]=isdigit((unsigned char)*c)&&atoi(c)==ans; mu+=r[g]; }
+        okn+=(long)mu; mu/=G; int mix=mu>0&&mu<1; mixed+=mix;
+        for(int g=0;g<G;g++){
+            if(mix){ Buf b={0}; bfmt(&b,"{\"i\":%d,\"r\":%.0f,\"w\":%.4f,\"cat\":\"%s\",\"text\":\"",i,r[g],r[g]-mu,jgs(t,"cat",""));
+                besc(&b,pr); besc(&b,gs[g]); bstr(&b,".\"}\n"); fwrite(b.p,1,b.n,o); free(b.p); rows++; }
+            free(gs[g]); }
+        jfree(t); if((i&63)==63||i==n-1) fprintf(stderr,"\r[arith] %d/%d  pass %.1f%%  mixed groups %ld  rows %ld   ",i+1,n,100.0*okn/((double)(i+1)*G),mixed,rows);
+    }
+    fclose(o); fprintf(stderr,"\n"); printf("[arith] %d problems x %d: pass %.2f%%, mixed groups %ld, rows %ld\n",n,G,100.0*okn/((double)n*G),mixed,rows); }
 /* teacher scoring for on-policy distillation: each row's transcript (text from a0) is scored by the teacher's /score
  * under its own chat template (system SYS + user prompt); adds "tl" (teacher token byte lengths) and "tp" (log p) */
 static void cmd_tscore(const char *in, const char *outp){
@@ -821,6 +878,7 @@ int main(int argc, char **argv){
     if(argc<3){ fprintf(stderr,
         "usage: agentenv try \"<task>\" | tool <tasks> <out> | code <tasks> <out> | gen-code <out> <n> | gen-tool <out> <n> [-mix L,C,F,N,R] | gen-steps <out> <n>\n"
         "       | traj <tasks> <out> | group <tasks> <out> [-all] | tscore <rows> <out> | mkstore <in> <store.tsv> [words]\n"
+        "       | gen-arith <out> <n> [-store arithmark.tsv] | arith <problems> <rows> [-n G -temp T]\n"
         "opts: -port N -teacher -temp T -n samples -seed S -store file -steps N -max N -v\n"); return 1; }
     char *pos[8]; int np=0;
     for(int i=1;i<argc;i++){
@@ -833,7 +891,7 @@ int main(int argc, char **argv){
     if(!strcmp(cmd,"mkstore")&&np>=3){ cmd_mkstore(pos[1],pos[2],np>3?atoi(pos[3]):120); return 0; }
     if(o_store) store_load(o_store);
     if(!strcmp(cmd,"search")&&np>=2){ Buf b={0}; DWORD t=GetTickCount(); tool_search(pos[1],&b); printf("%s\n(%lu ms)\n",b.p?b.p:"",(unsigned long)(GetTickCount()-t)); return 0; }
-    int gen=(!strncmp(cmd,"gen-",4)&&strcmp(cmd,"gen-steps"))||!strcmp(cmd,"traj")||!strcmp(cmd,"tscore");
+    int gen=(!strncmp(cmd,"gen-",4)&&strcmp(cmd,"gen-steps")&&strcmp(cmd,"gen-arith"))||!strcmp(cmd,"traj")||!strcmp(cmd,"tscore");
     if(gen&&!o_student) o_teacher=1;
     if(o_teacher) get_templates();
     if(!strcmp(cmd,"try")){ J *t=calloc(1,sizeof(J)); t->t='o'; Buf b={0}; bstr(&b,"{\"prompt\":\""); besc(&b,pos[1]); bstr(&b,"\"}"); jfree(t); t=jload(b.p);
@@ -846,5 +904,7 @@ int main(int argc, char **argv){
     if(!strcmp(cmd,"traj")&&np>=3){ if(o_n<1) o_n=1; cmd_traj(pos[1],pos[2]); return 0; }
     if(!strcmp(cmd,"group")&&np>=3){ cmd_group(pos[1],pos[2]); return 0; }
     if(!strcmp(cmd,"tscore")&&np>=3){ cmd_tscore(pos[1],pos[2]); return 0; }
+    if(!strcmp(cmd,"gen-arith")&&np>=3){ cmd_genarith(pos[1],atoi(pos[2])); return 0; }
+    if(!strcmp(cmd,"arith")&&np>=3){ cmd_arith(pos[1],pos[2]); return 0; }
     fprintf(stderr,"bad command\n"); return 1;
 }

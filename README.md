@@ -101,7 +101,8 @@ cudalm lmeval-vs <A.items.tsv> <B.items.tsv>       paired per-item comparison of
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>
-cudalm serve     <name> [port=8090]                  HTTP /completion for agentenv (continuous batching, CUDALM_SERVE_SLOTS)
+cudalm serve     <name> [port=8090]                  HTTP /completion for agentenv (continuous batching, CUDALM_SERVE_SLOTS;
+                                                     "num_first":1 forces a number as the first sampled token)
 cudalm data      <fetch|tokenizer|encode|mix|info|canon> ...
 cudalm help                                        all commands + every environment variable
 ```
