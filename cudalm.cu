@@ -6642,6 +6642,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_FP8_DBG","0","per-run","FP8 debug",1},
  {"CUDALM_QLM_DIAG","","per-run","QLM diagnostics",1},
  {"CUDALM_MASK_DUMP","","per-run","dump the loss mask",1},
+ {"CUDALM_EVAL_AT","","per-run","eval: file of train.bin token offsets to score one window each",1},
+ {"CUDALM_EVAL_OUT","","per-run","eval: output TSV for CUDALM_EVAL_AT (offset, mean loss)",1},
  {"CUDALM_DATA_ROOTS","","per-run","data roots for bare corpus names (;-separated; default <exe>\\data;<exe>\\prep\\data + data_roots.txt)",1},
  {"CUDALM_PYTHON","","per-run","python used by `data fetch` (default: py -3)",1},
  {0,0,0,0,0}};
@@ -8383,7 +8385,9 @@ static void cmd_eval(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
         "usage: cudalm eval <name|model.bin> <data_dir> [batches] [batch_size]\n"
         "  forward-only: mean val loss + per-layer MoE expert utilisation.\n"
-        "  Safe to run while training is in progress.\n"); exit(1); }
+        "  Safe to run while training is in progress.\n"
+        "  CUDALM_EVAL_AT=<file of token offsets> scores those T-token windows of train.bin instead\n"
+        "  (batches = all of them) and writes 'offset<TAB>mean loss' rows to CUDALM_EVAL_OUT.\n"); exit(1); }
     char path[1024]; model_path(argv[2],path,sizeof(path));
     FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
     Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk);
@@ -8391,11 +8395,21 @@ static void cmd_eval(int argc,char**argv){
     int nb=argc>4?atoi(argv[4]):20; if(nb<1)nb=1;
     int B =argc>5?atoi(argv[5]):1;  if(B<1)B=1;
     char p[1024]; size_t nval=0; uint16_t*vl=NULL;
+    /* CUDALM_EVAL_AT: per-window scoring of fixed train.bin offsets (data filtering probes) */
+    size_t nat=0,*at=NULL; FILE*atf=NULL,*ato=NULL;
+    if(getenv("CUDALM_EVAL_AT")){ FILE*f=fopen(getenv("CUDALM_EVAL_AT"),"r"); if(!f){perror(getenv("CUDALM_EVAL_AT"));exit(1);}
+        size_t cap=1<<16; at=(size_t*)malloc(cap*8); unsigned long long x;
+        while(fscanf(f,"%llu",&x)==1){ if(nat==cap) at=(size_t*)realloc(at,(cap*=2)*8); at[nat++]=(size_t)x; } fclose(f);
+        snprintf(p,sizeof(p),"%s/train.bin",argv[3]); atf=fopen(p,"rb");
+        const char*op=getenv("CUDALM_EVAL_OUT"); ato=fopen(op?op:"evalat.tsv","w");
+        if(!nat||!atf||!ato){ fprintf(stderr,"[eval] CUDALM_EVAL_AT: no offsets, no %s or bad CUDALM_EVAL_OUT\n",p); exit(1); } }
+    if(atf){ vl=(uint16_t*)malloc(((size_t)c.T+1)*2); nval=0; } else {
     snprintf(p,sizeof(p),"%s/val.bin",argv[3]);
     { size_t s; uint8_t*b=read_file(p,&s); if(b){ vl=(uint16_t*)b; nval=s/2; } }
     if(!vl){ snprintf(p,sizeof(p),"%s/train.bin",argv[3]);
              size_t s; uint8_t*b=read_file(p,&s); if(!b){fprintf(stderr,"no val.bin or train.bin in %s\n",argv[3]);exit(1);}
-             vl=(uint16_t*)b; nval=s/2; printf("[eval] val.bin missing, using train.bin\n"); }
+             vl=(uint16_t*)b; nval=s/2; printf("[eval] val.bin missing, using train.bin\n"); } }
+    if(atf) nb=(int)((nat+B-1)/B);
     gC=c; cuda_init(); Off o; calc_offsets(&c,&o);
     ngram_infer(path);
     size_t np=param_count(&c);
@@ -8430,12 +8444,17 @@ static void cmd_eval(int argc,char**argv){
     double tot_a=0; size_t n_a=0;
     g_rng=12345;                            /* fixed seed: comparable across runs */
     for(int b=0;b<nb;b++){
-        for(int i=0;i<B;i++){ size_t st=((size_t)(urand()*4294967296.0))%(nval-span);
+        for(int i=0;i<B;i++){ size_t st;
+            if(atf){ size_t k=(size_t)b*B+i; if(k>=nat) k=nat-1; lm_fseek64(atf,(long long)at[k]*2,SEEK_SET);
+                if(fread(vl,2,(size_t)c.T+1,atf)!=(size_t)c.T+1){ fprintf(stderr,"[eval] offset %zu past the end\n",at[k]); exit(1); } st=0; }
+            else st=((size_t)(urand()*4294967296.0))%(nval-span);
             for(int j=0;j<c.T;j++){ int r=i*c.T+j; tok[r]=vl[st+j]; tgt[r]=vl[st+j+1]; } }
         ck(cudaMemcpy(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice),"tok h2d");
         ck(cudaMemcpy(tgtG,tgt,(size_t)N*4,cudaMemcpyHostToDevice),"tgt h2d");
         gpu_forward(P,&o,a,tokG);
         tot += gpu_loss(P,&o,a,tgtG,N,lp);
+        if(ato) for(int i=0;i<B&&(size_t)b*B+i<nat;i++){ double r=0; for(int j=0;j<c.T;j++) r+=lp[i*c.T+j];
+            fprintf(ato,"%zu\t%.5f\n",at[(size_t)b*B+i],r/c.T); }
         if(can_mask){
             memcpy(tm,tgt,(size_t)N*4);
             for(int i=0;i<B;i++) mask_apply(&ms,tok+(size_t)i*c.T,tm+(size_t)i*c.T,c.T,c.eot);
@@ -8454,6 +8473,7 @@ static void cmd_eval(int argc,char**argv){
                 for(int x=0;x<El;x++){ ecount[(size_t)l*E+x] += off[x+1]-off[x]; if(!k) e0[(size_t)l*E+x] += off[x+1]-off[x]; } } }
         if((b+1)%10==0){ printf("  %d/%d batches\n",b+1,nb); fflush(stdout); }
     }
+    if(ato){ fclose(ato); fclose(atf); printf("[eval] %zu windows scored -> %s\n",nat,getenv("CUDALM_EVAL_OUT")?getenv("CUDALM_EVAL_OUT"):"evalat.tsv"); }
     double mean=tot/nb;
     printf("\n[eval] val loss %.4f   perplexity %.2f   (%d batches x %d tokens)\n",
            mean, exp(mean), nb, N);

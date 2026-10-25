@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-10-25
 
+- Add filtering plan and new pipeline scripts
+
+## Unreleased - 2026-10-25
+
 - add(arith): adjust reward calculation for near misses
 - add(cudalm): fix looped model parameter reading
 - add(cudalm): adjust Muon loading for n < np
