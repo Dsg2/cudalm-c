@@ -2424,7 +2424,7 @@ static float g_auxlm[64],g_biaslm[64]; static int g_auxlm_n=0,g_biaslm_n=0;
 #define LMUL(v,n,l) ((l)<(n)?(v)[l]:1.0f)
 static int parse_flist(const char*s,float*v,int max){ int n=0; while(s&&*s&&n<max){ v[n++]=(float)atof(s); s=strchr(s,','); if(s)s++; } return n; }
 static double g_sk_r[2]; static long g_sk_n[2],g_rb_mv,g_rb_tot;
-static unsigned short*g_kdI=0,*g_kdP=0; static int g_kdK=0; static float g_kda=0.f;   /* CUDALM_KD, see k_kd_adj (GPU only) */
+static unsigned short*g_kdI=0,*g_kdP=0; static int g_kdK=0,g_kdrn=0; static float g_kda=0.f;   /* CUDALM_KD, see k_kd_adj (GPU only) */
 #ifndef CUDALM_CPU
 __global__ void k_router_top1(const float*rt,float*rprobs,int*assign,float*gate,int N,int E,const float*bias){
     int n=blockIdx.x*blockDim.x+threadIdx.x; if(n>=N)return;
@@ -2645,14 +2645,17 @@ __global__ void k_sce_h8(const __half*lg,const int*tgt,float*loss,bf16*dl,__nv_f
     if(!threadIdx.x) loss[n]=-logf(ptg+1e-12f);
 }
 /* CUDALM_KD (20n): cached teacher top-K per input position (cudalm kdcache). After the CE kernel the head
- * gradient p - onehot becomes p - (1-a) onehot - a t, t = the teacher top-K renormalised: CE against the
- * mixed soft target. One thread per row, K+1 entries; the E4M3 copy of the patched entries is refreshed. */
-__global__ void k_kd_adj(float*dl,bf16*dlb,__nv_fp8_e4m3*q8,const int*tgt,const unsigned short*ki,const __half*kp,int rows,int V,int K,int nAll,float a){
+ * gradient p - onehot becomes p - (1-a) onehot - a t: CE against the mixed soft target. 20o default t = the raw
+ * teacher top-K + its missing mass 1-sum(top-K) on the true token (rn=0); rn=1 = the 20n top-K renormalised to 1,
+ * which gives the true token no teacher mass whenever it is outside the top-K (~28% of positions at K=8).
+ * One thread per row, K+1 entries; the E4M3 copy of the patched entries is refreshed. */
+__global__ void k_kd_adj(float*dl,bf16*dlb,__nv_fp8_e4m3*q8,const int*tgt,const unsigned short*ki,const __half*kp,int rows,int V,int K,int nAll,float a,int rn){
     int n=blockIdx.x*blockDim.x+threadIdx.x; if(n>=rows||tgt[n]<0) return;
     const __half*p=kp+(size_t)n*K; const unsigned short*id=ki+(size_t)n*K; float s=0.f, iN=a/nAll, qs=448.0f*nAll;
     for(int k=0;k<K;k++) s+=__half2float(p[k]);
     if(s<=0.f) return;
-    for(int k=-1;k<K;k++){ size_t x=(size_t)n*V+(k<0?tgt[n]:id[k]); float dv=k<0?iN:-iN*__half2float(p[k])/s, nv;
+    float sc=rn?1.f/s:1.f, ty=rn?1.f:fminf(s,1.f);
+    for(int k=-1;k<K;k++){ size_t x=(size_t)n*V+(k<0?tgt[n]:id[k]); float dv=k<0?iN*ty:-iN*__half2float(p[k])*sc, nv;
         if(dlb){ nv=d_bf2f(dlb[x])+dv; dlb[x]=d_f2bf(nv); } else { nv=dl[x]+dv; dl[x]=nv; }
         if(q8) q8[x]=__nv_fp8_e4m3(nv*qs); } }
 /* kdcache: top-K (K <= 16) of one logits row with their full-softmax probabilities, one block per row */
@@ -5697,7 +5700,7 @@ static void gpu_head_bwd(const float*P,float*G,const Off*o,GA*a,const int*tgtG){
         kchk("head softmax_ce",r0);
 #ifndef CUDALM_CPU
         if(g_kdK&&!comp){ KL(k_kd_adj,nblk((size_t)rows,TPB),TPB)(hb?NULL:a->dlogits,hb?(bf16*)a->dlogits:NULL,f8?q8:NULL,tgts+r0,
-                              g_kdI+(size_t)r0*g_kdK,(const __half*)g_kdP+(size_t)r0*g_kdK,rows,V,g_kdK,denom,g_kda); kchk("head kd",r0); }
+                              g_kdI+(size_t)r0*g_kdK,(const __half*)g_kdP+(size_t)r0*g_kdK,rows,V,g_kdK,denom,g_kda,g_kdrn); kchk("head kd",r0); }
 #endif
         if(f8) fp8_matmul(q8,e8t,&hs[3],&hs[1],rows,D,V,&ONE,&ZERO,dfnd+(size_t)r0*D,D,"head_dfn_f8");
         else g_ab(a->dlogits,P+o->emb,dfnd+(size_t)r0*D,rows,V,D);
@@ -6643,6 +6646,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_PERM_BASE","0","train","perm sampler start offset",1},
  {"CUDALM_KD","","train","teacher top-K cache (cudalm kdcache) for distillation",1},
  {"CUDALM_KD_ALPHA","0.5","train","weight of the teacher target in the CE target",1},
+ {"CUDALM_KD_RENORM","0","train","1 = renormalise the teacher top-K to 1 (20n); 0 = raw top-K, missing mass on the true token",1},
  {"CUDALM_SEED","random","train","pins batch order / sampling",0},
  {"CUDALM_TOKW","0","train","per-token loss weights from <corpus>/train.w: 1 = weights (GRPO), 2 = q<0 is teacher log p*8 (on-policy distillation)",0},
  {"CUDALM_OPD_BIAS","auto","train","TOKW=2 baseline added to teacher log p; auto = running mean of the advantage, so it is centred; mask = drop teacher tokens (control)",0},
@@ -8089,13 +8093,13 @@ static void cmd_train(int argc,char**argv){
         if(!kdf||fread(m,1,4,kdf)!=4||memcmp(m,"KDC1",4)||fread(kh,4,2,kdf)!=2||fread(&kn,8,1,kdf)!=1){ fprintf(stderr,"[kd] cannot read %s\n",e); exit(1); }
         if(kh[1]!=c.V||kn!=(unsigned long long)ntr){ fprintf(stderr,"[kd] %s is V %d / %llu tokens, model V %d / corpus %zu tokens\n",e,kh[1],kn,c.V,ntr); exit(1); }
         if(mask_on||trw||g_tokw){ fprintf(stderr,"[kd] not with prompt masking or token weights\n"); exit(1); }
-        g_kdK=kh[0]; kdrec=(size_t)g_kdK*4; g_kda=0.5f; { const char*x=getenv("CUDALM_KD_ALPHA"); if(x) g_kda=(float)atof(x); }
+        g_kdK=kh[0]; kdrec=(size_t)g_kdK*4; g_kda=0.5f; { const char*x=getenv("CUDALM_KD_ALPHA"); if(x) g_kda=(float)atof(x); x=getenv("CUDALM_KD_RENORM"); g_kdrn=x&&atoi(x); }
         kdh=(unsigned short*)malloc((size_t)c.T*kdrec); kdI=(unsigned short*)malloc((size_t)N*g_kdK*2); kdP=(unsigned short*)malloc((size_t)N*g_kdK*2);
 #ifdef CUDALM_CPU
         fprintf(stderr,"[kd] CUDALM_KD needs the CUDA build\n"); exit(1);
 #endif
         g_kdI=(unsigned short*)dmalloc((size_t)N*g_kdK*2); g_kdP=(unsigned short*)dmalloc((size_t)N*g_kdK*2);
-        printf("[kd] %s: teacher top-%d targets, alpha %.2f\n",e,g_kdK,g_kda); } }
+        printf("[kd] %s: teacher top-%d targets (%s), alpha %.2f\n",e,g_kdK,g_kdrn?"renormalised, 20n":"raw + missing mass on the true token",g_kda); } }
     auto build=[&](int it,int*tok,int*tgt)->int{
         size_t span=(size_t)c.T+2;
         for(int i=0;i<B;i++){ size_t st=perm_on ? pm_start(&pm,(size_t)(it-perm_base)*(size_t)B+(size_t)i)

@@ -57,7 +57,8 @@ PROSE = {'ultrafineweb', 'ufw-l3', 'cosmopedia-v2', 'finemath'}
 #   HWK = HW control with fresh samples; HWW = web weight cut by 1/3 (pair with +dclmN to replace it)
 HWV = {'HW': (PROSE, {}), 'HWK': (PROSE, {}), 'HWM': (PROSE - {'finemath'}, {}), 'HWC': (PROSE, {'github-python': 10 / 21}),
        'HWMC': (PROSE - {'finemath'}, {'github-python': 10 / 21}), 'HWW': (PROSE, {'ultrafineweb': 2 / 3}),
-       'HWK5': (PROSE, {}), 'HWK9': (PROSE, {})}   # HW corpora for the KD arms (alpha 0.5 / 0.9)
+       'HWK5': (PROSE, {}), 'HWK9': (PROSE, {}),   # HW corpora for the KD arms (alpha 0.5 / 0.9)
+       'HWR5': (PROSE, {}), 'HWR9': (PROSE, {})}   # 20o KD (raw top-K + missing mass on the true token)
 XRE = re.compile(r'([a-z]+)(\d+(?:\.\d+)?)$')
 def extra_docs(name):
     arr = np.fromfile(os.path.join(fp, 'extra', name + '.bin'), dtype=np.uint16); e = np.flatnonzero(arr == 0)

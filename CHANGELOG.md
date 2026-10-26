@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-26
 
+- Update k_kd_adj to accept rn parameter and compute renormalised mass
+- Add HWR5/HWR9 entries to prep/docsel.py for KD arms
+- Add new scripts/kdfix.ps1 for KD rerun with build 20o
+
+## Unreleased - 2026-10-26
+
 - Add II_QUEUE.md with stage plan and resume markers
 - Add CUDALM_KD env flag and kdcache.py script
 - Update cudalm.cu with kd_adj, k_topk_row, vres, kd, kdcache functions
