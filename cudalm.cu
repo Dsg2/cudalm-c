@@ -2424,6 +2424,7 @@ static float g_auxlm[64],g_biaslm[64]; static int g_auxlm_n=0,g_biaslm_n=0;
 #define LMUL(v,n,l) ((l)<(n)?(v)[l]:1.0f)
 static int parse_flist(const char*s,float*v,int max){ int n=0; while(s&&*s&&n<max){ v[n++]=(float)atof(s); s=strchr(s,','); if(s)s++; } return n; }
 static double g_sk_r[2]; static long g_sk_n[2],g_rb_mv,g_rb_tot;
+static unsigned short*g_kdI=0,*g_kdP=0; static int g_kdK=0; static float g_kda=0.f;   /* CUDALM_KD, see k_kd_adj (GPU only) */
 #ifndef CUDALM_CPU
 __global__ void k_router_top1(const float*rt,float*rprobs,int*assign,float*gate,int N,int E,const float*bias){
     int n=blockIdx.x*blockDim.x+threadIdx.x; if(n>=N)return;
@@ -2643,6 +2644,39 @@ __global__ void k_sce_h8(const __half*lg,const int*tgt,float*loss,bf16*dl,__nv_f
         d[i]=o; q[i]=oq; }
     if(!threadIdx.x) loss[n]=-logf(ptg+1e-12f);
 }
+/* CUDALM_KD (20n): cached teacher top-K per input position (cudalm kdcache). After the CE kernel the head
+ * gradient p - onehot becomes p - (1-a) onehot - a t, t = the teacher top-K renormalised: CE against the
+ * mixed soft target. One thread per row, K+1 entries; the E4M3 copy of the patched entries is refreshed. */
+__global__ void k_kd_adj(float*dl,bf16*dlb,__nv_fp8_e4m3*q8,const int*tgt,const unsigned short*ki,const __half*kp,int rows,int V,int K,int nAll,float a){
+    int n=blockIdx.x*blockDim.x+threadIdx.x; if(n>=rows||tgt[n]<0) return;
+    const __half*p=kp+(size_t)n*K; const unsigned short*id=ki+(size_t)n*K; float s=0.f, iN=a/nAll, qs=448.0f*nAll;
+    for(int k=0;k<K;k++) s+=__half2float(p[k]);
+    if(s<=0.f) return;
+    for(int k=-1;k<K;k++){ size_t x=(size_t)n*V+(k<0?tgt[n]:id[k]); float dv=k<0?iN:-iN*__half2float(p[k])/s, nv;
+        if(dlb){ nv=d_bf2f(dlb[x])+dv; dlb[x]=d_f2bf(nv); } else { nv=dl[x]+dv; dl[x]=nv; }
+        if(q8) q8[x]=__nv_fp8_e4m3(nv*qs); } }
+/* kdcache: top-K (K <= 16) of one logits row with their full-softmax probabilities, one block per row */
+__global__ void k_topk_row(const float*lg,int V,int K,unsigned short*oi,__half*op){
+    int n=blockIdx.x; const float*l=lg+(size_t)n*V; float m=-1e30f,s=0.f,tv[16]; int ti[16],nt=0;
+    for(int i=threadIdx.x;i<V;i+=blockDim.x){ float x=l[i],mm=fmaxf(m,x); s=s*__expf(m-mm)+__expf(x-mm); m=mm;
+        if(nt<K||x>tv[nt-1]){ int j=nt<K?nt++:K-1; while(j>0&&tv[j-1]<x){ tv[j]=tv[j-1]; ti[j]=ti[j-1]; j--; } tv[j]=x; ti[j]=i; } }
+    for(int k=16;k;k>>=1) ms_merge(m,s,__shfl_xor_sync(~0u,m,k),__shfl_xor_sync(~0u,s,k));
+    __shared__ float sm[32],ss[32],wv[32]; __shared__ int wi[32],win; int w=threadIdx.x>>5, nw=blockDim.x>>5, ptr=0;
+    if(!(threadIdx.x&31)){ sm[w]=m; ss[w]=s; }
+    __syncthreads();
+    if(w==0){ m=threadIdx.x<nw?sm[threadIdx.x]:-1e30f; s=threadIdx.x<nw?ss[threadIdx.x]:0.f;
+        for(int k=16;k;k>>=1) ms_merge(m,s,__shfl_xor_sync(~0u,m,k),__shfl_xor_sync(~0u,s,k));
+        if(!threadIdx.x){ sm[0]=m; ss[0]=s; } }
+    __syncthreads();
+    m=sm[0]; float inv=1.0f/ss[0];
+    for(int r=0;r<K;r++){ float v=ptr<nt?tv[ptr]:-1e30f; int t=threadIdx.x;
+        for(int k=16;k;k>>=1){ float v2=__shfl_xor_sync(~0u,v,k); int t2=__shfl_xor_sync(~0u,t,k); if(v2>v||(v2==v&&t2<t)){ v=v2; t=t2; } }
+        if(!(threadIdx.x&31)){ wv[w]=v; wi[w]=t; }
+        __syncthreads();
+        if(!threadIdx.x){ int bt=wi[0]; float bv=wv[0]; for(int j=1;j<nw;j++) if(wv[j]>bv||(wv[j]==bv&&wi[j]<bt)){ bv=wv[j]; bt=wi[j]; } win=bt; }
+        __syncthreads();
+        if(threadIdx.x==win){ oi[(size_t)n*K+r]=(unsigned short)ti[ptr]; op[(size_t)n*K+r]=__float2half(__expf(tv[ptr]-m)*inv); ptr++; }
+        __syncthreads(); } }
 __global__ void k_f2bf(const float*src,bf16*dst,size_t n){ size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) dst[i]=d_f2bf(src[i]); }
 /* sum of squares -> 64 partials (grad-norm clipping) */
 __global__ void k_sqsum(const float*G,size_t n,float*part){
@@ -3187,6 +3221,9 @@ static float g_moe_aux=0.03f;   /* CUDALM_MOE_AUX */
 /* ---- Tier 1: gated attention (o = SDPA * 2σ(x Wg), Wg zero-init = identity)
  * and n-gram layer/gate/trigram. Float weights outside QLM, AdamW, .t1 sidecar. */
 static int g_attg=0, g_ng_layer=0, g_ng_gate=0, g_ng_tri=0;
+/* CUDALM_VRES (20n): value residual, v_l <- (v_l + v_0)/2 for l >= 1; g_dv0 collects layer 0's share in backward */
+static int g_vres=-1; static float*g_dv0=NULL; static int g_dv0n=0;
+static int vres_on(void){ if(g_vres<0){ const char*e=getenv("CUDALM_VRES"); g_vres=e&&atoi(e)!=0; } return g_vres; }
 static float *g_Wg=0,*g_WgG=0; static bf16 *g_WgM=0,*g_WgV=0;
 #ifndef CUDALM_CPU
 __global__ void k_agate_f(const float*att,float*s,float*o,size_t n){
@@ -5564,6 +5601,7 @@ static void gpu_forward(const float*P,const Off*o,GA*a,const int*tokG){
         g_ab(a->a_norm[l],P+rd->wq[l],a->qh[l],N,D,D);
         g_ab(a->a_norm[l],P+rd->wk[l],a->kh[l],N,D,KD);
         g_ab(a->a_norm[l],P+rd->wv[l],a->vh[l],N,D,KD); f8_drop();          kchk("fwd qkv",l);
+        if(l&&vres_on()){ size_t nv=(size_t)N*KD; e_add(a->vh[l],a->vh[0],nv); KL(k_scale,nblk(nv,TPB),TPB)(a->vh[l],nv,0.5f); kchk("fwd vres",l); }
         if(g_fp16&&g_ropeh){        /* q's fp32 copy is never read again; k's is (decoder prefill) */
             KL(k_rope_h,nblk((size_t)N*gC.H*gC.half,TPB),TPB)(a->qh[l],a->qh16[l],gRC,gRS,N,gC.H,gC.hd,gC.half,gC.T,0);
             KL(k_rope_h,nblk((size_t)N*gC.KV*gC.half,TPB),TPB)(a->kh[l],a->kh16[l],gRC,gRS,N,gC.KV,gC.hd,gC.half,gC.T,1);
@@ -5657,6 +5695,10 @@ static void gpu_head_bwd(const float*P,float*G,const Off*o,GA*a,const int*tgtG){
         else if(f8&&g_h16) KL(k_softmax_ce,rows,TPB)((const __half*)a->logits,tgts+r0,a->lossb+r0,a->dlogits,q8,rows,V,denom,wr,g_negp);
         else KL(k_softmax_ce,rows,TPB)(a->logits,tgts+r0,a->lossb+r0,a->dlogits,f8?q8:NULL,rows,V,denom,wr,g_negp);
         kchk("head softmax_ce",r0);
+#ifndef CUDALM_CPU
+        if(g_kdK&&!comp){ KL(k_kd_adj,nblk((size_t)rows,TPB),TPB)(hb?NULL:a->dlogits,hb?(bf16*)a->dlogits:NULL,f8?q8:NULL,tgts+r0,
+                              g_kdI+(size_t)r0*g_kdK,(const __half*)g_kdP+(size_t)r0*g_kdK,rows,V,g_kdK,denom,g_kda); kchk("head kd",r0); }
+#endif
         if(f8) fp8_matmul(q8,e8t,&hs[3],&hs[1],rows,D,V,&ONE,&ZERO,dfnd+(size_t)r0*D,D,"head_dfn_f8");
         else g_ab(a->dlogits,P+o->emb,dfnd+(size_t)r0*D,rows,V,D);
         kchk("head dfn",r0);
@@ -5776,6 +5818,12 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
 #endif
           kchk("bwd attn dKV",l); }
         e_rope(a->dq,gC.H,N,1); e_rope(a->dk,gC.KV,N,1);                   kchk("bwd rope",l);
+        if(vres_on()){ size_t nv=(size_t)N*KD;   /* v_l = (raw_l + v_0)/2: half to this layer's Wv, half to layer 0's */
+            if(g_dv0n<N){ if(g_dv0) cudaFree(g_dv0); g_dv0=(float*)dmalloc(nv*4); g_dv0n=N; }
+            if(l==gC.L-1) ck(cudaMemset(g_dv0,0,nv*4),"dv0 zero");
+            if(l){ KL(k_scale,nblk(nv,TPB),TPB)(a->dv,nv,0.5f); e_add(g_dv0,a->dv,nv); }
+            else e_add(a->dv,g_dv0,nv);
+            kchk("bwd vres",l); }
         g_abt(a->dq,P+rd->wq[l],a->danorm,N,D,D);
         g_abt_b(a->dk,P+rd->wk[l],a->danorm,N,KD,D,1.0f);
         g_abt_b(a->dv,P+rd->wv[l],a->danorm,N,KD,D,1.0f);
@@ -6522,6 +6570,7 @@ static const EnvReg g_envreg[]={
  {"NGRAM_LRMULT","1","memory","engram: LR multiplier for memory params",0},
  {"CUDALM_NG_HOSTMAP","0","memory","1 = old host qsort for ngram keys (~15 ms/step)",0},
  {"CUDALM_ATTN_GATE","0","model","per-layer attention output gate (+L*D*D)",0},
+ {"CUDALM_VRES","0","model","value residual (ResFormer): layers >= 1 attend over (v_l + v_0)/2, no params",0},
  {"CUDALM_CANON","","model","Canon layers: A (after norm1), C (after norm2), AC (+L*4*D each)",0},
  {"CUDALM_SHARED_F","0","moe","shared always-on SwiGLU expert width (MoE only, <= F, +L*3*D*Fs)",0},
  {"CUDALM_D","","model","at new: override the preset width",1},
@@ -6592,6 +6641,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MASK_PROMPT","1","train","chatml: loss on assistant tokens only",0},
  {"CUDALM_SAMPLER","perm","train","perm | rand",0},
  {"CUDALM_PERM_BASE","0","train","perm sampler start offset",1},
+ {"CUDALM_KD","","train","teacher top-K cache (cudalm kdcache) for distillation",1},
+ {"CUDALM_KD_ALPHA","0.5","train","weight of the teacher target in the CE target",1},
  {"CUDALM_SEED","random","train","pins batch order / sampling",0},
  {"CUDALM_TOKW","0","train","per-token loss weights from <corpus>/train.w: 1 = weights (GRPO), 2 = q<0 is teacher log p*8 (on-policy distillation)",0},
  {"CUDALM_OPD_BIAS","auto","train","TOKW=2 baseline added to teacher log p; auto = running mean of the advantage, so it is centred; mask = drop teacher tokens (control)",0},
@@ -6890,7 +6941,7 @@ __global__ void __launch_bounds__(1024) k_dec_sample(const float*logits,int V,co
     for(int i=0;i<k;i++){ u-=__expf((sv[i]-sv[0])*it); if(u<=0){ pick=i; break; } }
     out[s]=si[pick]; lp[s]=sv[pick]-ls; }
 
-static int dec_ok(void){ return (!g_ngram_on||g_ng_order+g_ng_tri<=4) && !g_pscratch && gC.hd<=2*WARP; }   /* tokw keeps 4 tokens */
+static int dec_ok(void){ return (!g_ngram_on||g_ng_order+g_ng_tri<=4) && !g_pscratch && gC.hd<=2*WARP && !vres_on(); }   /* tokw keeps 4 tokens */
 static Dec* dec_new(int B,int Tm){
     Dec*d=(Dec*)calloc(1,sizeof(Dec)); int L=gC.L,D=gC.D,KD=gC.KD; d->B=B; d->Tm=Tm; d->R=3*g_eg_dil+1;
     d->K=(float**)calloc(L,sizeof(float*)); d->V=(float**)calloc(L,sizeof(float*)); d->cA=(float**)calloc(L,sizeof(float*)); d->cC=(float**)calloc(L,sizeof(float*));
@@ -8032,12 +8083,30 @@ static void cmd_train(int argc,char**argv){
                pm.nw,c.T,pm.nw*4/1e6,perm_base,first%pm.nw,pm.epoch,
                (double)(iters-start_iter)*B/(double)pm.nw);
     }
+    /* CUDALM_KD=<file.kd> (cudalm kdcache over THIS corpus): CE against (1-a) onehot + a teacher top-K, a = CUDALM_KD_ALPHA */
+    FILE*kdf=NULL; unsigned short*kdh=NULL,*kdI=NULL,*kdP=NULL; size_t kdrec=0;
+    { const char*e=getenv("CUDALM_KD"); if(e&&*e){ char m[4]; int kh[2]={0,0}; unsigned long long kn=0; kdf=fopen(e,"rb");
+        if(!kdf||fread(m,1,4,kdf)!=4||memcmp(m,"KDC1",4)||fread(kh,4,2,kdf)!=2||fread(&kn,8,1,kdf)!=1){ fprintf(stderr,"[kd] cannot read %s\n",e); exit(1); }
+        if(kh[1]!=c.V||kn!=(unsigned long long)ntr){ fprintf(stderr,"[kd] %s is V %d / %llu tokens, model V %d / corpus %zu tokens\n",e,kh[1],kn,c.V,ntr); exit(1); }
+        if(mask_on||trw||g_tokw){ fprintf(stderr,"[kd] not with prompt masking or token weights\n"); exit(1); }
+        g_kdK=kh[0]; kdrec=(size_t)g_kdK*4; g_kda=0.5f; { const char*x=getenv("CUDALM_KD_ALPHA"); if(x) g_kda=(float)atof(x); }
+        kdh=(unsigned short*)malloc((size_t)c.T*kdrec); kdI=(unsigned short*)malloc((size_t)N*g_kdK*2); kdP=(unsigned short*)malloc((size_t)N*g_kdK*2);
+#ifdef CUDALM_CPU
+        fprintf(stderr,"[kd] CUDALM_KD needs the CUDA build\n"); exit(1);
+#endif
+        g_kdI=(unsigned short*)dmalloc((size_t)N*g_kdK*2); g_kdP=(unsigned short*)dmalloc((size_t)N*g_kdK*2);
+        printf("[kd] %s: teacher top-%d targets, alpha %.2f\n",e,g_kdK,g_kda); } }
     auto build=[&](int it,int*tok,int*tgt)->int{
         size_t span=(size_t)c.T+2;
         for(int i=0;i<B;i++){ size_t st=perm_on ? pm_start(&pm,(size_t)(it-perm_base)*(size_t)B+(size_t)i)
                                              : (size_t)(urand64()%(uint64_t)(ntr-span));
             if(trw){ if(!wst) wst=(size_t*)malloc(sizeof(size_t)*B); wst[i]=st; }
-            for(int j=0;j<c.T;j++){ int r=i*c.T+j; tok[r]=tr[st+j]; tgt[r]=tr[st+j+1]; } }
+            for(int j=0;j<c.T;j++){ int r=i*c.T+j; tok[r]=tr[st+j]; tgt[r]=tr[st+j+1]; }
+            if(kdf){ lm_fseek64(kdf,20+(long long)st*(long long)kdrec,SEEK_SET);
+                if(fread(kdh,kdrec,(size_t)c.T,kdf)!=(size_t)c.T){ fprintf(stderr,"[kd] short read at %zu\n",st); exit(1); }
+                for(int j=0;j<c.T;j++){ size_t r=(size_t)i*c.T+j; memcpy(kdI+r*g_kdK,kdh+(size_t)j*2*g_kdK,(size_t)g_kdK*2);
+                    memcpy(kdP+r*g_kdK,kdh+(size_t)j*2*g_kdK+g_kdK,(size_t)g_kdK*2); } } }
+        if(kdf){ ck(cudaMemcpy(g_kdI,kdI,(size_t)N*g_kdK*2,cudaMemcpyHostToDevice),"kd I"); ck(cudaMemcpy(g_kdP,kdP,(size_t)N*g_kdK*2,cudaMemcpyHostToDevice),"kd P"); }
         int ntrain=N;
         if(mask_on){ ntrain=0;
             for(int i=0;i<B;i++) ntrain+=mask_apply(&ms,tok+(size_t)i*c.T,tgt+(size_t)i*c.T,c.T,c.eot);
@@ -8382,6 +8451,110 @@ static double gpu_loss(const float*P,const Off*o,GA*a,const int*tgtG,int N,float
     if(!perpos) free(h);
     return s/N;
 }
+/* kdcache (20n): the teacher's top-K next-token probabilities for every train.bin position, for CUDALM_KD.
+ * Windows of T advance by T/2 and keep only positions not yet written, so every target past the first T/2
+ * sees >= T/2 tokens of context. File: "KDC1", K, V, ntok (u64), then per input position p (predicting
+ * token p+1) K uint16 ids + K fp16 probabilities; the last position is a zero record (no gradient). */
+static void cmd_kdcache(int argc,char**argv){
+    if(argc<5){ fprintf(stderr,"usage: cudalm kdcache <teacher> <data_dir> <out.kd> [K=8] [B=8]\n"
+        "  teacher top-K (<= 16) next-token probabilities for every train.bin position; train with CUDALM_KD=<out.kd>\n"); exit(1); }
+#ifdef CUDALM_CPU
+    fprintf(stderr,"kdcache needs the CUDA build\n"); exit(1);
+#else
+    char path[1024],p[1100]; model_resolve(argv[2],path,sizeof path);
+    Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk);
+    int K=argc>5?atoi(argv[5]):8, B=argc>6?atoi(argv[6]):8; if(K<1)K=1; if(K>16)K=16; if(B<1)B=1; if(B>64)B=64;
+    snprintf(p,sizeof p,"%s/train.bin",argv[3]); size_t ntr; uint16_t*tr=(uint16_t*)read_file(p,&ntr);
+    if(!tr){ fprintf(stderr,"cannot read %s\n",p); exit(1); } ntr/=2;
+    int T=c.T, H=T/2, N=B*T, D=c.D, V=c.V; if(ntr<(size_t)T+2){ fprintf(stderr,"[kdcache] corpus shorter than T\n"); exit(1); }
+    gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
+    size_t np=param_count(&c); float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P h2d");
+    rope_tables(&c); GA*a=ga_new(N,1);
+    int*tokG=(int*)dmalloc((size_t)N*4),*tok=(int*)malloc((size_t)N*4);
+    unsigned short*oiG=(unsigned short*)dmalloc((size_t)g_chrows*K*2),*hI=(unsigned short*)malloc((size_t)N*K*2),*hP=(unsigned short*)malloc((size_t)N*K*2);
+    __half*opG=(__half*)dmalloc((size_t)g_chrows*K*2);
+    unsigned short*rec=(unsigned short*)calloc((size_t)T,(size_t)K*4);
+    FILE*f=fopen(argv[4],"wb"); if(!f){ perror(argv[4]); exit(1); }
+    int hv[2]={K,V}; unsigned long long nn=ntr; fwrite("KDC1",1,4,f); fwrite(hv,4,2,f); fwrite(&nn,8,1,f);
+    size_t nwin=(ntr-T-1)/H+1, done=0; int last=(nwin-1)*(size_t)H+T<ntr-1; nwin+=last;   /* + one window flush with the end */
+    printf("[kdcache] %s -> %s | %zu tokens, %zu windows of %d (stride %d), top-%d\n",argv[2],argv[4],ntr,nwin,T,H,K); fflush(stdout);
+    double t0=wall();
+    for(size_t w0=0;w0<nwin;w0+=B){ int nb=(int)(nwin-w0<(size_t)B?nwin-w0:B); size_t sw[64];
+        memset(tok,0,(size_t)N*4);
+        for(int i=0;i<nb;i++){ size_t w=w0+i; sw[i]=last&&w==nwin-1?ntr-1-T:w*H; for(int j=0;j<T;j++) tok[i*T+j]=tr[sw[i]+j]; }
+        ck(cudaMemcpy(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice),"tok h2d");
+        gpu_forward(P,&o,a,tokG);
+        for(int r0=0;r0<nb*T;r0+=g_chrows){ int rows=nb*T-r0<g_chrows?nb*T-r0:g_chrows;
+            g_abt(a->fn+(size_t)r0*D,P+o.emb,a->logits,rows,D,V);
+            KL(k_topk_row,rows,256)(a->logits,V,K,oiG,opG); kchk("kdcache topk",r0);
+            ck(cudaMemcpy(hI+(size_t)r0*K,oiG,(size_t)rows*K*2,cudaMemcpyDeviceToHost),"kd I d2h");
+            ck(cudaMemcpy(hP+(size_t)r0*K,opG,(size_t)rows*K*2,cudaMemcpyDeviceToHost),"kd P d2h"); }
+        for(int i=0;i<nb;i++){ int j0=sw[i]+T>done?(int)(done>sw[i]?done-sw[i]:0):T;
+            for(int j=j0;j<T;j++){ memcpy(rec+(size_t)(j-j0)*2*K,hI+((size_t)i*T+j)*K,(size_t)K*2); memcpy(rec+(size_t)(j-j0)*2*K+K,hP+((size_t)i*T+j)*K,(size_t)K*2); }
+            if(j0<T){ fwrite(rec,(size_t)K*4,(size_t)(T-j0),f); done=sw[i]+T; } }
+        if((w0/B)%2000==0){ printf("  %zu/%zu windows, %.0fs\n",w0+nb,nwin,wall()-t0); fflush(stdout); } }
+    memset(rec,0,(size_t)K*4); for(;done<ntr;done++) fwrite(rec,(size_t)K*4,1,f);
+    if(fclose(f)){ fprintf(stderr,"[kdcache] write failed\n"); exit(1); }
+    printf("[kdcache] done: %zu positions, %.2f GB, %.0fs\n",ntr,(20+(double)ntr*K*4)/1e9,wall()-t0);
+#endif
+}
+/* vrescheck (20n): central finite differences vs gpu_backward on a random 3-layer dense model (Wv of layers 0-2,
+ * Wq of layer 1), with CUDALM_VRES off and on. Exact in the CPU build (fp32); GPU fp16/FP8 paths are switched off. */
+static void cmd_vrescheck(void){
+    Cfg c; preset("nano",&c); c.L=3; c.n_exp=0; c.n_mtp=0; c.T=32; c.win=0; c.full_every=0; cfg_derive(&c);
+    gC=c; cuda_init(); g_fp8gemm=0; g_fp16=0; Off o; calc_offsets(&c,&o); t1_setup(&c);
+    size_t np=param_count(&c); float*Ph=(float*)malloc(np*4); for(size_t i=0;i<np;i++) Ph[i]=0.05f*rnd_normal();
+    for(int l=0;l<c.L;l++) for(int i=0;i<c.D;i++){ Ph[o.an1[l]+i]=1; Ph[o.an2[l]+i]=1; }
+    for(int i=0;i<c.D;i++) Ph[o.nf+i]=1;
+    int B=2,N=B*c.T; float*P=(float*)dmalloc(np*4),*G=(float*)dmalloc(np*4),*Gh=(float*)malloc(np*4);
+    rope_tables(&c); GA*a=ga_new(N,1); a->tr=1;
+    int*tok=(int*)malloc(N*4),*tgt=(int*)malloc(N*4),*tokG=(int*)dmalloc(N*4),*tgtG=(int*)dmalloc(N*4);
+    for(int i=0;i<N;i++){ tok[i]=(int)(urand64()%(uint64_t)c.V); tgt[i]=(int)(urand64()%(uint64_t)c.V); }
+    ck(cudaMemcpy(tokG,tok,N*4,cudaMemcpyHostToDevice),"t"); ck(cudaMemcpy(tgtG,tgt,N*4,cudaMemcpyHostToDevice),"t");
+    auto loss=[&](){ ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P"); gpu_forward(P,&o,a,tokG); return gpu_loss(P,&o,a,tgtG,N,NULL); };
+    int okall=1;
+    for(int vr=0;vr<2;vr++){ g_vres=vr; printf("[vrescheck] VRES=%d loss %.6f\n",vr,loss()); gpu_backward(P,G,&o,a,tokG,tgtG); ck(cudaMemcpy(Gh,G,np*4,cudaMemcpyDeviceToHost),"G");
+        double num=0,den=0; size_t blk[4]={o.wv[0],o.wv[1],o.wv[2],o.wq[1]};
+        for(int b=0;b<4;b++) for(int k=0;k<6;k++){ size_t i=blk[b]+(size_t)(urand64()%(uint64_t)(c.D*c.KD)); float s=Ph[i]; double e=1e-2;
+            Ph[i]=s+(float)e; double lp=loss(); Ph[i]=s-(float)e; double lm=loss(); Ph[i]=s;
+            double fd=(lp-lm)/(2*e); num+=(fd-Gh[i])*(fd-Gh[i]); den+=fd*fd; }
+        double re=sqrt(num/(den>0?den:1)); printf("[vrescheck] VRES=%d: rel err %.2e %s\n",vr,re,re<2e-2?"ok":"FAIL"); okall&=re<2e-2; }
+    printf("[vrescheck] %s\n",okall?"PASS":"FAIL"); }
+/* avg (20n): uniform average of checkpoints of one architecture (seeds of one recipe, the last checkpoints of
+ * a decay): weights, the rendered n-gram table (re-encoded to q4), Wng and the .t1/.x1 side weights. The
+ * optimizer state is not averaged (the first input's sidecar moments are written): eval and export only. */
+static void cmd_avg(int argc,char**argv){
+    if(argc<5){ fprintf(stderr,"usage: cudalm avg <out> <in1> <in2> [...]   (names or .bin paths, one architecture)\n"); exit(1); }
+    side_apply(argv[3]); int nin=argc-3; Cfg c; Tok*tk=NULL; size_t np=0; double*acc=NULL; char p0[1024],pk[1024],op[1100];
+    for(int k=0;k<nin;k++){ model_resolve(argv[3+k],pk,sizeof pk); Cfg ck2; float*Pk=model_load_full(pk,&ck2,&tk);
+        if(!k){ c=ck2; np=param_count(&c); acc=(double*)calloc(np,8); snprintf(p0,sizeof p0,"%s",pk); }
+        else if(param_count(&ck2)!=np||ck2.D!=c.D||ck2.L!=c.L||ck2.V!=c.V){ fprintf(stderr,"[avg] %s: different architecture\n",pk); exit(1); }
+        for(size_t i=0;i<np;i++) acc[i]+=Pk[i]; free(Pk); }
+    float*P=(float*)malloc(np*4); for(size_t i=0;i<np;i++) P[i]=(float)(acc[i]/nin); free(acc);
+    gC=c; cuda_init();
+    float*dv[5]={0}; size_t dn[5]={0}; double*hs[5]={0}; float*tmp=NULL; size_t tcap=0;
+    for(int k=0;k<nin;k++){ model_resolve(argv[3+k],pk,sizeof pk); snprintf(op,sizeof op,"%s.opt",pk);
+        if(!k){ ngram_infer(pk); if(g_eg_on){ fprintf(stderr,"[avg] engram tables are not supported\n"); exit(1); }
+            size_t nt=(size_t)g_ng_R*g_ng_De, nw=(size_t)g_ng_De*c.D;
+            if(g_ngram_on){ dv[0]=g_ng; dn[0]=nt; dv[1]=g_ngW; dn[1]=nw; if(g_ng_gate){ dv[2]=g_ngWk; dn[2]=nw; } }
+            if(g_attg){ dv[3]=g_Wg; dn[3]=(size_t)c.L*c.D*c.D; }
+            if(g_xn){ dv[4]=g_xP; dn[4]=g_xn; }
+            for(int i=0;i<5;i++) if(dv[i]){ hs[i]=(double*)calloc(dn[i],8); if(dn[i]>tcap) tcap=dn[i]; }
+            tmp=(float*)malloc(tcap*4+4); }
+        else { if(g_ngram_on&&!ngram_load(op)){ fprintf(stderr,"[avg] no n-gram table at %s.ng\n",op); exit(1); } t1_load(op); }
+        for(int i=0;i<5;i++) if(dv[i]){ ck(cudaMemcpy(tmp,dv[i],dn[i]*4,cudaMemcpyDeviceToHost),"avg d2h"); for(size_t j=0;j<dn[i];j++) hs[i][j]+=tmp[j]; } }
+    for(int i=0;i<5;i++) if(dv[i]){ for(size_t j=0;j<dn[i];j++) tmp[j]=(float)(hs[i][j]/nin); ck(cudaMemcpy(dv[i],tmp,dn[i]*4,cudaMemcpyHostToDevice),"avg h2d"); free(hs[i]); }
+    if(g_ngram_on&&g_ng_q4){ size_t nt=dn[0];   /* re-encode the averaged table: fresh digits/residual/scales, zero moments */
+        KL(k_qlm_encode,(unsigned)g_ngq_ngrp,g_ngq_grp,g_ngq_grp)(g_ng,g_ngq_d,g_ngq_r,g_ngq_s,g_ngq_spD,1,g_ngq_grp,g_ngq_dmax,1); kchk("avg ngq encode",-1);
+        ck(cudaMemset(g_ngq_m8,0,nt),"avg m8"); ck(cudaMemset(g_ngq_v8,0,nt),"avg v8");
+        ck(cudaMemset(g_ngq_ms,0,(size_t)g_ngq_ngrp*4),"avg ms"); ck(cudaMemset(g_ngq_vs,0,(size_t)g_ngq_ngrp*4),"avg vs"); }
+    char out[1024]; model_path(argv[2],out,sizeof out); snprintf(op,sizeof op,"%s.opt",out);
+    model_save_bundle(out,&c,P,np,g_tokblob,g_tokblobl);
+    if(g_ngram_on) ngram_save(op,0);
+    t1_save(op,0);
+    { char a1[1100],b1[1100]; size_t sl; snprintf(a1,sizeof a1,"%s.env",p0); snprintf(b1,sizeof b1,"%s.env",out);
+      uint8_t*sb=read_file(a1,&sl); if(sb){ FILE*g=fopen(b1,"wb"); if(g){ fwrite(sb,1,sl,g); fclose(g); } free(sb); } }
+    printf("[avg] %d checkpoints -> %s (%zu params%s%s)\n",nin,out,np,g_ngram_on?", n-gram table re-encoded":"",g_attg||g_xn?", side weights":""); free(P); free(tmp); }
 static void cmd_eval(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
         "usage: cudalm eval <name|model.bin> <data_dir> [batches] [batch_size]\n"
@@ -10181,6 +10354,8 @@ int main(int argc,char**argv){
         "  cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp] [T]\n"
         "  cudalm lmeval   <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]\n"
         "  cudalm lmeval-vs <A.items.tsv> <B.items.tsv>   paired per-item comparison of two lmeval dumps\n"
+        "  cudalm avg      <out> <in1> <in2> [...]   (checkpoint average / soup; eval + export)\n"
+        "  cudalm kdcache  <teacher> <data_dir> <out.kd> [K=8] [B=8]   (teacher top-K for CUDALM_KD)\n"
         "  cudalm grow    <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
         "  cudalm gguf     <name> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]\n"
@@ -10200,6 +10375,9 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"chatbench")){ cmd_chatbench(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval"))   { cmd_lmeval(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval-vs")){ cmd_lmeval_vs(argc,argv); return 0; }
+    if(!strcmp(argv[1],"avg"))      { cmd_avg(argc,argv); return 0; }
+    if(!strcmp(argv[1],"kdcache"))  { cmd_kdcache(argc,argv); return 0; }
+    if(!strcmp(argv[1],"vrescheck")){ cmd_vrescheck(); return 0; }
     if(!strcmp(argv[1],"bench"))    { cmd_bench(argc,argv); return 0; }
     if(!strcmp(argv[1],"grow"))     { return cmd_grow(argc,argv); }
     if(!strcmp(argv[1],"quantize")) { return cmd_quantize(argc,argv); }

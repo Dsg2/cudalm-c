@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-10-26
 
+- Add II_QUEUE.md with stage plan and resume markers
+- Add CUDALM_KD env flag and kdcache.py script
+- Update cudalm.cu with kd_adj, k_topk_row, vres, kd, kdcache functions
+- Update prep scripts: gate, d1build, docsel, gate, hwbuild
+- Update scripts: fdoc, master, stage3
+
+## Unreleased - 2026-10-26
+
 - Add FILTER_PLAN.md with block probe results and doc-level filter criteria
 - Add CUDALM_EVAL_SPANS flag to cudalm.cu for per-document scoring
 - Add prep/docsel.py and prep/fdocsum.py for arm selection and replicate reporting

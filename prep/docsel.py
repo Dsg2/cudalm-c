@@ -1,10 +1,12 @@
 # Document-level selection for v3pre proxy anneals.
 #   docsel.py pool <fp dir> <nblocks>                  -> <fp>/pool_spans.txt (source-proportional random blocks)
-#   docsel.py build <v3pre> <fp> <out root> <tokens> <arm> <rep> [...]  arm in R L50 H50 X50 D25 D10 HW, one corpus per arm+rep
+#   docsel.py build <v3pre> <fp> <out root> <tokens> <arm> <rep> [...]  one corpus per arm+rep
+# arm = base[+extraN...]; base in R L50 H50 X50 D25 D10 (all sources) or HW* (prose hard half, see HWV);
+#   +extraN mixes N% of the tokens from <fp>/extra/<extra>.bin (uint16 eot-separated docs), e.g. HWM+arith3+cloze6
 # Scores come from `cudalm eval` with CUDALM_EVAL_SPANS: <fp>/docs_micro.tsv (LS-Micro2) and <fp>/docs_ref.tsv (LS2.5).
 #   L50/H50: lowest/highest half of each source's tokens by LS-Micro2 loss per token
 #   X50: highest half by excess loss (LS-Micro2 - LS2.5 per token): learnable docs the small model hasn't learned yet
-import sys, os, random, shutil
+import sys, os, random, shutil, re, bisect
 import numpy as np
 from collections import defaultdict
 cmd, a = sys.argv[1], sys.argv[2:]
@@ -28,7 +30,6 @@ def rd(fn):
     return d
 mi = rd('docs_micro.tsv'); rf = rd('docs_ref.tsv') if os.path.exists(os.path.join(fp, 'docs_ref.tsv')) else {k: (n, sl) for k, (n, sl) in mi.items()}   # no ref: excess 0
 docs = defaultdict(list)  # src -> [(start, n, loss/tok, excess/tok)]
-import bisect
 starts = [s[0] for s in spans]
 for ds, (n, sl) in mi.items():
     if ds not in rf or rf[ds][0] != n: continue
@@ -51,23 +52,43 @@ def half(v, key, top, frac=0.5):  # docs making up frac of the source's tokens, 
 sel = {'R': lambda v: v, 'L50': lambda v: half(v, lambda d: d[2], False), 'H50': lambda v: half(v, lambda d: d[2], True),
        'X50': lambda v: half(v, lambda d: d[3], True),
        'D25': lambda v: half(v, lambda d: d[2], True, 0.75), 'D10': lambda v: half(v, lambda d: d[2], True, 0.9)}
-PROSE = {'ultrafineweb', 'ufw-l3', 'cosmopedia-v2', 'finemath'}   # HW: H50 for prose sources, random elsewhere
+PROSE = {'ultrafineweb', 'ufw-l3', 'cosmopedia-v2', 'finemath'}
+# HW variants: (sources filtered to their hard half, source weight multipliers; shares renormalised)
+#   HWK = HW control with fresh samples; HWW = web weight cut by 1/3 (pair with +dclmN to replace it)
+HWV = {'HW': (PROSE, {}), 'HWK': (PROSE, {}), 'HWM': (PROSE - {'finemath'}, {}), 'HWC': (PROSE, {'github-python': 10 / 21}),
+       'HWMC': (PROSE - {'finemath'}, {'github-python': 10 / 21}), 'HWW': (PROSE, {'ultrafineweb': 2 / 3}),
+       'HWK5': (PROSE, {}), 'HWK9': (PROSE, {})}   # HW corpora for the KD arms (alpha 0.5 / 0.9)
+XRE = re.compile(r'([a-z]+)(\d+(?:\.\d+)?)$')
+def extra_docs(name):
+    arr = np.fromfile(os.path.join(fp, 'extra', name + '.bin'), dtype=np.uint16); e = np.flatnonzero(arr == 0)
+    return arr, list(zip(np.r_[0, e[:-1] + 1], e + 1))
 tb = np.memmap(os.path.join(src_dir, 'train.bin'), dtype=np.uint16, mode='r')
 for arm, rep in jobs:
     rng = random.Random(f'{arm}-{rep}'); out = []; ml = mx = mt = 0
+    base, *ex = arm.split('+'); ex = [(XRE.match(e).group(1), float(XRE.match(e).group(2)) / 100) for e in ex]
+    btok = tokens * (1 - sum(f for _, f in ex))
+    filt, mul = HWV.get(base, (None, {}))
+    w = {s: sum(d[1] for d in v) * mul.get(s, 1) for s, v in docs.items()}; wt = sum(w.values())
     for s, v in docs.items():
-        budget = tokens * sum(d[1] for d in v) / tot
-        cand = (sel['H50'](v) if s in PROSE else v)[:] if arm == 'HW' else sel[arm](v)[:]; rng.shuffle(cand); acc = 0
+        budget = btok * w[s] / wt
+        cand = ((sel['H50'](v) if s in filt else v) if filt is not None else sel[base](v))[:]; rng.shuffle(cand); acc = 0
         for d in cand:
             if acc >= budget: break
             out.append(d); acc += d[1]
-    rng.shuffle(out)
+    xs = []
+    for nm, fr in ex:
+        arr, dl = extra_docs(nm); acc = 0; k = 0; order = list(range(len(dl))); rng.shuffle(order)
+        while acc < tokens * fr:
+            i0, i1 = dl[order[k % len(order)]]; xs.append(arr[i0:i1]); acc += i1 - i0; k += 1
+        print(f'  {arm}_{rep}: extra {nm} {acc} tokens ({k / len(dl):.2f} passes over {len(dl)} docs)')
+    items = [('d', d) for d in out] + [('x', x) for x in xs]; rng.shuffle(items)
     d = os.path.join(root, f'{arm}_{rep}'); os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, 'train.bin'), 'wb') as f:
-        for ds, n, l, x in out:
-            seg = tb[ds:ds + n]; f.write(seg.tobytes())
+        for kind, it in items:
+            if kind == 'x': f.write(it.tobytes()); mt += len(it); continue
+            ds, n, l, x = it; seg = tb[ds:ds + n]; f.write(seg.tobytes())
             if seg[-1] != 0: f.write(b'\0\0')
             ml += l * n; mx += x * n; mt += n
     for fn in ('val.bin', 'tokenizer.json', 'tokenizer.bin', 'template.txt', 'meta.json'):
         shutil.copy(os.path.join(src_dir, fn), d)
-    print(f'{arm}_{rep}: {len(out)} docs, {mt} tokens, loss/tok {ml/mt:.3f}, excess/tok {mx/mt:.3f}')
+    print(f'{arm}_{rep}: {len(out)} docs + {len(xs)} extra, {mt} tokens, pool loss/tok {ml/max(1,mt):.3f}')
