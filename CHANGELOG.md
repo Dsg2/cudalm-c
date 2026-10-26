@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased - 2026-10-27
+
+- prep/d1build.py: json.dump call
+- Add default=int to prevent serialization errors on non-int values
+
 ## Unreleased - 2026-10-26
 
 - update(queue): adjust benchmark rows
