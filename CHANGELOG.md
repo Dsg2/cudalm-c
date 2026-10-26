@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-10-26
 
+- update(queue): adjust benchmark rows
+
+## Unreleased - 2026-10-26
+
 - Update k_kd_adj to accept rn parameter and compute renormalised mass
 - Add HWR5/HWR9 entries to prep/docsel.py for KD arms
 - Add new scripts/kdfix.ps1 for KD rerun with build 20o

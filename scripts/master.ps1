@@ -2,13 +2,14 @@
 # Stage 1: 500-step proxy anneals of LS-Micro2_it60000 (fdoc.ps1), 4 reps vs control HWK, gated by prep\gate.py:
 #   ADOPT d >= +0.10 & t >= 3 | EXTEND to 8 reps if +0.05 <= d < +0.10 (or t < 3) | KILL d <= 0 | else HOLD
 #   arms: HWM (FineMath unfiltered), HWC (code 21% -> 10%), HW+arith1/3, HW+cloze3/6, HWW+dclm12 (DCLM for 1/3 of web),
-#         HWK5/HWK9 (online KD from LS2.5 = g3aux top-8, alpha 0.5 / 0.9)
+#         HWR5/HWR9 (online KD from LS2.5 = g3aux top-8, alpha 0.5 / 0.9; 20o target = raw top-8 + missing mass on the
+#         true token). 20n's renormalised KD (HWK5) lost -0.56 margin on 2 reps: stopped there, HWK9 dropped (2026-10-26).
 # Gate 1: stop unless the adopted gains sum to >= +0.30 margin or AM-dev gains >= 2 points.
 # Stage 2: the adopted recipe (D1) as the full decay of it60000 (CUDALM_ITERS=87036, LS-Micro2-HW's schedule) at seeds 9013
 #   and 9014, controls LS-Micro2-HW (9013) and HWB (v3pre-hw, 9014); LR_MIN 0.02 variant; soup = avg of the seeds;
 #   last-k average of the 9013 run. D1 adopted if d >= +0.20 & z >= 2.5, or >= +0.12 on both seeds.
 # Results: logs\master\master.res
-$E = 'E:\cudalm'; $X = "$E\cudalm20n.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $FP = "$E\logs\fp"; $DOC = "$FP\doc"
+$E = 'E:\cudalm'; $X = "$E\cudalm20o.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $FP = "$E\logs\fp"; $DOC = "$FP\doc"
 $L = "$E\logs\master"; $RES = "$L\master.res"; New-Item -ItemType Directory -Force $L | Out-Null; Set-Location $E
 $env:FDOC_EXE = $X
 function Log($s) { "$(Get-Date -Format 'MM-dd HH:mm') $s" | Out-File -Append -Encoding ascii $RES }
@@ -25,13 +26,13 @@ if (!(Test-Path $RES)) { Log "start | build $X" }
 $data = @('HWM', 'HWC', 'HW+arith1', 'HW+arith3', 'HW+cloze3', 'HW+cloze6', 'HWW+dclm12')
 if (!(Test-Path "$L\s1.done")) {
     Log 'stage 1: data arms + control'; Fdoc (@('HWK') + $data) 4 '' ''
-    Log 'stage 1: KD arms'; Fdoc @('HWK5') 4 'CUDALM_KD_ALPHA=0.5' 'g3aux'; Fdoc @('HWK9') 4 'CUDALM_KD_ALPHA=0.9' 'g3aux'
-    $all = $data + @('HWK5', 'HWK9'); $g = Gate $all
+    Log 'stage 1: KD arms (20o)'; Fdoc @('HWR5') 4 'CUDALM_KD_ALPHA=0.5' 'g3aux'; Fdoc @('HWR9') 4 'CUDALM_KD_ALPHA=0.9' 'g3aux'
+    $all = $data + @('HWK5', 'HWR5', 'HWR9'); $g = Gate $all
     $ext = @($all | ? { $g[$_] -and $g[$_][0] -eq 'EXTEND' })
     if ($ext) { Log "stage 1: extending to 8 reps: $($ext -join ' ')"
-        Fdoc (@('HWK') + @($ext | ? { $_ -notlike 'HWK*' })) 8 '' ''
-        if ($ext -contains 'HWK5') { Fdoc @('HWK5') 8 'CUDALM_KD_ALPHA=0.5' 'g3aux' }
-        if ($ext -contains 'HWK9') { Fdoc @('HWK9') 8 'CUDALM_KD_ALPHA=0.9' 'g3aux' }
+        Fdoc (@('HWK') + @($ext | ? { $_ -notlike 'HWK?' -and $_ -notlike 'HWR?' })) 8 '' ''
+        if ($ext -contains 'HWR5') { Fdoc @('HWR5') 8 'CUDALM_KD_ALPHA=0.5' 'g3aux' }
+        if ($ext -contains 'HWR9') { Fdoc @('HWR9') 8 'CUDALM_KD_ALPHA=0.9' 'g3aux' }
         $g = Gate $all }
     $g.Keys | % { "$_ $($g[$_][0]) $($g[$_][1])" } | Set-Content -Encoding ascii "$L\s1.decisions"
     "ok" | Out-File -Encoding ascii "$L\s1.done" }
@@ -44,7 +45,7 @@ foreach ($fam in @('arith', 'cloze', 'dclm')) {
     $best = $ad | ? { $_ -match "\+$fam\d+$" } | Sort-Object { -$dec[$_][1] } | Select-Object -First 1
     if ($best) { $ex += ($best -split '\+')[1]; $sum += $dec[$best][1]; if ($fam -eq 'dclm') { $base = $base -replace '^HW', 'HWW' } } }
 if ($base -eq 'HWWMC' -or $base -eq 'HWWM' -or $base -eq 'HWWC') { $base = $base.Substring(0, 2) + $base.Substring(3); Log "note: DCLM swap + $($base): web multiplier dropped (no combined HWV entry)" }
-$kdA = $ad | ? { $_ -like 'HWK?' } | Sort-Object { -$dec[$_][1] } | Select-Object -First 1
+$kdA = $ad | ? { $_ -like 'HWR?' } | Sort-Object { -$dec[$_][1] } | Select-Object -First 1
 if ($kdA) { $sum += $dec[$kdA][1] }
 $recipe = (@($base) + $ex) -join '+'
 # AM-dev gain of the adopted arith arm (dev items, same reps)
@@ -58,7 +59,7 @@ $D1 = "D:\cudalm_data\d1_$($recipe.Replace('+','_'))"
 if (!(Test-Path "$D1\train.bin")) { Log "stage 2: building $D1"
     py -3 "$E\prep\d1build.py" $V "$E\logs\fdec" "$FP\extra" $D1 $recipe 1.8e9 *> "$L\d1build.log"; Get-Content "$L\d1build.log" -Tail 3 | % { Log "  $_" } }
 $kdf = ''
-if ($kdA) { $kdf = "F:\cudalm_kd\d1.kd"; $alpha = if ($kdA -eq 'HWK5') { '0.5' } else { '0.9' }
+if ($kdA) { $kdf = "F:\cudalm_kd\d1.kd"; $alpha = if ($kdA -eq 'HWR5') { '0.5' } else { '0.9' }
     if (!(Test-Path "$L\kd.done")) { Log 'stage 2: teacher cache over the D1 corpus'; Clean
         & $X kdcache g3aux $D1 $kdf 8 8 *> "$L\kdcache.log"; "ok" | Out-File -Encoding ascii "$L\kd.done" } }
 function Decay($nm, $data, $seed, $extra) {
