@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-27
 
+- New file: scripts/stage4.ps1
+- Implements stage4 logic: waits for stage3, runs loop arm and LS-Micro3-D1lr evaluation
+- Uses environment variables for paths and seeds
+- Outputs results to stage4.res
+
+## Unreleased - 2026-10-27
+
 - prep/d1build.py: json.dump call
 - Add default=int to prevent serialization errors on non-int values
 
