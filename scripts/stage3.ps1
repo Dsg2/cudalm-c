@@ -5,7 +5,7 @@
 # Adopt: mean paired d_margin over both seeds >= +0.10 and both seeds > 0. Then ONE full pretrain (87,036 steps, v3pre)
 # with every adopted change (LS-Micro3), and its it60000 decayed on the stage-2 D1 corpus like D1A (LS-Micro3-D1).
 # Results: logs\master\stage3.res
-$E = 'E:\cudalm'; $X = "$E\cudalm20n.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $L = "$E\logs\master"; $RES = "$L\stage3.res"
+$E = 'E:\cudalm'; $X = "$E\cudalm20o.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $L = "$E\logs\master"; $RES = "$L\stage3.res"
 Set-Location $E
 function Log($s) { "$(Get-Date -Format 'MM-dd HH:mm') $s" | Out-File -Append -Encoding ascii $RES }
 function Clean { Get-ChildItem env: | ? { $_.Name -like 'CUDALM_*' -or $_.Name -like 'QLM_*' -or $_.Name -like 'NGRAM_*' } | % { Remove-Item "env:$($_.Name)" } }
@@ -34,7 +34,7 @@ foreach ($seed in 9301, 9302) { foreach ($a in $ARMS.Keys) { $env:CUDALM_KEEP_EV
 $adopt = @()
 foreach ($a in @($ARMS.Keys | ? { $_ -ne 'base' })) {
     $d = foreach ($seed in 9301, 9302) {
-        $o = & $X lmeval-vs "$L\S3_base_$seed.items.tsv" "$L\S3_$($a)_$seed.items.tsv" 2>&1 | ? { $_ -match '^margin index' }
+        $o = & $X lmeval-vs "$L\S3_base_$seed.items.tsv" "$L\S3_$($a)_$seed.items.tsv" 2>&1 | ? { $_ -match 'margin index' } | % { $_.Trim() }
         Log "  $a seed $seed : $o"; [double](($o -split '\s+')[2]) }
     $mean = ($d | Measure-Object -Average).Average; $ok = $mean -ge 0.10 -and ($d | ? { $_ -le 0 }).Count -eq 0
     Log "$($a): mean d_margin $([math]::Round($mean,3)) -> $(if ($ok) { 'ADOPT' } else { 'reject' })"; if ($ok) { $adopt += $a } }
