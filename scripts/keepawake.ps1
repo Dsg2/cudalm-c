@@ -1,13 +1,10 @@
-# Holds ES_SYSTEM_REQUIRED (no system sleep, display may still turn off) until stage 4 finishes or no cudalm process runs.
+# Holds ES_SYSTEM_REQUIRED (no idle sleep; the display may still turn off; a manual sleep still works) until the last line
+# of -Res matches -Done.   keepawake.ps1 -Res E:\cudalm\logs\xdata\xdata.res -Done 'xdata done'
+param([string]$Res = 'E:\cudalm\logs\master\stage4.res', [string]$Done = 'stage 4 done')
 Add-Type -Name P -Namespace W -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);'
-$res = 'E:\cudalm\logs\master\stage4.res'
-[W.P]::SetThreadExecutionState([uint32]2147483649) | Out-Null
-"keepawake on $(Get-Date)"
+$t0 = Get-Date; "keepawake on $t0 until '$Done' in $Res"
 while ($true) {
-    Start-Sleep 300; [W.P]::SetThreadExecutionState([uint32]2147483649) | Out-Null
-    $s3 = 'E:\cudalm\logs\master\stage3.res'
-    $done = (Get-Content $s3 -Tail 1) -match 'stage 3 done' -and (Get-Content $res -Tail 1) -match 'stage 4 done' -and
-            (Get-Item $res).LastWriteTime -gt (Get-Item $s3).LastWriteTime
-    if ($done -and !(Get-Process cudalm* -EA 0)) { break } }
+    [W.P]::SetThreadExecutionState([uint32]2147483649) | Out-Null; Start-Sleep 300
+    if ((Test-Path $Res) -and (Get-Item $Res).LastWriteTime -gt $t0 -and (Get-Content $Res -Tail 1) -match $Done) { break } }
 [W.P]::SetThreadExecutionState([uint32]2147483648) | Out-Null
 "keepawake off $(Get-Date)"

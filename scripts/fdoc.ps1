@@ -2,9 +2,11 @@
 # LS2.5 (g3aux); arms (see prep\docsel.py) x $Reps replicates (own docs + own seed), each a 500-step
 # anneal of LS-Micro2_it60000 (LR 1.2e-3 -> 1.2e-4). Results: logs\fp\fdoc.res, summary logs\fp\fdoc_sum.txt
 # Dev sets (bench\amdev.tsv, bench\clozedev.tsv when present) are scored into <job>.dev.items.tsv; prep\gate.py decides.
-param([int]$NP = 4000, [int]$Reps = 4, [string[]]$Arms = @('R', 'L50', 'H50', 'X50'))
-$E = 'E:\cudalm'; $X = "$E\cudalm20m.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $FP = "$E\logs\fp"
-$DD = 'D:\cudalm_data\fdoc'; $L = "$FP\doc"; $RES = "$FP\fdoc.res"; $SRC = 'LS-Micro2_it60000'; $TOK = 32768000
+# -Src: checkpoint every arm anneals from; -Tag: separate results (logs\fp\doc_<tag>, fdoc_<tag>.res, models FD<tag>_<job>)
+param([int]$NP = 4000, [int]$Reps = 4, [string[]]$Arms = @('R', 'L50', 'H50', 'X50'), [string]$Src = 'LS-Micro2_it60000', [string]$Tag = '')
+$E = 'E:\cudalm'; $X = "$E\cudalm20o.exe"; $M = "$E\models"; $V = "$E\prep\data\v3pre"; $FP = "$E\logs\fp"
+$T = if ($Tag) { "_$Tag" } else { '' }
+$DD = 'D:\cudalm_data\fdoc'; $L = "$FP\doc$T"; $RES = "$FP\fdoc$T.res"; $SRC = $Src; $TOK = 32768000; $MP = "FD$($Tag)_"
 if ($env:FDOC_EXE) { $X = $env:FDOC_EXE }
 New-Item -ItemType Directory -Force $L, $DD | Out-Null; Set-Location $E
 function Clean { Get-ChildItem env: | ? { $_.Name -like 'CUDALM_*' -or $_.Name -like 'QLM_*' -or $_.Name -like 'NGRAM_*' } | % { Remove-Item "env:$($_.Name)" } }
@@ -12,8 +14,8 @@ function CopyModel($a, $b) { Get-ChildItem "$M\$a.bin*" | % { Copy-Item $_.FullN
 function Log($s) { $s | Out-File -Append -Encoding ascii $RES }
 $DEV = (@('amdev', 'clozedev') | ? { Test-Path "$E\bench\$_.tsv" }) -join ','
 function DevScore($j) {
-    if (!$DEV -or (Test-Path "$L\$j.dev.items.tsv") -or !(Test-Path "$M\FD_$j.bin")) { return }
-    Clean; $env:CUDALM_LMEVAL_ITEMS = "$L\$j.dev.items.tsv"; & $X lmeval "FD_$j" $DEV *> "$L\$j.dev.log"; Clean }
+    if (!$DEV -or (Test-Path "$L\$j.dev.items.tsv") -or !(Test-Path "$M\$MP$j.bin")) { return }
+    Clean; $env:CUDALM_LMEVAL_ITEMS = "$L\$j.dev.items.tsv"; & $X lmeval "$MP$j" $DEV *> "$L\$j.dev.log"; Clean }
 if (!(Test-Path $RES)) { "start $(Get-Date) | pool $NP blocks | reps $Reps | arms $($Arms -join ' ') | base $SRC" | Out-File -Encoding ascii $RES }
 if (!(Test-Path "$FP\pool_spans.txt")) { py -3 "$E\prep\docsel.py" pool $FP $NP *>> "$FP\docsel.log" }
 foreach ($sc in @(@('micro', 'LS-Micro2'), @('ref', 'g3aux'))) {
@@ -26,7 +28,7 @@ $jobs = foreach ($rp in 1..$Reps) { foreach ($a in $Arms) { "$($a)_$rp" } }
 $need = $jobs | ? { !(Test-Path "$DD\$_\train.bin") } | % { $p = $_.Split('_'); $p[0]; $p[1] }
 if ($need) { py -3 "$E\prep\docsel.py" build $V $FP $DD $TOK @need *>> "$FP\docsel.log" }
 foreach ($j in $jobs) {
-    $nm = "FD_$j"; if (Test-Path "$L\$j.done") { DevScore $j; continue }
+    $nm = "$MP$j"; if (Test-Path "$L\$j.done") { DevScore $j; continue }
     CopyModel $SRC $nm; Clean
     $env:CUDALM_LR = '1.2e-3'; $env:CUDALM_WARMUP = '10'; $env:CUDALM_WSD_DECAY = '0.99'; $env:CUDALM_SEED = "$(9200 + [int]$j.Split('_')[1])"
     $env:CUDALM_BENCH_EVERY = '0'; $env:CUDALM_KEEP_EVERY = '0'
