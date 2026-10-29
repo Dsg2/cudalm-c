@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-29
 
+- Update preset and new model commands
+- Add TUI custom preset field
+- Add TUI shape validation for new model
+
+## Unreleased - 2026-10-29
+
 - Tidy changelog
 
 ## Unreleased - 2026-10-29

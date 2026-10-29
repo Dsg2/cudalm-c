@@ -91,7 +91,8 @@ cudalm train mymodel mysft 1
 ## CLI
 
 ```
-cudalm new       <name> <preset> [experts]
+cudalm new       <name> <preset> [experts]           preset "custom" = any shape: set CUDALM_D / _L / _H / _KV / _F
+                                                     (base D160 L11 H5 KV1 F432 T2048; TUI New model > preset custom)
 cudalm train     <name> <corpus> [epochs]
 cudalm eval      <name> <corpus> [batches] [batch_size]
 cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]

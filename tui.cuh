@@ -21,7 +21,7 @@ enum { F_TEXT, F_MODEL, F_DATA, F_FILE, F_CHOICE, F_DIR, F_PATH, F_TOKD, F_OPT, 
  * vis: 0 always, 1 ngram only, 2 engram only, 3 any memory, 4 advanced (F2 shows). ext: "a|b" choices, a file glob, or F_PATH suffixes ".a;.b".
  * F_DATA = corpus picker, F_TOKD = tokenizer/corpus picker, F_DIR / F_PATH = folder / file-or-folder browser. */
 typedef struct { const char*label,*def; int kind; const char*arg; int vis; const char*ext; const char*help; } TFld;   /* help: '\n' = next line */
-#define T_NF 26
+#define T_NF 32
 typedef struct { const char*cmd,*title,*help; TFld f[T_NF]; const char*run; int grp; } TCmd;   /* run: help on [ Run ]; grp 1 = Data tools, 2 = Diagnostics, 3 = Data tools (advanced) */
 #define T_TEXTIN ".jsonl;.json;.txt"
 #define T_PRESETS "nano|micro|m1|m3|m6|m8|m16|m32|m70|m50|m64e|m220e|a8m|a8m9|s8x|s8w"
@@ -59,8 +59,14 @@ static const TCmd T_CMDS[]={
  {"new","New model","create models\\<name>.bin + config .bin.env (other settings: Environment screen, also saved)",
   {{"name","",F_TEXT,0,0,0,"File name: creates models\\<name>.bin plus its config models\\<name>.bin.env.\n"
      "Refused if the model already exists. Train it next with Train (model = this name)."},
-   {"preset","s8w",F_CHOICE,T_PRESETS,0,0,"Model shape: width D, layers L, attention heads H (KV = shared key/value heads),\n"
-     "FFN width F (per expert), default context T and vocab V. Left/Right cycles; the shape is shown below."},
+   {"preset","s8w",F_CHOICE,T_PRESETS "|custom",0,0,"Model shape: width D, layers L, attention heads H (KV = shared key/value heads),\n"
+     "FFN width F (per expert), default context T and vocab V. custom = set every shape value yourself below."},
+   {" dim","160",F_ENV,"CUDALM_D",5,0,"Model width D (residual stream). Must be divisible by heads, with an even head dim (D/heads).\n"
+     "Embedding params = vocab x D, so width is the costliest knob at small sizes."},
+   {" layers","11",F_ENV,"CUDALM_L",5,0,"Number of transformer blocks (1..64). Each adds attention + FFN (or experts) params."},
+   {" heads","5",F_ENV,"CUDALM_H",5,0,"Attention (query) heads; head dim = dim / heads, must be even."},
+   {" kv heads","1",F_ENV,"CUDALM_KV",5,0,"Shared key/value heads (GQA); heads must be divisible by this. 1 = MQA, = heads = full MHA."},
+   {" ffn","432",F_ENV,"CUDALM_F",5,0,"FFN hidden width (SwiGLU, 3 x D x F params), per expert when experts >= 2."},
    {"experts","32",F_TEXT,0,0,0,"0 = dense FFN. >=2 = Mixture of Experts: each layer gets this many FFN experts (max 256)\n"
      "and every token uses only top-k of them -- total params grow with experts, compute per token does not."},
    {"ctx","0",F_TEXT,0,0,0,"Context length in tokens (0 = preset default, min 16). Longer = more activation VRAM\n"
@@ -532,11 +538,13 @@ static void t_env_push(const char*k,const char*v){
     if(t_nsaved<40){ const char*o=getenv(k); snprintf(t_saved[t_nsaved][0],T_MAXL,"%s",k); snprintf(t_saved[t_nsaved][1],T_MAXL,"%s",o?o:""); t_nsaved++; }
     lm_setenv(k,v); }
 static void t_env_pop(void){ while(t_nsaved>0){ t_nsaved--; lm_setenv(t_saved[t_nsaved][0],t_saved[t_nsaved][1]); } }
+static int t_cust;                                                 /* New model preset = custom: shape fields (vis 5) shown */
 static int t_mode(const TCmd*c, char vals[][T_MAXL]){
+    t_cust=0; for(int i=0;i<T_NF&&c->f[i].label;i++) if(!strcmp(c->f[i].label,"preset")) t_cust=!strcmp(vals[i],"custom");
     for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_MEM) return !strcmp(vals[i],"engram")?2:!strcmp(vals[i],"ngram")?1:0;
     return -1; }
 static int t_adv;                                                  /* F2: show advanced fields (vis 4) */
-static int t_vis(const TFld*f,int mode){ return !f->vis || (f->vis==4 ? t_adv : f->vis==3 ? mode>0 : mode==f->vis); }
+static int t_vis(const TFld*f,int mode){ return !f->vis || (f->vis==5 ? t_cust : f->vis==4 ? t_adv : f->vis==3 ? mode>0 : mode==f->vis); }
 /* hidden or empty fields are pushed as unset, so a loaded profile cannot leak into the other memory mode */
 static void t_form_env(const TCmd*c, char vals[][T_MAXL]){
     int mode=t_mode(c,vals);
@@ -547,13 +555,16 @@ static void t_form_env(const TCmd*c, char vals[][T_MAXL]){
             t_env_push(f->arg,v); }
         else if(f->kind==F_MEM){ t_env_push("CUDALM_NGRAM",mode?"1":"0"); t_env_push("CUDALM_ENGRAM",mode==2?"1":"0"); } } }
 static void t_new_stats(const TCmd*c, char vals[][T_MAXL]){
-    Cfg cf; if(!preset(vals[1],&cf)){ printf("  \x1b[2m(unknown preset)\x1b[0m\n"); return; }
-    cf.n_mtp=0; cf.n_exp=atoi(vals[2]); if(cf.n_exp<=1) cf.n_exp=0;
+    int ci=(int)(c-T_CMDS), ip=t_fi(ci,"preset"), ie=t_fi(ci,"experts"); char err[200];
+    Cfg cf; if(ip<0||!preset(vals[ip],&cf)){ printf("  \x1b[2m(unknown preset)\x1b[0m\n"); return; }
+    cf.n_mtp=0; cf.n_exp=ie<0?0:atoi(vals[ie]); if(cf.n_exp<=1) cf.n_exp=0;
     t_form_env(c,vals);
-    cf.pool=env_i("CUDALM_UNIPOOL",0)&&cf.n_exp>1; if(!layout_apply(&cf)) return; cfg_derive(&cf);
+    if(!shape_env(&cf,err,sizeof err)){ printf("  \x1b[31m%s\x1b[0m\n",err); t_env_pop(); return; }
+    cf.pool=env_i("CUDALM_UNIPOOL",0)&&cf.n_exp>1; if(!layout_apply(&cf)){ t_env_pop(); return; } cfg_derive(&cf);
     int kl[64], k=topk_parse(getenv("CUDALM_TOPK"),getenv("CUDALM_TOPK_L"),kl);
     MemCfg m; mem_from_env(&m,cf.L);
-    printf("\x1b[1mparams\x1b[0m \x1b[2m(V=%d from the preset; the first train resizes it to the data's vocab)\x1b[0m\n",cf.V);
+    printf("\x1b[1mparams\x1b[0m  D=%d L=%d H=%d KV=%d F=%d \x1b[2m(V=%d from the preset; the first train resizes it to the data's vocab)\x1b[0m\n",
+           cf.D,cf.L,cf.H,cf.KV,cf.F,cf.V);
     pstats_print(&cf,&m,k,kl,env_i("CUDALM_ATTN_GATE",0)!=0);
     t_env_pop(); }
 
@@ -1030,7 +1041,8 @@ static int tui_check(int argc,char**argv){
         for(int i=0;i<T_NF&&c->f[i].label;i++) if(c->f[i].kind==F_MODEL&&model) snprintf(V[i],T_MAXL,"%s",model);
         int ok=t_cmdline(c,V,cl,sizeof cl,err,sizeof err);
         printf("%-16s %s\n",c->title,ok?cl:err);
-        if(c->grp==1||c->grp==3){ int np=t_panel(c,V,1); if(np) printf("  (%d problem%s)\n",np,np>1?"s":""); } }
+        if(c->grp==1||c->grp==3){ int np=t_panel(c,V,1); if(np) printf("  (%d problem%s)\n",np,np>1?"s":""); }
+        if(t_is(c,"New model")){ t_mode(c,V); t_new_stats(c,V); } }
     return 0; }
 static int tui_main(void){
     HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); DWORD m=0;

@@ -224,9 +224,18 @@ static int preset(const char*n, Cfg*c){
     else if(!strcmp(n,"s8w")){c->V=8192;c->D=384;c->L=8; c->H=6; c->KV=2;c->F=384; c->T=1024;}
     /* modular base (MODULAR_LLM_PLAN.md): pair with CUDALM_LAYOUT; F = expert width */
     else if(!strcmp(n,"mod230")){c->V=16384;c->D=512;c->L=12;c->H=8;c->KV=2;c->F=256;c->T=1024;}
+    /* base for a hand-set shape (CUDALM_D/L/H/KV/F); defaults = the LS-Micro shape */
+    else if(!strcmp(n,"custom")){c->V=16384;c->D=160;c->L=11;c->H=5;c->KV=1;c->F=432;c->T=2048;}
     else return 0;
     cfg_derive(c); return 1;
 }
+/* CUDALM_D/_L/_H/_KV/_F shape overrides at new; 0 + err filled if the shape is invalid */
+static int shape_env(Cfg*c,char*err,size_t ne){
+    int*f[5]={&c->D,&c->L,&c->H,&c->KV,&c->F}; const char*k[5]={"CUDALM_D","CUDALM_L","CUDALM_H","CUDALM_KV","CUDALM_F"};
+    for(int i=0;i<5;i++){ const char*e=getenv(k[i]); if(e&&atoi(e)>0) *f[i]=atoi(e); }
+    if(c->L>64||c->D%c->H||c->H%c->KV||(c->D/c->H)&1){
+        snprintf(err,ne,"bad shape D=%d L=%d H=%d KV=%d (need D%%H==0, H%%KV==0, even head dim, L<=64)",c->D,c->L,c->H,c->KV); return 0; }
+    cfg_derive(c); return 1; }
 typedef struct { size_t emb; size_t an1[64],wq[64],wk[64],wv[64],wo[64],an2[64],wr[64],w1[64],w3[64],w2[64];
                  size_t nf; size_t mtp[16]; } Off;
 /* Layout must match tinylm.c map_weights EXACTLY or checkpoints stop being
@@ -7175,7 +7184,8 @@ static int cmd_info(int argc,char**argv){
 static int cmd_new(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
         "usage: cudalm new <name> <preset> [n_experts] [ctx] [window] [full_every]\n"
-        "  presets: nano micro m1 m3 m6 m8 m16 m32 m70 m50 m64e\n"
+        "  presets: nano micro m1 m3 m6 m8 m16 m32 m70 m50 m64e m220e a8m a8m9 s8x s8w mod230\n"
+        "           custom = D160 L11 H5 KV1 F432 T2048 base, meant for CUDALM_D/_L/_H/_KV/_F\n"
         "  n_experts: >=2 turns the FFN into top-1 routed MoE (more total capacity\n"
         "             at ~the same per-token compute). e.g. m64e 8 = 16.2M active / 63.0M total\n"
         "  ctx:       override the preset context length (e.g. 8192)\n"
@@ -7197,9 +7207,7 @@ static int cmd_new(int argc,char**argv){
         return 1; }
     const char *name=argv[2], *ps=argv[3];
     Cfg c; if(!preset(ps,&c)){ fprintf(stderr,"unknown preset '%s'\n",ps); return 1; }
-    { int*f[5]={&c.D,&c.L,&c.H,&c.KV,&c.F}; const char*k[5]={"CUDALM_D","CUDALM_L","CUDALM_H","CUDALM_KV","CUDALM_F"};   /* shape overrides */
-      for(int i=0;i<5;i++){ const char*e=getenv(k[i]); if(e&&atoi(e)>0) *f[i]=atoi(e); }
-      if(c.L>64||c.D%c.H||c.H%c.KV||(c.D/c.H)&1){ fprintf(stderr,"new: bad shape D=%d L=%d H=%d KV=%d (need D%%H==0, H%%KV==0, even head dim, L<=64)\n",c.D,c.L,c.H,c.KV); return 1; } }
+    { char err[200]; if(!shape_env(&c,err,sizeof err)){ fprintf(stderr,"new: %s\n",err); return 1; } }
     c.n_mtp=0;                                 /* MTP is not trained on the CUDA path */
     c.n_exp = argc>4 ? atoi(argv[4]) : 0; if(c.n_exp==1) c.n_exp=0;
     if(c.n_exp>256){ fprintf(stderr,"n_experts %d > 256\n",c.n_exp); return 1; }
