@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-10-29
+
+- Add cmd_ngfold() to cudalm.cu
+- Add ngfold entry to cudalm main()
+- Add ngfold.ps1 and scripts/ngfold.ps1
+- Add scripts/ngrec.ps1
+
 ## Unreleased - 2026-10-27
 
 - New file: scripts/stage4.ps1

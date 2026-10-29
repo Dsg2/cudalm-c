@@ -8559,6 +8559,47 @@ static void cmd_avg(int argc,char**argv){
     { char a1[1100],b1[1100]; size_t sl; snprintf(a1,sizeof a1,"%s.env",p0); snprintf(b1,sizeof b1,"%s.env",out);
       uint8_t*sb=read_file(a1,&sl); if(sb){ FILE*g=fopen(b1,"wb"); if(g){ fwrite(sb,1,sl,g); fclose(g); } free(sb); } }
     printf("[avg] %d checkpoints -> %s (%zu params%s%s)\n",nin,out,np,g_ngram_on?", n-gram table re-encoded":"",g_attg||g_xn?", side weights":""); free(P); free(tmp); }
+/* cudalm ngfold <out> <in> <rows> <data_dir> [tokens]: shrink the hashed n-gram table to <rows> = R/f rows with no retrain.
+ * Keys are h % R, so h % (R/f) == (h % R) % (R/f): rows r, r+R/f, ... collide in the smaller table exactly as they merge here.
+ * Each merged row is the usage-weighted mean (row counts over the first [tokens] of <data_dir>/train.bin, +1 smoothing).
+ * Table moments restart at zero (re-encoded q4, old sref kept); weights, Wng and side weights are copied unchanged. */
+static void cmd_ngfold(int argc,char**argv){
+    if(argc<6){ fprintf(stderr,"usage: cudalm ngfold <out> <in> <rows> <data_dir> [tokens=2e8]\n"); exit(1); }
+    side_apply(argv[3]); char pk[1024],op[1100],out[1024]; model_resolve(argv[3],pk,sizeof pk);
+    Cfg c; Tok*tk=NULL; float*P=model_load_full(pk,&c,&tk); size_t np=param_count(&c);
+    gC=c; cuda_init(); ngram_infer(pk);
+    if(!g_ngram_on||g_eg_on||g_ng_tri){ fprintf(stderr,"[ngfold] needs a plain n-gram table (not engram, not NGRAM_TRI)\n"); exit(1); }
+    int R=g_ng_R, R2=atoi(argv[4]), De=g_ng_De, O=g_ng_order;
+    if(R2<=0||R2>=R||R%R2||O<1||O>8){ fprintf(stderr,"[ngfold] rows %d must divide %d (and be smaller)\n",R2,R); exit(1); }
+    size_t nt=(size_t)R*De; float*t=(float*)malloc(nt*4); ck(cudaMemcpy(t,g_ng,nt*4,cudaMemcpyDeviceToHost),"fold d2h");
+    double*cnt=(double*)calloc(R,8);
+    { char p[1100]; snprintf(p,sizeof p,"%s/train.bin",argv[5]); FILE*f=fopen(p,"rb"); if(!f){ perror(p); exit(1); }
+      size_t want=argc>6?(size_t)atof(argv[6]):200000000, got=0, nb=1<<20; uint16_t*b=(uint16_t*)malloc(nb*2); unsigned hs[8]; int nh=0;
+      while(got<want){ size_t n=fread(b,2,nb,f); if(!n) break;
+          for(size_t i=0;i<n;i++){ memmove(hs+1,hs,7*sizeof(unsigned)); hs[0]=b[i]; if(nh<O){ nh++; if(nh<O) continue; }
+              unsigned h=2166136261u; for(int j=O-1;j>=0;j--) h=(h^hs[j])*16777619u;   /* = k_ngram_key */
+              h^=h>>15; cnt[h%(unsigned)R]+=1; }
+          got+=n; }
+      fclose(f); free(b); printf("[ngfold] row usage from %zu tokens of %s\n",got,p); }
+    int fo=R/R2; float*t2=(float*)malloc((size_t)R2*De*4); double tot=0,mix=0;
+    for(int r=0;r<R2;r++){ double w=0,mx=0;
+        for(int k=0;k<fo;k++){ double x=cnt[r+(size_t)k*R2]; w+=x+1; tot+=x; if(x>mx) mx=x; }
+        mix+=w-fo-mx;                                  /* usage landing on a row it now shares with a busier one */
+        for(int d=0;d<De;d++){ double s=0; for(int k=0;k<fo;k++){ size_t rr=r+(size_t)k*R2; s+=(cnt[rr]+1)*t[rr*De+d]; }
+            t2[(size_t)r*De+d]=(float)(s/w); } }
+    float sref=g_ngq_spH.sref; g_ng_R=R2; g_ng=(float*)dmalloc((size_t)R2*De*4);
+    ck(cudaMemcpy(g_ng,t2,(size_t)R2*De*4,cudaMemcpyHostToDevice),"fold h2d");
+    if(g_ng_q4){ ngram_q4_setup(); g_ngq_spH.sref=sref; ck(cudaMemcpy(g_ngq_spD,&g_ngq_spH,sizeof(QSpanD),cudaMemcpyHostToDevice),"fold sref"); }
+    model_path(argv[2],out,sizeof out); snprintf(op,sizeof op,"%s.opt",out);
+    model_save_bundle(out,&c,P,np,g_tokblob,g_tokblobl); ngram_save(op,0); t1_save(op,0);
+    { char a1[1100],b1[1100]; snprintf(a1,sizeof a1,"%s.env",pk); snprintf(b1,sizeof b1,"%s.env",out);   /* env with the new row count */
+      FILE*fi=fopen(a1,"r"),*fw=fopen(b1,"w"); char l[1024]; int seen=0;
+      if(fw){ if(fi) while(fgets(l,sizeof l,fi)){ if(!strncmp(l,"NGRAM_ROWS=",11)){ fprintf(fw,"NGRAM_ROWS=%d\n",R2); seen=1; } else fputs(l,fw); }
+          if(!seen) fprintf(fw,"NGRAM_ROWS=%d\n",R2); fclose(fw); }
+      if(fi) fclose(fi); }
+    printf("[ngfold] %s: n-gram table %d -> %d rows (-%zu params); %.1f%% of row usage now shares a row with a busier one -> %s\n",
+           pk,R,R2,(size_t)(R-R2)*De,100.0*mix/(tot>0?tot:1),out);
+    free(t); free(t2); free(cnt); free(P); }
 static void cmd_eval(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
         "usage: cudalm eval <name|model.bin> <data_dir> [batches] [batch_size]\n"
@@ -10359,6 +10400,7 @@ int main(int argc,char**argv){
         "  cudalm lmeval   <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]\n"
         "  cudalm lmeval-vs <A.items.tsv> <B.items.tsv>   paired per-item comparison of two lmeval dumps\n"
         "  cudalm avg      <out> <in1> <in2> [...]   (checkpoint average / soup; eval + export)\n"
+        "  cudalm ngfold   <out> <in> <rows> <data_dir> [tokens]   (fold the n-gram table to rows = R/f, usage-weighted)\n"
         "  cudalm kdcache  <teacher> <data_dir> <out.kd> [K=8] [B=8]   (teacher top-K for CUDALM_KD)\n"
         "  cudalm grow    <in> <out.bin> [--layers N] [--ffn F] [--noise x]\n"
         "  cudalm quantize <in> <out.bin> [q8|q4|q4n|fp16]\n"
@@ -10380,6 +10422,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"lmeval"))   { cmd_lmeval(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval-vs")){ cmd_lmeval_vs(argc,argv); return 0; }
     if(!strcmp(argv[1],"avg"))      { cmd_avg(argc,argv); return 0; }
+    if(!strcmp(argv[1],"ngfold"))   { cmd_ngfold(argc,argv); return 0; }
     if(!strcmp(argv[1],"kdcache"))  { cmd_kdcache(argc,argv); return 0; }
     if(!strcmp(argv[1],"vrescheck")){ cmd_vrescheck(); return 0; }
     if(!strcmp(argv[1],"bench"))    { cmd_bench(argc,argv); return 0; }
