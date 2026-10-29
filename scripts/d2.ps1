@@ -30,12 +30,12 @@ if (!(Test-Path "$XD\umcvx.bin")) {
 if (!(Test-Path "$D2\meta.json")) {
     py -3 "$E\prep\d1build.py" $V "$E\logs\fdec" $XD $D2 $R 1.8e9 *> "$L\d2build.log"; Get-Content "$L\d2build.log" -Tail 4 | % { Log "  $_" } }
 # 3. two decays of LS-Micro3_it60000, then their average
-foreach ($v in @(@('LS-Micro3-D2', ''), @('LS-Micro3-D2lr', '0.02'))) { $nm = $v[0]
+foreach ($dv in @(@('LS-Micro3-D2', ''), @('LS-Micro3-D2lr', '0.02'))) { $nm = $dv[0]
     if (Test-Path "$L\$nm.done") { continue }
     Get-ChildItem "$M\LS-Micro3_it60000.bin*" | % { Copy-Item $_.FullName ("$M\$nm" + $_.Name.Substring('LS-Micro3_it60000'.Length)) -Force }
     Clean; foreach ($k in $BASE.Keys) { Set-Item "env:$k" $BASE[$k] }
     $env:CUDALM_ITERS = '87036'; $env:CUDALM_LR = '1.2e-3'; $env:CUDALM_SEED = '9013'; $env:CUDALM_BENCH_EVERY = '0'; $env:CUDALM_KEEP_EVERY = '0'
-    if ($v[1]) { $env:CUDALM_LR_MIN = $v[1] }
+    if ($dv[1]) { $env:CUDALM_LR_MIN = $dv[1] }   # not $v: PS names ignore case, $v would clobber $V
     $t0 = Get-Date; & $X train $nm $D2 1 *>> "$L\$nm.train.log"; $ex = $LASTEXITCODE; Clean
     Log "$nm train exit $ex $([int]((Get-Date)-$t0).TotalMinutes) min"; Score $nm; "ok" | Out-File -Encoding ascii "$L\$nm.done" }
 $nm = 'LS-Micro3-D2soup'
