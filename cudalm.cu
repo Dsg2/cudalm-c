@@ -7289,7 +7289,7 @@ static void cmd_run(int argc,char**argv){
 /* ===================== serve ============================================ */
 /* cudalm serve <model> [port=8090]: a llama-server-compatible subset for agentenv/evals.
  * POST /completion {"prompt","n_predict","temperature","top_k","top_p","seed","stop":[..],"num_first"} -> {"content",
- * "tokens_predicted","stop_type":"eos|word|limit","stopped_eos","nll"}; GET /health; POST /shutdown (clean exit, never kill a CUDA process). Raw prompt (no template),
+ * "tokens_predicted","stop_type":"eos|word|limit","stopped_eos","nll"}; POST /logprob (scoring, see sv_logprob); GET /health; POST /shutdown (clean exit, never kill a CUDA process). Raw prompt (no template),
  * concurrent clients: continuous batching on the KV-cache decoder (CUDALM_SERVE_SLOTS, default 64), else one request at a
  * time with a full-context forward per token like `run`. Winsock is loaded at run time. */
 #ifdef _WIN32
@@ -7434,6 +7434,56 @@ static void sv_lockstep(const SReq*r,const float*P,const Off*o,GA*a,int*tokG,con
     sv_results(out,B,gen,prod,st,nll,pn);
     for(int b=0;b<B;b++) free(gen[b].p);
     free(gen); free(prod); free(st); free(done); free(nll); free(ids); free(seq); }
+/* POST /logprob {"context"|"prompt", "continuation":".." | "continuations":[..], "bos":1, "tokens":0, "top_logprobs":0}:
+ * log P(continuation | context) per continuation, scored like lmeval (eot + context + continuation, encoded separately, context
+ * cut from the left to fit T; FP8 off so scores do not depend on padding) -> {"context_tokens","results":[{"logprob","tokens",
+ * "bytes","is_greedy"[,"token_logprobs":[{"token","logprob"[,"top":[["tok",lp],..]]}]]}]}. No continuation: every context token
+ * is scored (rolling loglikelihood / perplexity). Handled between decode steps; ~1 forward per continuation. */
+static void sv_logprob(const char*body,const float*P,const Off*o,GA*a,int*tokG,const Cfg*cp,const Tok*tk,int rows,SBuf*out){
+    Cfg c=*cp; int V=c.V; const char*pp=js_key(body,"context"); if(!pp) pp=js_key(body,"prompt");
+    char*ctx=pp&&*pp=='"'?js_str(pp+1,NULL):strdup(""), *cs[64]; int nk=0;
+    const char*sp=js_key(body,"continuations"); if(!sp) sp=js_key(body,"continuation");
+    if(sp&&*sp=='"') cs[nk++]=js_str(sp+1,NULL);
+    else if(sp&&*sp=='[') for(sp++;*sp&&*sp!=']'&&nk<64;){ if(*sp=='"') cs[nk++]=js_str(sp+1,&sp); else sp++; }
+    int bos=js_num(body,"bos",1)!=0, ntop=(int)js_num(body,"top_logprobs",0), det=js_num(body,"tokens",0)!=0||ntop>0, roll=!nk;
+    if(ntop>20) ntop=20; if(roll) cs[nk++]=strdup("");
+    int cn; int*ci=tok_encode((Tok*)tk,ctx,&cn), ch=rows<g_chrows?rows:g_chrows, sN=a->N, sT=gC.T, f8=g_fp8gemm; g_fp8gemm=0;
+    float*lg=(float*)malloc((size_t)ch*V*4); int*pad=(int*)calloc(c.T,4); char t[200];
+    snprintf(t,sizeof t,"{\"context_tokens\":%d,\"results\":[",cn); sb_str(out,t);
+    for(int k=0;k<nk;k++){
+        int kn; int*ki=tok_encode((Tok*)tk,cs[k],&kn), L=0, *s=(int*)malloc(4*(size_t)(1+cn+kn));
+        if(bos) s[L++]=tk->eot; memcpy(s+L,ci,4*(size_t)cn); L+=cn; int s0=roll?1:L; memcpy(s+L,ki,4*(size_t)kn); L+=kn; free(ki);
+        if(L-1>c.T){ int d=L-1-c.T; memmove(s,s+d,4*(size_t)(L-d)); L-=d; s0-=d; }
+        if(s0<1) s0=1;
+        double sum=0; int gr=1, n=L>s0?L-s0:0;
+        sb_str(out,k?",{":"{");
+        if(det) sb_str(out,"\"token_logprobs\":[");
+        if(n){ int Tr=(L-1+15)&~15; if(Tr>c.T) Tr=c.T;
+            for(int j=0;j<Tr;j++) pad[j]=j<L-1?s[j]:0;
+            ck(cudaMemcpy(tokG,pad,(size_t)Tr*4,cudaMemcpyHostToDevice),"tok h2d");
+            a->N=Tr; gC.T=Tr; gpu_forward(P,o,a,tokG);
+            for(int j0=s0-1;j0<L-1;j0+=ch){ int m=L-1-j0<ch?L-1-j0:ch;     /* row j predicts s[j+1] */
+                g_abt(a->fn+(size_t)j0*c.D,P+o->emb,a->logits,m,c.D,V);
+                ck(cudaMemcpy(lg,a->logits,(size_t)m*V*4,cudaMemcpyDeviceToHost),"logits d2h");
+                for(int r=0;r<m;r++){ const float*z=lg+(size_t)r*V; int y=s[j0+r+1], bi=0; double se=0;
+                    for(int v=1;v<V;v++) if(z[v]>z[bi]) bi=v;
+                    for(int v=0;v<V;v++) se+=exp((double)z[v]-z[bi]);
+                    double lse=z[bi]+log(se), lp=z[y]-lse; sum+=lp; gr&=bi==y;
+                    if(!det) continue;
+                    sb_str(out,j0+r>s0-1?",{\"token\":\"":"{\"token\":\""); sb_esc(out,(const char*)tk->dec[y],(size_t)tk->declen[y]);
+                    snprintf(t,sizeof t,"\",\"logprob\":%.6f",lp); sb_str(out,t);
+                    if(ntop>0){ int tp[20]; sb_str(out,",\"top\":[");
+                        for(int q=0;q<ntop;q++){ int b=-1; for(int v=0;v<V;v++){ int u=0; for(int w=0;w<q;w++) u|=tp[w]==v;
+                                if(!u&&(b<0||z[v]>z[b])) b=v; }
+                            tp[q]=b; sb_str(out,q?",[\"":"[\""); sb_esc(out,(const char*)tk->dec[b],(size_t)tk->declen[b]);
+                            snprintf(t,sizeof t,"\",%.6f]",z[b]-lse); sb_str(out,t); }
+                        sb_str(out,"]"); }
+                    sb_str(out,"}"); } }
+            a->N=sN; gC.T=sT; }
+        snprintf(t,sizeof t,"%s\"logprob\":%.6f,\"tokens\":%d,\"bytes\":%d,\"is_greedy\":%s}",det?"],":"",sum,n,
+                 (int)strlen(roll?ctx:cs[k]),n&&gr?"true":"false"); sb_str(out,t);
+        free(s); free(cs[k]); }
+    sb_str(out,"]}"); g_fp8gemm=f8; free(lg); free(pad); free(ci); free(ctx); }
 #ifndef CUDALM_CPU
 /* continuous batching: every request ("n" samples each) takes slots of one Dec; new requests are prefilled into
  * free slots between steps, finished slots are compacted away, each step decodes all live slots together */
@@ -7450,6 +7500,8 @@ static void sv_batched(Dec*dc,const float*P,const Off*o,GA*a,int*tokG,const Cfg*
         while(!quit){                                     /* admit */
             if(!pr){ SQ*q=sq_pop(); if(!q) break;
                 if(!strncmp(q->rq,"POST /shutdown",14)){ quit=1; bye=q; break; }
+                if(!strncmp(q->rq,"POST /logprob",13)){ SBuf out={0}; sv_logprob(q->body,P,o,a,tokG,&c,tk,c.T,&out);
+                    sv_reply(q->cs,"200 OK",&out); free(out.p); sq_free(q); continue; }
                 if(strncmp(q->rq,"POST /completion",16)){ sv_replys(q->cs,"404 Not Found","{\"error\":\"unknown endpoint\"}"); sq_free(q); continue; }
                 BReq*R=(BReq*)calloc(1,sizeof(BReq)); R->q=q; sreq_parse(q->body,&R->r,c.T,ns); int B=R->r.n;
                 R->gen=(SBuf*)calloc(B,sizeof(SBuf)); R->prod=(int*)calloc(B,4); R->st=(int*)malloc(B*4); R->nll=(double*)calloc(B,8);
@@ -7516,6 +7568,8 @@ static void cmd_serve(int argc,char**argv){
         SQ*q=sq_pop(); if(!q){ WaitForSingleObject(g_sqe,50); continue; }
         if(!strncmp(q->rq,"POST /completion",16)){ SReq r; sreq_parse(q->body,&r,c.T,nmax); SBuf out={0};
             sv_lockstep(&r,P,&o,a,tokG,&c,tk,nmax,pad,lgs,ord,&out); sv_reply(q->cs,"200 OK",&out); free(out.p); sreq_free(&r); }
+        else if(!strncmp(q->rq,"POST /logprob",13)){ SBuf out={0}; sv_logprob(q->body,P,&o,a,tokG,&c,tk,rows,&out);
+            sv_reply(q->cs,"200 OK",&out); free(out.p); }
         else if(!strncmp(q->rq,"POST /shutdown",14)){ sv_replys(q->cs,"200 OK","{\"status\":\"bye\"}"); sq_free(q);
             printf("[serve] shutdown\n"); fflush(stdout); W.close_(ls); return; }
         else sv_replys(q->cs,"404 Not Found","{\"error\":\"unknown endpoint\"}");
@@ -10391,7 +10445,7 @@ int main(int argc,char**argv){
         "cudalm - CUDA trainer/runner for tinylm models (no arguments = interactive menu)\n"
         "  cudalm new      <name> <preset>\n"
         "  cudalm run      <name|model.bin> [\"prompt\"] [n] [temp] [topk]\n"
-        "  cudalm serve    <name|model.bin> [port=8090]   (HTTP /completion for agentenv)\n"
+        "  cudalm serve    <name|model.bin> [port=8090]   (HTTP /completion, /logprob for external benches)\n"
         "  cudalm train    <name> <data_dir> [epochs]\n"
         "  cudalm eval     <name> <data_dir> [batches] [batch_size]\n"
         "  cudalm probe    <name> <prompts.txt> [ntok] [temp] [topk]\n"

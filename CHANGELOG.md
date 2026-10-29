@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-29
 
+- Add reference client script
+- Update help text for serve command
+
+## Unreleased - 2026-10-29
+
 - Add cmd_ngfold() to cudalm.cu
 - Add ngfold entry to cudalm main()
 - Add ngfold.ps1 and scripts/ngfold.ps1

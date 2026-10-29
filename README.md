@@ -103,9 +103,32 @@ cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>
 cudalm serve     <name> [port=8090]                  HTTP /completion for agentenv (continuous batching, CUDALM_SERVE_SLOTS;
                                                      "num_first":1 forces a number as the first sampled token)
+                                                     and /logprob for scoring (see below)
 cudalm data      <fetch|tokenizer|encode|mix|info|canon> ...
 cudalm help                                        all commands + every environment variable
 ```
+
+### Scoring over HTTP (`serve` /logprob)
+
+`cudalm serve` also answers `POST /logprob`, so a served model can be run on any loglikelihood-style benchmark
+(multiple choice, perplexity) from another tool:
+
+```
+{"context": "Q: ... A:", "continuations": [" yes", " no"], "bos": 1, "tokens": 0, "top_logprobs": 0}
+-> {"context_tokens": 7, "results": [{"logprob": -1.93, "tokens": 1, "bytes": 4, "is_greedy": true}, ...]}
+```
+
+- `continuation` (one string) or `continuations` (up to 64) are scored as log P(continuation | context). This matches
+  `cudalm lmeval`: eot + context + continuation, each encoded separately, and the context is cut from the left to fit T.
+  With FP8 off, scores do not depend on padding. For acc_norm, divide `logprob` by `bytes`.
+- With no continuation, every context token is scored. This gives a rolling loglikelihood, or perplexity as
+  exp(−logprob / tokens).
+- `tokens:1` adds `token_logprobs` per token. `top_logprobs:k` (k ≤ 20) adds the k best alternatives at each position.
+- `bos:0` drops the leading eot.
+
+`scripts/logprob_bench.py` is a reference client. It reads lmeval-format TSV or JSONL `{"context","choices","gold"}`
+and prints acc, acc_norm and the mean margin. If you also pass an lmeval items dump, it checks per-item agreement with
+`cudalm lmeval`. On 300 items each of ARC-Easy, PIQA and ArithMark, acc_norm agreed on 300/300 items.
 
 `cudalm lmeval` ends with the Open SLM intelligence index. Each component is normalised against chance,
 N(s, c) = 100 × (s − c) ÷ (100 − c), using acc_norm: HellaSwag (c 25), ARC = mean of ARC-Easy and ARC-Challenge (c 25),
