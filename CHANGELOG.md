@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-29
 
+- README.md: document new lens subcommand
+- cpu_kern.h: add k_lens kernel
+- cudalm.cu: add k_lens kernel and cmd_lens function
+
+## Unreleased - 2026-10-29
+
 - Add reference client script
 - Update help text for serve command
 

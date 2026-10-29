@@ -98,6 +98,11 @@ cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]
 cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp]
 cudalm lmeval    <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]
 cudalm lmeval-vs <A.items.tsv> <B.items.tsv>       paired per-item comparison of two lmeval dumps
+cudalm lens      <name> <data_dir|"text"> [tokens=16384] [T=1024]
+                                                     logit lens: the residual stream after the embedding, each attention
+                                                     and each block, read out through the final norm + tied head (per-stage
+                                                     CE, top-1, agreement with the full model, entropy; text mode adds a
+                                                     grid of each stage's top-1 guess; CUDALM_LENS_OUT=<tsv>, CUDALM_LENS_COLS)
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>

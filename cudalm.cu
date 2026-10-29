@@ -2613,6 +2613,26 @@ template<class TL> __global__ void k_softmax_ce(const TL*lg,const int*tgt,float*
     if(threadIdx.x==0){ d[tg]-=iN; loss[n]=-logf(ptg+1e-12f);
         if(q) q[tg]=__nv_fp8_e4m3(d[tg]*qs); }
 }
+/* logit lens: per row out[4n..] = logP(tgt), argmax, entropy (nats), logP(fin) (the full model's top-1; own top-1 if fin NULL) */
+__global__ void k_lens(const float*lg,const int*tgt,const int*fin,float*out,int rows,int V){
+    int n=blockIdx.x; if(n>=rows) return; const float*l=lg+(size_t)n*V;
+    __shared__ float sv[32],ss[32],se[32]; __shared__ int si[32]; int w=threadIdx.x>>5, nw=(blockDim.x+31)>>5;
+    float mx=-1e30f; int mi=0;
+    for(int i=threadIdx.x;i<V;i+=blockDim.x) if(l[i]>mx){ mx=l[i]; mi=i; }
+    for(int k=16;k;k>>=1){ float v=__shfl_down_sync(~0u,mx,k); int j=__shfl_down_sync(~0u,mi,k); if(v>mx||(v==mx&&j<mi)){ mx=v; mi=j; } }
+    if(!(threadIdx.x&31)){ sv[w]=mx; si[w]=mi; }
+    __syncthreads();
+    if(!threadIdx.x) for(int k=1;k<nw;k++) if(sv[k]>sv[0]||(sv[k]==sv[0]&&si[k]<si[0])){ sv[0]=sv[k]; si[0]=si[k]; }
+    __syncthreads();
+    float m=sv[0],s=0.f,e=0.f;
+    for(int i=threadIdx.x;i<V;i+=blockDim.x){ float x=l[i]-m, p=expf(x); s+=p; e+=p*x; }
+    for(int k=16;k;k>>=1){ s+=__shfl_down_sync(~0u,s,k); e+=__shfl_down_sync(~0u,e,k); }
+    if(!(threadIdx.x&31)){ ss[w]=s; se[w]=e; }
+    __syncthreads();
+    if(!threadIdx.x){ for(int k=1;k<nw;k++){ ss[0]+=ss[k]; se[0]+=se[k]; }
+        float lse=m+logf(ss[0]); float*o=out+4*(size_t)n;
+        o[0]=l[tgt[n]]-lse; o[1]=(float)si[0]; o[2]=logf(ss[0])-se[0]/ss[0]; o[3]=fin?l[fin[n]]-lse:-logf(ss[0]); }
+}
 /* h8+h16 head: online max/sum (2 reads of the fp16 logits, not 3), 8 per
  * thread-iteration, dl as bf16 (|dl|<=1/nAll underflows fp16) + the E4M3 copy.
  * Needs V%8==0. */
@@ -9124,6 +9144,79 @@ static void cmd_lmeval(int argc,char**argv){
     if(itf){ fclose(itf); printf("[lmeval] per-item margins -> %s\n",ip); }
 }
 
+/* ===================== lens ============================================= */
+/* cudalm lens <model> <data_dir|"text"> [tokens=16384] [T=1024]: logit lens. The residual stream after the embedding
+ * (+ layer-0 n-gram), after each block's attention (Ln.att) and after each block (Ln) is read out through the final norm
+ * and the tied unembedding, as if the model stopped there. Per stage: CE of the true next token, top-1 accuracy, agreement
+ * with the full model's top-1, logP of that token, entropy. data_dir: windows spread over val.bin (else train.bin);
+ * CUDALM_LENS_OUT=<tsv> also writes the table. text: adds a grid of each stage's top-1 guess per position
+ * (CUDALM_LENS_COLS positions, default 12; * = the true next token, _ = space, | = newline). */
+static void lens_cell(const Tok*tk,int t,char*o,int w){
+    int k=0; for(int i=0;i<tk->declen[t]&&k<w;i++){ unsigned char ch=tk->dec[t][i]; o[k++]=ch==' '?'_':ch=='\n'?'|':ch<32||ch>126?'~':(char)ch; }
+    o[k]=0; }
+static void cmd_lens(int argc,char**argv){
+    if(argc<4){ fprintf(stderr,"usage: cudalm lens <name|model.bin> <data_dir|\"text\"> [tokens=16384] [T=1024]\n"); exit(1); }
+    g_fp8gemm=0;
+    char path[1024]; model_path(argv[2],path,sizeof(path));
+    FILE*e=fopen(path,"rb"); if(e)fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]);
+    Cfg c; Tok*tk=NULL; float*Ph=model_load_full(path,&c,&tk);
+    char vp[1200]; size_t vs=0; snprintf(vp,sizeof vp,"%s" PSEP "val.bin",argv[3]); uint16_t*vl=(uint16_t*)read_file(vp,&vs);
+    if(!vl){ snprintf(vp,sizeof vp,"%s" PSEP "train.bin",argv[3]); vl=(uint16_t*)read_file(vp,&vs); }
+    int txt=!vl, n=0, *ids=NULL, T, N, R, B=1, D=c.D, V=c.V, L=c.L;
+    if(txt){ if(!tk){ fprintf(stderr,"model has no tokenizer\n"); exit(1); }
+        int k; int*t=tok_encode(tk,argv[3],&k); n=k+1; if(n>c.T+1) n=c.T+1;
+        ids=(int*)malloc(4*(size_t)n); ids[0]=tk->eot; memcpy(ids+1,t,4*(size_t)(n-1)); free(t);
+        if(n<2){ fprintf(stderr,"[lens] empty text\n"); exit(1); }
+        T=64; while(T<n-1) T*=2; if(T>c.T) T=c.T; N=T; R=n-1; }
+    else { T=argc>5?atoi(argv[5]):1024; if(T>c.T) T=c.T; if(T<16) T=16;
+        long long want=argc>4?atoll(argv[4]):16384; size_t nv=vs/2; B=(int)((want+T-1)/T); if(B<1) B=1;
+        if((size_t)B*T+1>nv) B=(int)((nv-1)/T); if(B<1){ fprintf(stderr,"[lens] %s too small\n",vp); exit(1); }
+        N=R=B*T; }
+    c.T=T; cfg_derive(&c); gC=c; cuda_init(); Off o; calc_offsets(&c,&o); ngram_infer(path);
+    size_t np=param_count(&c); float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,Ph,np*4,cudaMemcpyHostToDevice),"P h2d");
+    rope_tables(&c); GA*a=ga_new(N,0); int ch=N<g_chrows?N:g_chrows;
+    int*tok=(int*)calloc(N,4),*tgt=(int*)calloc(N,4),*fin=(int*)malloc(4*(size_t)R);
+    int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4),*finG=(int*)dmalloc((size_t)N*4);
+    float*outG=(float*)dmalloc((size_t)ch*16),*ho=(float*)malloc((size_t)ch*16);
+    if(txt) for(int j=0;j<R;j++){ tok[j]=ids[j]; tgt[j]=ids[j+1]; }
+    else { size_t nv=vs/2; for(int b=0;b<B;b++){ size_t off=(size_t)b*(nv-T-1)/B; for(int j=0;j<T;j++){ tok[b*T+j]=vl[off+j]; tgt[b*T+j]=vl[off+j+1]; } } }
+    ck(cudaMemcpy(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice),"tok h2d"); ck(cudaMemcpy(tgtG,tgt,(size_t)N*4,cudaMemcpyHostToDevice),"tgt h2d");
+    gpu_forward(P,&o,a,tokG);
+    const Off*rd=g_prd?g_prd:&o; int S=2*L+1, cols=12; { const char*v=getenv("CUDALM_LENS_COLS"); if(v&&atoi(v)>0) cols=atoi(v); }
+    if(cols>R) cols=R;
+    double*st=(double*)calloc((size_t)S*5,8); int*grid=(int*)malloc(4*(size_t)S*cols);
+    for(int q=0;q<S;q++){ int s=(q+S-1)%S;                 /* the final stage first: its top-1 is the reference */
+        const float*src=s==0?a->a_in[0]:s&1?a->f_in[s/2]:s/2<L?a->a_in[s/2]:a->x_final;
+        e_rmsf(src,P,rd->nf,a->fn,a->fnr,N,D);
+        for(int r0=0;r0<R;r0+=ch){ int m=R-r0<ch?R-r0:ch;
+            g_abt(a->fn+(size_t)r0*D,P+o.emb,a->logits,m,D,V);
+            KL(k_lens,m,TPB)(a->logits,tgtG+r0,s==S-1?NULL:finG+r0,outG,m,V);
+            ck(cudaMemcpy(ho,outG,(size_t)m*16,cudaMemcpyDeviceToHost),"lens d2h");
+            double*z=st+(size_t)s*5;
+            for(int i=0;i<m;i++){ const float*h=ho+4*(size_t)i; int r=r0+i, am=(int)h[1];
+                if(s==S-1) fin[r]=am;
+                z[0]-=h[0]; z[1]+=am==tgt[r]; z[2]+=am==fin[r]; z[3]+=h[3]; z[4]+=h[2];
+                if(r<cols) grid[s*cols+r]=am; } }
+        if(s==S-1) ck(cudaMemcpy(finG,fin,4*(size_t)R,cudaMemcpyHostToDevice),"fin h2d"); }
+    printf("[lens] %s | %s | %d positions%s\n",argv[2],txt?"text":vp,R,txt?"":" (val windows)");
+    if(txt){ char cell[16];
+        printf("\n  %-8s","input"); for(int j=0;j<cols;j++){ lens_cell(tk,tok[j],cell,7); printf(" %-8s",cell); }
+        printf("\n  %-8s","next");  for(int j=0;j<cols;j++){ lens_cell(tk,tgt[j],cell,7); printf(" %-8s",cell); } printf("\n");
+        for(int s=0;s<S;s++){ char nm[16]; if(!s) snprintf(nm,sizeof nm,"emb"); else snprintf(nm,sizeof nm,"L%d%s",(s-1)/2,s&1?".att":"");
+            printf("  %-8s",nm);
+            for(int j=0;j<cols;j++){ int t=grid[s*cols+j]; lens_cell(tk,t,cell,6); printf(" %c%-7s",t==tgt[j]?'*':' ',cell); }
+            printf("\n"); }
+        if(cols<R) printf("  (first %d of %d positions; CUDALM_LENS_COLS for more)\n",cols,R); }
+    const char*op=getenv("CUDALM_LENS_OUT"); FILE*of=op&&*op?fopen(op,"w"):NULL;
+    if(of) fprintf(of,"stage\tce\ttop1\tagree\tlogp_final_top1\tentropy\n");
+    printf("\n  %-8s %8s %7s %7s %10s %8s\n","stage","CE","top1","=final","logP(fin1)","entropy");
+    for(int s=0;s<S;s++){ char nm[16]; if(!s) snprintf(nm,sizeof nm,"emb"); else snprintf(nm,sizeof nm,"L%d%s",(s-1)/2,s&1?".att":"");
+        const double*z=st+(size_t)s*5;
+        printf("  %-8s %8.4f %6.2f%% %6.2f%% %10.4f %8.4f\n",nm,z[0]/R,100*z[1]/R,100*z[2]/R,z[3]/R,z[4]/R);
+        if(of) fprintf(of,"%s\t%.5f\t%.5f\t%.5f\t%.5f\t%.5f\n",nm,z[0]/R,z[1]/R,z[2]/R,z[3]/R,z[4]/R); }
+    if(of){ fclose(of); printf("[lens] table -> %s\n",op); }
+}
+
 /* ===================== bench ============================================ */
 static void cmd_bench(int argc,char**argv){
     if(argc<3){ fprintf(stderr,
@@ -10453,6 +10546,7 @@ int main(int argc,char**argv){
         "  cudalm chatbench <name> <bench.txt> [ngen] [temp] [topp] [reppen] [nsamp] [T]\n"
         "  cudalm lmeval   <name> [hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark|all] [n] [Tmax]\n"
         "  cudalm lmeval-vs <A.items.tsv> <B.items.tsv>   paired per-item comparison of two lmeval dumps\n"
+        "  cudalm lens     <name> <data_dir|\"text\"> [tokens=16384] [T=1024]   logit lens: every layer read out through the head\n"
         "  cudalm avg      <out> <in1> <in2> [...]   (checkpoint average / soup; eval + export)\n"
         "  cudalm ngfold   <out> <in> <rows> <data_dir> [tokens]   (fold the n-gram table to rows = R/f, usage-weighted)\n"
         "  cudalm kdcache  <teacher> <data_dir> <out.kd> [K=8] [B=8]   (teacher top-K for CUDALM_KD)\n"
@@ -10474,6 +10568,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"probe"))    { cmd_probe(argc,argv); return 0; }
     if(!strcmp(argv[1],"chatbench")){ cmd_chatbench(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval"))   { cmd_lmeval(argc,argv); return 0; }
+    if(!strcmp(argv[1],"lens"))     { cmd_lens(argc,argv); return 0; }
     if(!strcmp(argv[1],"lmeval-vs")){ cmd_lmeval_vs(argc,argv); return 0; }
     if(!strcmp(argv[1],"avg"))      { cmd_avg(argc,argv); return 0; }
     if(!strcmp(argv[1],"ngfold"))   { cmd_ngfold(argc,argv); return 0; }

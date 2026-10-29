@@ -500,6 +500,15 @@ template<class TL> __global__ void k_softmax_ce(const TL*lg,const int*tgt,float*
         d[tg]-=iN; loss[n]=-logf(ptg+1e-12f);
         if(q) for(int i=0;i<V;i++) q[i]=__nv_fp8_e4m3(d[i]*qs); }
 }
+/* logit lens: out[4n..] = logP(tgt), argmax, entropy, logP(fin) */
+__global__ void k_lens(const float*lg,const int*tgt,const int*fin,float*out,int rows,int V){
+    #pragma omp parallel for schedule(static)
+    for(int n=0;n<rows;n++){ const float*l=lg+(size_t)n*V; float mx=l[0]; int mi=0;
+        for(int i=1;i<V;i++) if(l[i]>mx){ mx=l[i]; mi=i; }
+        double s=0,e=0; for(int i=0;i<V;i++){ float x=l[i]-mx, p=fexp(x); s+=p; e+=(double)p*x; }
+        float lse=mx+(float)log(s); float*o=out+4*(size_t)n;
+        o[0]=l[tgt[n]]-lse; o[1]=(float)mi; o[2]=(float)(log(s)-e/s); o[3]=fin?l[fin[n]]-lse:-(float)log(s); }
+}
 CPU_STUB(k_sce_h8)
 CPU_EW(k_f2bf,(const float*src,bf16*dst,size_t n),dst[i]=d_f2bf(src[i]))
 /* sum of squares -> one partial per launch block (64 in every caller) */
