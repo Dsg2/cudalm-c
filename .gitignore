@@ -11,3 +11,8 @@ __pycache__/
 
 # gitpub: logs, run captures and build output live here
 _scratch/
+
+# personal plans/notes
+*_PLAN.md
+II_*.md
+*Training Analysis.md
