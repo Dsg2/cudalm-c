@@ -2,10 +2,11 @@
 
 ## Unreleased - 2026-10-29
 
-- Update CHANGELOG.md entries
-- Remove FILTER_PLAN.md reference from d1build.py filter
-- Remove CUDALM_KD flag reference from d1build.py filter
-- Remove II_QUEUE.md reference from d1build.py filter
+- Tidy changelog
+
+## Unreleased - 2026-10-29
+
+- Drop references to private notes from d1build.py and the changelog
 
 ## Unreleased - 2026-10-29
 
