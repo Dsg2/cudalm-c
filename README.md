@@ -103,6 +103,11 @@ cudalm lens      <name> <data_dir|"text"> [tokens=16384] [T=1024]
                                                      and each block, read out through the final norm + tied head (per-stage
                                                      CE, top-1, agreement with the full model, entropy; text mode adds a
                                                      grid of each stage's top-1 guess; CUDALM_LENS_OUT=<tsv>, CUDALM_LENS_COLS)
+                                                     + tuned-lens columns when <model>.tlens exists
+cudalm lens-tune <name> <data_dir> [steps=500] [tokens/step=8192] [T=1024]
+                                                     tuned lens: one affine translator per stage (y = h + hA + b), trained
+                                                     on train.bin to minimise KL(full model || readout); ~2 min for a
+                                                     10M model; plot with scripts/lensplot.py <out.png> <table.tsv>...
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
 cudalm info      <name>

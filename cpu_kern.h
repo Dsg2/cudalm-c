@@ -509,6 +509,24 @@ __global__ void k_lens(const float*lg,const int*tgt,const int*fin,float*out,int 
         float lse=mx+(float)log(s); float*o=out+4*(size_t)n;
         o[0]=l[tgt[n]]-lse; o[1]=(float)mi; o[2]=(float)(log(s)-e/s); o[3]=fin?l[fin[n]]-lse:-(float)log(s); }
 }
+/* tuned lens: row log-softmax; KL(p || softmax(lg)) with lg overwritten by (q - p) * sc; translator add */
+__global__ void k_logsm(const float*lg,float*out,int rows,int V){
+    #pragma omp parallel for schedule(static)
+    for(int n=0;n<rows;n++){ const float*l=lg+(size_t)n*V; float*o=out+(size_t)n*V; float m=l[0];
+        for(int i=1;i<V;i++) m=l[i]>m?l[i]:m;
+        double s=0; for(int i=0;i<V;i++) s+=fexp(l[i]-m);
+        float lse=m+(float)log(s); for(int i=0;i<V;i++) o[i]=l[i]-lse; }
+}
+__global__ void k_kld(float*lg,const float*lp,float*loss,int rows,int V,float sc){
+    #pragma omp parallel for schedule(static)
+    for(int n=0;n<rows;n++){ float*l=lg+(size_t)n*V; const float*p=lp+(size_t)n*V; float m=l[0];
+        for(int i=1;i<V;i++) m=l[i]>m?l[i]:m;
+        double s=0,kl=0; for(int i=0;i<V;i++) s+=fexp(l[i]-m);
+        float lse=m+(float)log(s);
+        for(int i=0;i<V;i++){ float pi=fexp(p[i]), lq=l[i]-lse; kl+=(double)pi*(p[i]-lq); l[i]=(fexp(lq)-pi)*sc; }
+        loss[n]=(float)kl; }
+}
+CPU_EW(k_tl_add,(float*Y,const float*H,const float*b,size_t n,int D),Y[i]+=H[i]+b[i%D])
 CPU_STUB(k_sce_h8)
 CPU_EW(k_f2bf,(const float*src,bf16*dst,size_t n),dst[i]=d_f2bf(src[i]))
 /* sum of squares -> one partial per launch block (64 in every caller) */

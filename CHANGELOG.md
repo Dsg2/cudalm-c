@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-29
 
+- README.md: document cudalm lens-tune command
+- cpu_kern.h: add k_logsm and k_kld kernels
+- cudalm.cu: add blk_reduce, lens_src, tl_apply, tl_load, lens_open, lens_gpu, and cmd_lens_tune
+
+## Unreleased - 2026-10-29
+
 - README.md: document new lens subcommand
 - cpu_kern.h: add k_lens kernel
 - cudalm.cu: add k_lens kernel and cmd_lens function
