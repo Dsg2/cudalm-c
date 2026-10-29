@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-29
 
+- Update CHANGELOG.md entries
+- Remove FILTER_PLAN.md reference from d1build.py filter
+- Remove CUDALM_KD flag reference from d1build.py filter
+- Remove II_QUEUE.md reference from d1build.py filter
+
+## Unreleased - 2026-10-29
+
 - Add _PLAN.md, II_*.md, *Training Analysis.md to .gitignore
 - Update .gitignore with new ignore patterns
 
@@ -53,7 +60,6 @@
 
 ## Unreleased - 2026-10-26
 
-- Add II_QUEUE.md with stage plan and resume markers
 - Add CUDALM_KD env flag and kdcache.py script
 - Update cudalm.cu with kd_adj, k_topk_row, vres, kd, kdcache functions
 - Update prep scripts: gate, d1build, docsel, gate, hwbuild
@@ -61,7 +67,6 @@
 
 ## Unreleased - 2026-10-26
 
-- Add FILTER_PLAN.md with block probe results and doc-level filter criteria
 - Add CUDALM_EVAL_SPANS flag to cudalm.cu for per-document scoring
 - Add prep/docsel.py and prep/fdocsum.py for arm selection and replicate reporting
 

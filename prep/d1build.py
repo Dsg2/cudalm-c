@@ -56,6 +56,6 @@ for fn in ('val.bin', 'tokenizer.json', 'tokenizer.bin', 'template.txt'):
     shutil.copy(os.path.join(src, fn), out)
 m = json.load(open(os.path.join(src, 'meta.json')))
 m.update(profile='v3pre-' + recipe, train_tokens=n_out, total_tokens=n_out + m['val_tokens'], recipe=recipe,
-         filter='d1build.py: docsel recipe at full scale (see FILTER_PLAN.md); val = v3pre val', sources=stats)
+         filter='d1build.py: docsel recipe at full scale; val = v3pre val', sources=stats)
 json.dump(m, open(os.path.join(out, 'meta.json'), 'w'), indent=2, default=int)
 print(f'{recipe}: {n_out} train tokens -> {out}')
