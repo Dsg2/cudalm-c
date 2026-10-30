@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-10-30
 
+- README.md: update tokenizer usage line to include [maxdigits] option
+- data.cuh: add maxdigits argument parsing and validation in cmd_data_tokenizer
+- data.cuh: skip token pairs exceeding maxdigits limit during merge
+
+## Unreleased - 2026-10-30
+
 - README.md: document new lmeval-vs output lines
 - cudalm.cu: implement scale-free and accuracy index calculations in le_vs()
 

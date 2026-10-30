@@ -577,9 +577,10 @@ static int d_tokjson(const char*dir){
         fprintf(f,"%s\n      [\n        ",i?",":""); d_jtok(f,u,t[x],tl[x]); fprintf(f,",\n        "); d_jtok(f,u,t[y],tl[y]); fprintf(f,"\n      ]"); }
     fprintf(f,"\n    ]\n  }\n}"); fclose(f); free(t); free(tl); free(b); return 1; }
 static int cmd_data_tokenizer(int argc,char**argv){
-    if(argc<5){ fprintf(stderr,"usage: cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300]\n"); return 1; }
+    if(argc<5){ fprintf(stderr,"usage: cudalm data tokenizer <out> <inputs> [vocab=16384] [sample_mb=300] [maxdigits=0]\n"
+                               "  maxdigits  no token holds more than this many ASCII digits (1 = numbers are digit by digit; 0 = no limit)\n"); return 1; }
     char out[1200],p[1200]; data_outdir(argv[3],out,sizeof out); DFiles fl;
-    int V=argc>5?atoi(argv[5]):16384; double mb=argc>6?atof(argv[6]):300;
+    int V=argc>5?atoi(argv[5]):16384; double mb=argc>6?atof(argv[6]):300; int maxd=argc>7?atoi(argv[7]):0;
     if(V<512||V>65535){ fprintf(stderr,"[tokenizer] vocab must be 512..65535 (tokens are stored as uint16)\n"); return 1; }
     snprintf(p,sizeof p,"%s\\tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer] %s already has a tokenizer - pick a new name\n",out); return 1; }
     if(!d_inputs(argv[4],&fl)) return 1;
@@ -609,6 +610,9 @@ static int cmd_data_tokenizer(int argc,char**argv){
         while(g_hn){ DHe h=he_pop(); int i=pr_get(h.k,0); if(g_pc[i]!=h.c){ if(g_pc[i]>0) he_push(g_pc[i],h.k); continue; } pi=i; break; }
         if(pi<0||g_pc[pi]<2) break;
         int A=(int)(g_pk[pi]>>32), B=(int)(uint32_t)g_pk[pi], Z=nv;
+        if(maxd){ int dg=0; const char*sa=tb.p+toff[A],*sb=tb.p+toff[B];        /* dropped from the heap; a later count change re-pushes and re-drops it */
+            for(int i=0;i<tlen[A];i++) dg+=sa[i]>='0'&&sa[i]<='9'; for(int i=0;i<tlen[B];i++) dg+=sb[i]>='0'&&sb[i]<='9';
+            if(dg>maxd) continue; }
         { DBuf*b=&tb; size_t oa=toff[A],ob=toff[B]; int la=tlen[A],lb=tlen[B];
           if(b->n+la+lb+1>b->cap){ b->cap=(b->n+la+lb+1)*2; b->p=(char*)realloc(b->p,b->cap); } memcpy(b->p+b->n,b->p+oa,la); memcpy(b->p+b->n+la,b->p+ob,lb);
           const char*s=b->p+b->n; size_t j=(d_fnv(s,la+lb)*0x9E3779B97F4A7C15ULL>>20)&(shc-1);

@@ -68,7 +68,8 @@ still wants a GPU.
 ```
 cudalm                                             (no arguments: menu with help text for every option)
 cudalm data fetch v3chat text_chat 2e8             download ~200M tokens of chat data as .jsonl
-cudalm data tokenizer mytok text_chat 16384        train a 16k byte-level BPE (+ canon.bin)
+cudalm data tokenizer mytok text_chat 16384        train a 16k byte-level BPE (+ canon.bin); optional [sample_mb] [maxdigits],
+                                                     maxdigits 1 = numbers are spelled digit by digit (still a plain HF BPE)
 cudalm data encode new chat text_chat mytok        -> data\chat\train.bin, val.bin, meta.json
 runs\pretrain.bat mymodel chat                     the reference recipe (32-expert MoE, QLM, engram)
 cudalm run mymodel "Hello" 128 0.7 40
