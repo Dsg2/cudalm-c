@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - 2026-10-30
+
+- README.md: document new flag and factorized embedding option
+- cudalm.cu: add fe_init, fe_update, fe_grad, fe_mat, fe_save functions and env var
+- tui.cuh: add CUDALM_EMB_E to command table
+
 ## Unreleased - 2026-10-29
 
 - Update preset and new model commands

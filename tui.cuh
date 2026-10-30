@@ -81,6 +81,8 @@ static const TCmd T_CMDS[]={
      "a pool per layer: same compute, far fewer total params. CUDA only: no quantize/grow/GGUF. Fixed at creation."},
    {"attn gate","0",F_ENV,"CUDALM_ATTN_GATE",0,"0|1","1 = learned sigmoid gate (a D x D matrix per layer) that scales each layer's attention output\n"
      "per token and channel (+L*D*D params)."},
+   {"emb dim","0",F_ENV,"CUDALM_EMB_E",0,0,"Factorized embedding: 0 = plain vocab x D table. E (< D, e.g. 96) = vocab x E table + E x D projection,\n"
+     "saving (vocab - E) x (D - E) params. Fixed at creation; QLM is not supported."},
    {"memory","engram",F_MEM,0,0,"none|ngram|engram","Hashed n-gram lookup memory, added to the residual stream. Huge in total params but tiny when active\n"
      "(one table row per sub-table per token). none = off; ngram = one table, one order, one layer; engram = multi-head x multi-order, several layers."},
    {" rows","524287",F_ENV,"NGRAM_ROWS",3,0,"Hash table rows. ngram: whole table; engram: per sub-table (rounded down to a prime).\n"

@@ -4808,8 +4808,61 @@ static int ngram_load(const char*optpath){
     printf("[ngram] resumed table+Wng from %s at iter %d\n",path,it);
     return it;
 }
+/* CUDALM_EMB_E (20u): factorized embedding. E [V,Ee] and Up [Ee,D] are the trained parameters;
+ * the tied [V,D] slot in P is rebuilt as E*Up after every step, so every reader of P+emb (head,
+ * serve, eval, the CPU build) is unchanged. Backward turns dW into dE = dW Up^T, dUp = E^T dW and
+ * zeroes dW, which leaves the main AdamW a no-op there. State: sidecar <optpath>.fe. */
+static int g_feE=0; static float *g_feP=0,*g_feG=0,*g_feW=0; static bf16 *g_feM=0,*g_feV=0;
+static int g_fe_file=-1;   /* info on a trained model: Ee from its .opt.fe (0 = none), not the environment */
+static int fe_dim(int D){ const char*e=getenv("CUDALM_EMB_E"); int v=g_fe_file>=0?g_fe_file:e&&*e?atoi(e):0; return v>0&&v<D?v:0; }
+static void fe_mat(void){   /* W = E Up */
+    const float one=1.0f,zero=0.0f; int V=gC.V,D=gC.D,Ee=g_feE;
+    ckb(cublasSgemm(CB,CUBLAS_OP_N,CUBLAS_OP_N,D,V,Ee,&one,g_feP+(size_t)V*Ee,D,g_feP,Ee,&zero,g_feW,D),"fe mat"); }
+static void fe_grad(float*dW){
+    const float one=1.0f,zero=0.0f; int V=gC.V,D=gC.D,Ee=g_feE; size_t ne=(size_t)V*Ee;
+    ckb(cublasSgemm(CB,CUBLAS_OP_T,CUBLAS_OP_N,Ee,V,D,&one,g_feP+ne,D,dW,D,&zero,g_feG,Ee),"fe dE");
+    ckb(cublasSgemm(CB,CUBLAS_OP_N,CUBLAS_OP_T,D,Ee,V,&one,dW,D,g_feP,Ee,&zero,g_feG+ne,D),"fe dUp");
+    ck(cudaMemset(dW,0,(size_t)V*D*4),"fe zero dW"); }
+static void fe_update(float lr,int t){
+    if(!g_feE) return;
+    static float b2=-1,wd; const char*e;
+    if(b2<0){ b2=(e=getenv("CUDALM_B2"))?(float)atof(e):0.99f; wd=(e=getenv("CUDALM_WD"))?(float)atof(e):0.1f; }
+    float b1=0.9f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
+    size_t ne=(size_t)gC.V*g_feE, nu=(size_t)g_feE*gC.D;
+    KL(k_adamw,nblk(ne,TPB),TPB)(g_feP,g_feG,g_feM,g_feV,ne,lr,b1,b2,wd,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
+    KL(k_adamw,nblk(nu,TPB),TPB)(g_feP+ne,g_feG+ne,g_feM+ne,g_feV+ne,nu,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs);
+    fe_mat(); kchk("fe adam",-1); }
+static int t1_rw(FILE*f,void*dev,size_t by,int wr);
+/* train only: loads <optpath>.fe (the file decides Ee) or starts one from CUDALM_EMB_E at iter 0 */
+static int fe_init(const char*optpath,int start,float*W){
+    char p[1200]; snprintf(p,sizeof p,"%s.fe",optpath);
+    FILE*f=fopen(p,"rb"); char m[4]; int h[4]={0};
+    if(f&&(fread(m,1,4,f)!=4||memcmp(m,"FES1",4)||fread(h,4,4,f)!=4||h[1]!=gC.V||h[2]!=gC.D)){
+        fprintf(stderr,"[emb] bad or mismatched %s\n",p); exit(1); }
+    int Ee=f?h[0]:fe_dim(gC.D); if(!Ee) return 0;
+    if(!f&&start>0){ fprintf(stderr,"[emb] CUDALM_EMB_E=%d but %s is missing and the model is at iter %d: "
+                                    "factorize a model from new, or unset CUDALM_EMB_E\n",Ee,p,start); exit(1); }
+    size_t ne=(size_t)gC.V*Ee, n=ne+(size_t)Ee*gC.D;
+    g_feE=Ee; g_feW=W; g_feP=(float*)dmalloc(n*4); g_feG=(float*)dmalloc(n*4);
+    g_feM=(bf16*)dmalloc(n*2); g_feV=(bf16*)dmalloc(n*2);
+    if(f){ int ok=t1_rw(f,g_feP,n*4,0)&&t1_rw(f,g_feM,n*2,0)&&t1_rw(f,g_feV,n*2,0); fclose(f);
+        if(!ok){ fprintf(stderr,"[emb] truncated %s\n",p); exit(1); } }
+    else { float*hp=(float*)malloc(n*4), su=1.0f/sqrtf((float)Ee);   /* E*Up ~ N(0, 0.02), as the unfactorized init */
+        for(size_t i=0;i<n;i++) hp[i]=(i<ne?0.02f:su)*rnd_normal();
+        ck(cudaMemcpy(g_feP,hp,n*4,cudaMemcpyHostToDevice),"fe init"); free(hp);
+        ck(cudaMemset(g_feM,0,n*2),"feM0"); ck(cudaMemset(g_feV,0,n*2),"feV0"); }
+    fe_mat(); kchk("fe init",-1);
+    printf("[emb] factorized %d x %d x %d: %zu params instead of %zu (%s)\n",gC.V,Ee,gC.D,n,(size_t)gC.V*gC.D,f?"resumed":"new");
+    return 1; }
+static void fe_save(const char*optpath,int it){
+    if(!g_feE) return;
+    char p[1200],tmp[1300]; snprintf(p,sizeof p,"%s.fe",optpath); FILE*f=save_open(p,tmp,sizeof tmp); if(!f) return;
+    size_t n=(size_t)gC.V*g_feE+(size_t)g_feE*gC.D; int h[4]={g_feE,gC.V,gC.D,it};
+    fwrite("FES1",1,4,f); fwrite(h,4,4,f);
+    t1_rw(f,g_feP,n*4,1); t1_rw(f,g_feM,n*2,1); t1_rw(f,g_feV,n*2,1);
+    save_commit(f,tmp,p); }
 static void t1_update(float lr,int t){
-    x1_update(lr,t);
+    x1_update(lr,t); fe_update(lr,t);
     float b1=0.9f,b2=0.95f,bc1=1.0f-powf(b1,(float)t),bc2=1.0f-powf(b2,(float)t);
     if(g_attg){ size_t n=(size_t)gC.L*gC.D*gC.D;
         KL(k_adamw,nblk(n,TPB),TPB)(g_Wg,g_WgG,g_WgM,g_WgV,n,lr,b1,b2,0.0f,bc1,bc2,(const float*)0,(size_t)0,(size_t)0,0,MU_OFF,g_side_gs); }
@@ -5899,6 +5952,7 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
     if(g_ngram_on&&!g_ng_layer) ngram_backward(a,tokG,N);   /* gate adds dh into dout */
     if(g_eg_on) engram_backward(a,tokG,N,0);
     KL(k_embed_bwd,nblk((size_t)N*D,TPB),TPB)(tokG,a->dout,G,og->emb,N,D); kchk("bwd embed",-1);
+    if(g_feE) fe_grad(G+og->emb);
 }
 
 /* Build the compact gradient offsets: emb, nf and mtp keep private slots
@@ -6321,6 +6375,7 @@ static int side_grads(const float**p,size_t*n){
             if(g_eg_conv){ SG(E->nwG,D); SG(E->KG,D*4); } } }
     if(g_xn) SG(g_xG,g_xn);
     if(g_attg) SG(g_WgG,(size_t)gC.L*D*D);
+    if(g_feE) SG(g_feG,(size_t)gC.V*g_feE+(size_t)g_feE*D);
 #undef SG
     return k; }
 /* fused QLM path: every update of a step (quantized layers, their float spans, the emb/nf
@@ -6625,6 +6680,7 @@ static const EnvReg g_envreg[]={
  {"NGRAM_LRMULT","1","memory","engram: LR multiplier for memory params",0},
  {"CUDALM_NG_HOSTMAP","0","memory","1 = old host qsort for ngram keys (~15 ms/step)",0},
  {"CUDALM_ATTN_GATE","0","model","per-layer attention output gate (+L*D*D)",0},
+ {"CUDALM_EMB_E","0","model","factorized embedding: V x E table + E x D projection (E < D; set at new)",0},
  {"CUDALM_VRES","0","model","value residual (ResFormer): layers >= 1 attend over (v_l + v_0)/2, no params",0},
  {"CUDALM_CANON","","model","Canon layers: A (after norm1), C (after norm2), AC (+L*4*D each)",0},
  {"CUDALM_SHARED_F","0","moe","shared always-on SwiGLU expert width (MoE only, <= F, +L*3*D*Fs)",0},
@@ -6832,6 +6888,7 @@ static void pstats(const Cfg*c,const MemCfg*m,int topk,const int*kl,int attg,PSt
         for(int l=0;l<c->L;l++){ int t=lyT(c,l), E=lyE(c,l), k=kl&&kl[l]>0?kl[l]:topk; if(!t) continue; if(k>E) k=E;
             if(t==2){ a+=k; PE=E; } else s->moe_off+=(E-k)*ef; }
         if(PE) s->moe_off+=(PE-(a<PE?a:PE))*ef; }
+    { int fe=fe_dim(c->D); if(fe) s->bb-=(double)c->V*c->D-((double)c->V*fe+(double)fe*c->D); }
     s->attg=attg?(double)c->L*c->D*c->D:0;
     if(m->mode==1){ s->tbl=(double)m->R*m->De; s->w=(double)m->De*c->D*(1+m->gate); s->mact=(double)m->De*(1+m->tri)+s->w; }
     else if(m->mode==2&&m->De>0){ int S=m->no*m->H, al=128%m->De==0?128/m->De:1;
@@ -6865,7 +6922,7 @@ static void pstats_print(const Cfg*c,const MemCfg*m,int topk,const int*kl,int at
     else printf("  ngram/engram off\n");
     printf("  total       %9.2fM %12s\n",s.tot/1e6,pcomma(s.tot));
     printf("  active      %9.2fM %12s / token  (backbone %s + memory %s; embedding %s included)\n",
-           s.act/1e6,pcomma(s.act),pcomma(s.bb-s.moe_off+s.attg),pcomma(s.mact),pcomma((double)c->V*c->D)); }
+           s.act/1e6,pcomma(s.act),pcomma(s.bb-s.moe_off+s.attg),pcomma(s.mact),pcomma(fe_dim(c->D)?((double)c->V+c->D)*fe_dim(c->D):(double)c->V*c->D)); }
 /* model config: every saved env var that is set, with the memory section written from m
  * so it is always complete (a resumed model whose .ng decided still gets its full config) */
 static void side_write(const char*mp,const MemCfg*m){
@@ -7173,6 +7230,9 @@ static int cmd_info(int argc,char**argv){
     else printf("  no model config yet (train writes one; untrained memory settings come from the environment)\n");
     MemCfg m; int ff=mem_from_file(p,&m); if(!ff) mem_from_env(&m,c.L);
     int ag=t1_attg_file(p); if(ag<0) ag=env_i("CUDALM_ATTN_GATE",0)!=0;
+    { snprintf(sp,sizeof sp,"%s.opt",p); FILE*q=fopen(sp,"rb"); if(q){ fclose(q); g_fe_file=0; strcat(sp,".fe");
+        if((q=fopen(sp,"rb"))){ char m4[4]; int fh[4]; if(fread(m4,1,4,q)==4&&!memcmp(m4,"FES1",4)&&fread(fh,4,4,q)==4) g_fe_file=fh[0]; fclose(q); } } }
+    if(fe_dim(c.D)) printf("  embedding: factorized E=%d (%s x %d + %d x %d)\n",fe_dim(c.D),pcomma(c.V),fe_dim(c.D),fe_dim(c.D),c.D);
     printf("  memory: %s (from %s)\n",mem_name(m.mode),ff?"trained .opt.ng":"config/environment");
     pstats_print(&c,&m,g_topk,g_topkL,ag); return 0; }
 
@@ -8147,6 +8207,8 @@ static void cmd_train(int argc,char**argv){
                 run_note==2?"new stage":"stage 1",epochs,iters-g_stage0,g_stage0,iters,
                 run_note==2?" (warmup + schedule restart; CUDALM_LR sets the peak, 1e-4 suits chat SFT)":"");
     g_start_iter=start_iter;
+    if(fe_dim(c.D)&&g_qlm_on){ fprintf(stderr,"[emb] CUDALM_EMB_E does not combine with QLM\n"); exit(1); }
+    if(!g_qlm_on) fe_init(optpath,start_iter,P+o.emb);
     { int S=iters-g_stage0, d=(int)(S*g_wsd_decay);
       if(g_wsd) printf("[cudalm train] schedule WSD: warmup %d, hold %g, cooldown over the last %.0f%% of the stage (%d iters, from iter %d) to %g\n",
                        (int)warmup, lr, g_wsd_decay*100.0f, d, iters-d, lr_minf()*lr);
@@ -8242,6 +8304,7 @@ static void cmd_train(int argc,char**argv){
     /* ---- LR scaler setup (see g_lrmul) ---- */
     int lrs_on=0,lrs_every=15000,lrs_K=200,lrs_vb=8; float lrs_eps=0.004f; double lrs_best=1e30;
     { const char*e=getenv("CUDALM_LRS"); lrs_on=e&&atoi(e)!=0; }
+    if(lrs_on&&g_feE){ printf("[lrs] off: not supported with CUDALM_EMB_E\n"); lrs_on=0; }
     if(lrs_on&&(!perm_on||g_fused||g_pscratch)){ printf("[lrs] off: needs the perm sampler and no QLM_FUSED/PSCRATCH\n"); lrs_on=0; }
     uint16_t*lv=NULL; size_t nlv=0,*lvst=NULL,lsz=0; uint8_t*lsnap=NULL,*lgood=NULL; int lgood_ok=0;
     char lrsp[1200]; snprintf(lrsp,sizeof lrsp,"%s.lrs",optpath);
@@ -8329,7 +8392,7 @@ static void cmd_train(int argc,char**argv){
         } else { char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(&QQ,qp,done); }
         if(g_ngram_on) ngram_save(optpath,done);
         if(g_eg_on) engram_save(optpath,done);
-        t1_save(optpath,done);
+        t1_save(optpath,done); fe_save(optpath,done);
         int ok=save_end();
         if(ok) lrs_save();
         else { printf("[ckpt] save FAILED - the previous checkpoint set is kept\n"); fflush(stdout); }
@@ -8406,8 +8469,8 @@ static void cmd_train(int argc,char**argv){
                 next_bench=((it-g_stage0)/bench_every+1)*bench_every; }
             if(keep_every>0&&it%keep_every==0){
                 /* ".opt" = the AdamW moments of a CUDALM_QLM=0 run, ".opt.mu" its Muon momentum */
-                const char*sfx[9]={"",".opt",".opt.mu",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1"}; char s[1200],d[1300]; int nk=0;
-                for(int i=0;i<9;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
+                const char*sfx[10]={"",".opt",".opt.mu",".opt.q",".opt.ng",".opt.t1",".opt.lrs",".env",".opt.x1",".opt.fe"}; char s[1200],d[1300]; int nk=0;
+                for(int i=0;i<10;i++){ snprintf(s,sizeof s,"%s%s",mpath,sfx[i]);
                     const char*dot=strrchr(mpath,'.'); int bl=dot?(int)(dot-mpath):(int)strlen(mpath);
                     snprintf(d,sizeof d,"%.*s_it%d%s%s",bl,mpath,it,dot?dot:"",sfx[i]);
                     if(lm_copyfile(s,d)) nk++; }
@@ -9341,6 +9404,7 @@ static void cmd_bench(int argc,char**argv){
         "  220M the MoE is 38.7%% of the step -- benchmarking without it measures\n"
         "  the wrong 60%%.\n"); exit(1); }
     Cfg c; if(!preset(argv[2],&c)){ fprintf(stderr,"unknown preset '%s'\n",argv[2]); exit(1); }
+    { char err[200]; if(!shape_env(&c,err,sizeof err)){ fprintf(stderr,"bench: %s\n",err); exit(1); } }
     int iters=argc>3?atoi(argv[3]):20;
     if(argc>5){ c.n_exp=atoi(argv[5]); if(c.n_exp==1) c.n_exp=0; }
     if(argc>6){ int t=atoi(argv[6]); if(t>0) c.T=t; }
@@ -9433,6 +9497,8 @@ static void grow_sidecars(const char*in,const char*out,const int*src,const int*i
         if(h[3]){ size_t w=(size_t)h[4]*D*8; fwrite(d+o,1,w,f); o+=w; }                /* ngram Wk(+M,V): no layers */
         if(h[5]){ size_t per=(size_t)h[5]*4; for(int l=0;l<Lnew;l++) fwrite(d+o+(size_t)src[l]*per,1,per,f); o+=(size_t)Lold*per; }
         fclose(f); printf("[grow] side weights %s -> %s%s\n",a,b,o==n?"":"  (SIZE MISMATCH - check it)"); free(d); }
+    snprintf(a,sizeof a,"%s.opt.fe",in); snprintf(b,sizeof b,"%s.opt.fe",out);
+    if(lm_copyfile(a,b)) printf("[grow] factorized embedding %s -> %s\n",a,b);
     snprintf(a,sizeof a,"%s.opt.x1",in);
     if(d_exists(a)) printf("[grow] note: %s (canon/shared side params) is not carried over\n",a);
 }

@@ -93,6 +93,8 @@ cudalm train mymodel mysft 1
 ```
 cudalm new       <name> <preset> [experts]           preset "custom" = any shape: set CUDALM_D / _L / _H / _KV / _F
                                                      (base D160 L11 H5 KV1 F432 T2048; TUI New model > preset custom)
+                                                     CUDALM_EMB_E=96: factorized embedding (V x 96 table + 96 x D projection,
+                                                     state in .opt.fe; the .bin keeps the full V x D product for inference)
 cudalm train     <name> <corpus> [epochs]
 cudalm eval      <name> <corpus> [batches] [batch_size]
 cudalm run       <name|model.bin> ["prompt"] [n] [temp] [topk]
