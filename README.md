@@ -155,6 +155,11 @@ margin and correctness; `cudalm lmeval-vs A.tsv B.tsv` pairs two such dumps item
 accuracy flips each way and the mean margin change ± paired SE, then the margin-index change with its z. Treat |z| < 2
 as no change.
 
+The margin index also rises when a model just gets less confident, since a mean margin below zero shrinks with the
+spread. So `lmeval-vs` prints two more lines: the **scale-free index** rescales B's margins per task to A's spread before
+pairing (a copy with every margin × 0.7 scores 0), and the **accuracy index** is the paired II change from answers that
+flipped. Compare models on the scale-free index; each task line shows the spread ratio that the margin change includes.
+
 Training options are `CUDALM_*`, `QLM_*` and `NGRAM_*` environment variables (`cudalm help` lists them all).
 `cudalm new` and `cudalm train` save the ones in effect to `models\<name>.bin.env`, so later commands don't need them
 again. To stop a training run cleanly, create `models\<name>.bin.stop` (or press Ctrl+C in the menu).

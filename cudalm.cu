@@ -7871,28 +7871,40 @@ static double le_vs(const char*pa,const char*pb,const char*pre,double*dix){
     LeT A[16],B[16]; int na=le_load(pa,A),nb=le_load(pb,B); double z=NAN;
     if(na<0||nb<0){ printf("%scannot read %s\n",pre,na<0?pa:pb); goto out; }
     {   static const char*ixn[5]={"hellaswag","arc_easy","arc_challenge","piqa","arithmark"};
-        double dm[5],ds[5]; int h[5]={0};
+        double dm[5],ds[5],rm[5],rs[5],im[5],is[5]; int h[5]={0};
         for(int i=0;i<na;i++){ int j=0; while(j<nb&&strcmp(A[i].t,B[j].t)) j++; if(j==nb) continue;
             int n=0,up=0,dn=0,L=A[i].n<B[j].n?A[i].n:B[j].n; double s=0,q=0;
             for(int k=0;k<L;k++) if(A[i].c[k]>=0&&B[j].c[k]>=0){ double d=B[j].m[k]-A[i].m[k]; s+=d; q+=d*d; n++;
                 up+=B[j].c[k]>A[i].c[k]; dn+=B[j].c[k]<A[i].c[k]; }
             if(!n) continue; double mu=s/n, se=n>1?sqrt((q/n-mu*mu)/(n-1)):0;
-            printf("%s%-13s %6d   acc %+6.2f%% (+%d/-%d)   margin %+.4f +-%.4f   z %+5.1f\n",pre,A[i].t,n,100.0*(up-dn)/n,up,dn,mu,se,se>0?mu/se:0);
-            for(int q2=0;q2<5;q2++) if(!strcmp(A[i].t,ixn[q2])){ dm[q2]=mu; ds[q2]=se; h[q2]=1; } }
-        double w[4]={1,1,1,0.65},m4[4],s4[4],num=0,den=0,var=0; int h4[4]={h[0],h[1]||h[2],h[3],h[4]},nc=0;
-        m4[0]=dm[0]; s4[0]=ds[0]; m4[2]=dm[3]; s4[2]=ds[3]; m4[3]=dm[4]; s4[3]=ds[4];
-        if(h[1]&&h[2]){ m4[1]=(dm[1]+dm[2])/2; s4[1]=0.5*sqrt(ds[1]*ds[1]+ds[2]*ds[2]); }
-        else if(h4[1]){ m4[1]=h[1]?dm[1]:dm[2]; s4[1]=h[1]?ds[1]:ds[2]; }
-        for(int q2=0;q2<4;q2++) if(h4[q2]){ num+=w[q2]*m4[q2]; var+=w[q2]*w[q2]*s4[q2]*s4[q2]; den+=w[q2]; nc++; }
-        if(nc>=2){ double d=100*num/den, se=100*sqrt(var)/den; z=se>0?d/se:0; if(dix) *dix=d;
-            printf("%smargin index %+.3f +-%.3f   z %+.1f   -> %s\n",pre,d,se,z,fabs(z)<2?"no clear change (|z| < 2)":z>0?"better":"worse"); }
+            /* scale-free: B rescaled to A's margin spread, so a merely less confident model scores no gain. idx: margin > 0 flips (acc_norm) */
+            double sa=0,qa=0,sb=0,qb=0; for(int k=0;k<L;k++) if(A[i].c[k]>=0&&B[j].c[k]>=0){ double a=A[i].m[k],b=B[j].m[k]; sa+=a; qa+=a*a; sb+=b; qb+=b*b; }
+            double va=qa/n-sa/n*(sa/n), vb=qb/n-sb/n*(sb/n), f=vb>0&&va>0?sqrt(va/vb):1, rq=0,rr=0,iq=0,ii=0;
+            for(int k=0;k<L;k++) if(A[i].c[k]>=0&&B[j].c[k]>=0){ double d=B[j].m[k]*f-A[i].m[k], fl=(B[j].m[k]>0)-(A[i].m[k]>0); rq+=d; rr+=d*d; iq+=fl; ii+=fl*fl; }
+            double ru=rq/n, rse=n>1?sqrt((rr/n-ru*ru)/(n-1)):0, iu=iq/n, ise=n>1?sqrt((ii/n-iu*iu)/(n-1)):0;
+            printf("%s%-13s %6d   acc %+6.2f%% (+%d/-%d)   margin %+.4f +-%.4f   z %+5.1f   spread x%.3f   scale-free %+.4f z %+5.1f\n",pre,A[i].t,n,100.0*(up-dn)/n,up,dn,mu,se,se>0?mu/se:0,f>0?1/f:0,ru,rse>0?ru/rse:0);
+            for(int q2=0;q2<5;q2++) if(!strcmp(A[i].t,ixn[q2])){ double N=q2==3?2.0:100.0/75; dm[q2]=mu; ds[q2]=se; rm[q2]=ru; rs[q2]=rse; im[q2]=iu*N; is[q2]=ise*N; h[q2]=1; } }
+        auto ixd=[&](const double*m,const double*s,double*dv,double*sv)->int{
+            double w[4]={1,1,1,0.65},m4[4],s4[4],num=0,den=0,var=0; int h4[4]={h[0],h[1]||h[2],h[3],h[4]},nc=0;
+            m4[0]=m[0]; s4[0]=s[0]; m4[2]=m[3]; s4[2]=s[3]; m4[3]=m[4]; s4[3]=s[4];
+            if(h[1]&&h[2]){ m4[1]=(m[1]+m[2])/2; s4[1]=0.5*sqrt(s[1]*s[1]+s[2]*s[2]); }
+            else if(h4[1]){ m4[1]=h[1]?m[1]:m[2]; s4[1]=h[1]?s[1]:s[2]; }
+            for(int q2=0;q2<4;q2++) if(h4[q2]){ num+=w[q2]*m4[q2]; var+=w[q2]*w[q2]*s4[q2]*s4[q2]; den+=w[q2]; nc++; }
+            if(nc<2) return 0; *dv=100*num/den; *sv=100*sqrt(var)/den; return 1; };
+        double d,se; static const char*vd[3]={"worse","no clear change (|z| < 2)","better"};
+        if(ixd(dm,ds,&d,&se)){ z=se>0?d/se:0; if(dix) *dix=d;
+            printf("%smargin index %+.3f +-%.3f   z %+.1f   -> %s\n",pre,d,se,z,vd[fabs(z)<2?1:z>0?2:0]);
+            ixd(rm,rs,&d,&se); double zr=se>0?d/se:0;
+            printf("%sscale-free index %+.3f +-%.3f   z %+.1f   -> %s\n",pre,d,se,zr,vd[fabs(zr)<2?1:zr>0?2:0]);
+            ixd(im,is,&d,&se); printf("%saccuracy index %+.2f +-%.2f   z %+.1f   (paired change in II)\n",pre,d,se,se>0?d/se:0); }
     }
 out:for(int i=0;i<na;i++){ free(A[i].m); free(A[i].c); } for(int i=0;i<nb;i++){ free(B[i].m); free(B[i].c); }
     return z; }
 static void cmd_lmeval_vs(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm lmeval-vs <A.items.tsv> <B.items.tsv>\n"
         "  paired comparison of two per-item dumps (CUDALM_LMEVAL_ITEMS=<file> on lmeval, or <model>.items/ from CUDALM_BENCH_EVERY):\n"
-        "  per task the accuracy flips and the mean margin change B - A +- paired SE; then the margin-index change and its z\n"); exit(1); }
+        "  per task the accuracy flips and the mean margin change B - A +- paired SE; then the margin-index change and its z,\n"
+        "  the scale-free index (B rescaled per task to A's margin spread, so lost confidence is no gain) and the paired II change\n"); exit(1); }
     printf("[lmeval-vs] B = %s\n           A = %s\n",argv[3],argv[2]); le_vs(argv[2],argv[3],"  ",NULL); }
 /* CUDALM_BENCH_EVERY=N: every N steps of the stage, score the checkpoint just saved with `lmeval` in a
  * child process (training waits; the time is left out of tok/s) and append a row to <model>.bench.tsv.

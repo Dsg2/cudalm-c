@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-10-30
 
+- README.md: document new lmeval-vs output lines
+- cudalm.cu: implement scale-free and accuracy index calculations in le_vs()
+
+## Unreleased - 2026-10-30
+
 - Update README.md with new loop training options
 - Add loop_setk, loop_pass, loop_kmax functions to cudalm.cu
 - Add g_lskip and g_lk_init to loop training logic in cudalm.cu
