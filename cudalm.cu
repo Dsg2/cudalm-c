@@ -168,6 +168,12 @@ static void loop_apply(Cfg*c){
     for(int l=b+1;l<p.L;l++) m[n++]=l;
     for(int v=0;v<n;v++){ c->lmap[v]=m[v]; c->lt[v]=p.lt[m[v]]; c->lE[v]=p.lE[m[v]]; c->lF[v]=p.lF[m[v]]; }
     c->lp=p.L; c->lb=b; c->L=n; }
+/* Passes of a looped model actually run (20u): pass(v) = earlier virtual layers sharing v's weights; passes >= k
+ * are skipped (identity). CUDALM_LOOP_RAND=1 draws k in 1..kmax per train step; CUDALM_LOOP_K=k fixes it (eval). */
+static unsigned char g_lskip[64]; static int g_lk_init=0; static int env_i(const char*k,int d);
+static int loop_pass(const Cfg*c,int v){ int n=0; for(int u=0;u<v;u++) n+=c->lmap[u]==c->lmap[v]; return n; }
+static int loop_kmax(const Cfg*c){ int m=0; for(int v=0;v<c->L;v++){ int p=loop_pass(c,v); if(p>m) m=p; } return m+1; }
+static void loop_setk(const Cfg*c,int k){ g_lk_init=1; for(int v=0;v<64;v++) g_lskip[v]=c->lp&&k>0&&v<c->L&&loop_pass(c,v)>=k; }
 static int NPOOL(const Cfg*c){ int n=0; for(int l=0;l<c->L;l++) n+=lyT(c,l)==2; return n; }
 static int NSPARSE(const Cfg*c){ int n=0; for(int l=0;l<c->L;l++) n+=lyT(c,l)!=0; return n; }
 static int FXW(const Cfg*c){ int m=c->F; for(int l=0;l<c->L;l++) if(!lyT(c,l)&&lyF(c,l)>m) m=lyF(c,l); return m; }
@@ -5699,10 +5705,12 @@ static void gpu_forward(const float*P,const Off*o,GA*a,const int*tokG){
     if(g_rpre){ rpre_ga(N); ck(cudaMemset(g_egc,0,(size_t)N*D*4),"egc0"); }
     if(g_ngram_on&&!g_ng_layer) ngram_forward(a,tokG,N);
     if(g_eg_on) eg_fwd(a,tokG,N,0);
+    if(!g_lk_init) loop_setk(&gC,env_i("CUDALM_LOOP_K",0));
     for(int l=0;l<gC.L;l++){
         if(g_pscratch) qlm_render_layer(&QQ,(float*)P,l);
         if(g_ngram_on&&l&&l==g_ng_layer) ngram_forward(a,tokG,N);
         if(g_eg_on&&l) eg_fwd(a,tokG,N,l);
+        if(g_lskip[l]){ e_cpy(l+1<gC.L?a->a_in[l+1]:a->x_final,a->a_in[l],(size_t)N*D); continue; }   /* skipped loop pass */
         e_rmsf(a->a_in[l],P,rd->an1[l],g_canA?a->cna[l]:a->a_norm[l],a->r1[l],N,D); kchk("fwd rmsnorm1",l);
         if(g_canA) canon_fwd(a->cna[l],l,0,a->a_norm[l],N);
         f8_hold(a->a_norm[l],N,D);
@@ -5842,6 +5850,7 @@ static void gpu_backward(const float*P,float*G,const Off*o,GA*a,const int*tokG,c
         /* the shared block still holds the PREVIOUS layer's gradients */
         if(g_fused && !getenv("CUDALM_QLM_NOALIAS") && !getenv("CUDALM_QLM_NOREUSE"))
             ck(cudaMemset(G+g_layer_g0,0,g_layer_gn*4),"zero layer G");
+        if(g_lskip[l]){ if(g_ngram_on&&l&&l==g_ng_layer) ngram_backward(a,tokG,N); if(g_eg_on&&l) engram_backward(a,tokG,N,l); continue; }
         if(lyT(&gC,l)){
             moe_backward(P,G,o,a,l,N);                                     kchk("bwd moe",l);
             if(g_shF) shared_bwd(a,l,N);
@@ -6690,6 +6699,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_KV","","model","at new: override the preset KV head count",1},
  {"CUDALM_F","","model","at new: override the preset FFN / expert width",1},
  {"CUDALM_LOOP","","model","looped layers a-bxk: run layers a..b k times, shared weights (e.g. 1-4x2)",0},
+ {"CUDALM_LOOP_RAND","0","train","looped model: draw the pass count 1..k per step (recurrent-depth training)",0},
+ {"CUDALM_LOOP_K","0","model","looped model: run only the first K passes (0 = all; eval at chosen depth)",0},
  {"CUDALM_DOCMASK","0","train","mask attention/canon across eot (pretraining; not for eot-separated chat turns)",1},
  {"CUDALM_UNIPOOL","0","model","at new: one expert pool shared by all layers",0},
  {"CUDALM_TOPK","2","moe","experts routed per token (1..8)",0},
@@ -8403,6 +8414,9 @@ static void cmd_train(int argc,char**argv){
     int keep_every=20000; { const char*e=getenv("CUDALM_KEEP_EVERY"); if(e) keep_every=atoi(e); }
     char stopp[1100]; snprintf(stopp,sizeof stopp,"%s.stop",mpath);
     int lrs_first=1, nskip=0, save_due=0;
+    int lrand=c.lp&&env_i("CUDALM_LOOP_RAND",0)?loop_kmax(&c):0;
+    if(lrand) printf("[loop] random depth: 1..%d passes per step (seeded per iter)\n",lrand);
+    if(lrand&&lrs_on){ printf("[lrs] off with CUDALM_LOOP_RAND\n"); lrs_on=0; }
     for(int it=start_iter; it<iters; it++){
         if(lrs_on&&it>=(int)warmup&&(lrs_first||it%lrs_every==0)){ lrs_first=0; int sk=lrs_probe(it);
             if(sk){ if((it+sk-1)/save_every>(it-1)/save_every) save_due=1; it+=sk-1; continue; } }
@@ -8412,10 +8426,13 @@ static void cmd_train(int argc,char**argv){
         ck(cudaMemcpyAsync(tokG,tok,(size_t)N*4,cudaMemcpyHostToDevice,0),"tok h2d");
         ck(cudaMemcpyAsync(tgtG,tgt,(size_t)N*4,cudaMemcpyHostToDevice,0),"tgt h2d");
         ck(cudaEventRecord(upev[it&1],0),"upev");
+        if(lrand){ unsigned long long h=((unsigned long long)it+1)*0x9E3779B97F4A7C15ULL^(unsigned long long)env_i("CUDALM_SEED",0); h^=h>>31; h*=0xBF58476D1CE4E5B9ULL; h^=h>>29;
+            loop_setk(&c,1+(int)(h%(unsigned long long)lrand)); }
         gpu_forward(P,&o,a,tokG);
         g_fused_lr=cur; g_fused_t=it+1;
         if(g_fused) fused_side_clip();       /* the layers step inside the backward */
         gpu_backward(P,G,&o,a,tokG,tgtG);
+        if(lrand) loop_setk(&c,env_i("CUDALM_LOOP_K",0));   /* benches / eval inside the run use the fixed depth */
         int ok=1;
         if(g_fused){ double sd=fused_side_sq();
             qlm_fused_tail(P,G,g_pscratch?&g_poff:&o,&g_goff);

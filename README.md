@@ -304,7 +304,8 @@ fp16/f32 keep floats; a quantized model exports as its own type.
   layer, stored after all other weights). Put it in `<model>.bin.env` of an existing fp32 checkpoint: the first load
   copies the repeat norms from the shared layers and its QLM state resumes. The header keeps the physical depth, so
   a looped checkpoint needs `CUDALM_LOOP` to load. Not combinable with QLM_FUSED, Muon, LR_BOOST_LAYERS, ATTN_GATE,
-  SHARED_F, CANON or quantize.
+  SHARED_F, CANON or quantize. `CUDALM_LOOP_RAND=1` trains with a random pass count 1..k per step (recurrent-depth
+  training); `CUDALM_LOOP_K=n` runs only the first n passes, e.g. to eval one checkpoint at several depths.
 - **Measuring SFT:** use `bench\chatbench.bat` (accuracy) and `bench\judgerun.bat` (coherence). Validation loss alone
   is a poor guide.
 - **Speed switches:** each of these is on by default and has an off switch for A/B runs. On a 5060 Ti, LS-Micro (top-1) went from

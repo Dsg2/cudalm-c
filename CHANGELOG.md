@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-30
 
+- Update README.md with new loop training options
+- Add loop_setk, loop_pass, loop_kmax functions to cudalm.cu
+- Add g_lskip and g_lk_init to loop training logic in cudalm.cu
+- Add new env flags and training output to cmd_train in cudalm.cu
+
+## Unreleased - 2026-10-30
+
 - README.md: document new flag and factorized embedding option
 - cudalm.cu: add fe_init, fe_update, fe_grad, fe_mat, fe_save functions and env var
 - tui.cuh: add CUDALM_EMB_E to command table
