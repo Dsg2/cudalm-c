@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-11-03
 
+- Add static size_t mem_tok_bytes(int N) function
+- Add static size_t mem_tok_bytes(N) call in ga_bytes for VRAM report
+- Move VRAM headroom check to after ngram/engram load
+- Adjust auto_batch and moe_stash_decide call order
+
+## Unreleased - 2026-11-03
+
 - Add hd_warn() to cudalm.cu
 - Add hd_warn() to tui.cuh
 - Warn when head dims are not 8/16/32/64

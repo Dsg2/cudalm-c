@@ -3556,6 +3556,7 @@ static void moe_perm_all(GA*a,int l,int N,int E,int Km,int K,int sb,float*out){
     ck(cudaMemcpyAsync(a->perm[l],a->h_perm,(size_t)K*Np*4,cudaMemcpyHostToDevice,0),"perm h2d");
 }
 
+static size_t mem_tok_bytes(int N);
 static size_t ga_bytes(int N,int train){   /* for the pre-flight VRAM report */
     int L=gC.L,D=gC.D,F=gC.F,KD=gC.KD,V=gC.V,H=gC.H,T=gC.T;
     size_t ND=(size_t)N*D,NKD=(size_t)N*KD,NF=(size_t)N*F, ch=(size_t)(N<g_chrows?N:g_chrows), NFX=(size_t)N*ga_fx();
@@ -3577,7 +3578,7 @@ static size_t ga_bytes(int N,int train){   /* for the pre-flight VRAM report */
     }
     size_t h16=0;                          /* fp16 attention operands, 2 bytes each */
     if(g_fp16){ h16 = (size_t)L*(ND+2*NKD)*2; if(train) h16 += ND*2; }
-    return tot*4 + h16;
+    return tot*4 + h16 + mem_tok_bytes(N);
 }
 
 /* ---- launch helpers ---- */
@@ -5149,6 +5150,15 @@ static void eg_ensure(int N){
     }
     g_eg_ncap=N;
 }
+/* per-token ngram/engram buffers (ngram_ensure/eg_ensure); 0 until a setup has run */
+static size_t mem_tok_bytes(int N){
+    size_t n=N, D=gC.D, De=g_ng_De, ND=n*D, NK, b;
+    if(g_eg_on){ size_t G=g_eg_gate!=0, C=g_eg_conv!=0; NK=n*g_eg_S;
+        b=NK*De*2+NK+ND*(3*C+2*G)+g_eg_np*(ND+G*(3*ND+3*n)+C*(2*ND+n)); }
+    else if(g_ngram_on){ NK=n*(g_ng_tri?2:1); b=n*De*2+ND+NK+(g_ng_gate?4*ND+3*n:0); }
+    else return 0;
+    if(g_ng_q4fold) b+=NK*(g_ngq_grp+2);
+    return b*4; }
 static EgP* eg_pt(int l){ for(int i=0;i<g_eg_np;i++) if(g_egp[i].layer==l) return &g_egp[i]; return 0; }
 static void engram_forward(GA*a,const int*tokG,int N,int l){
     EgP*P=eg_pt(l); if(!P) return;
@@ -8043,14 +8053,6 @@ static void cmd_train(int argc,char**argv){
       g_mask_head = want && c.tmpl==2; }
     gC=c; cuda_init(); Off o; calc_offsets(&c,&o);
     size_t np=param_count(&c);
-    int B=auto_batch(&c,np); int N=B*c.T;
-    moe_stash_decide(&c,np,N);
-    { size_t fr=0,tt=0; cudaMemGetInfo(&fr,&tt);
-      double use=(ga_bytes(N,1)+(double)opt_state_bytes(np))/1e9, head=(tt-(tt-fr))/1e9;
-      printf("[cudalm train] act=%.2f GB state=%.2f GB (B=%d T=%d, bf16 moments) | ~%.2f GB of %.2f GB, %.2f GB left for the desktop\n",
-             ga_bytes(N,1)/1e9, opt_state_bytes(np)/1e9, B, c.T, use, tt/1e9, head-use);
-      if(head-use < 0.8) printf("[cudalm train] WARNING: thin VRAM headroom - this GPU also drives the display.\n"
-                                "               If the driver resets, lower CUDALM_BATCH or raise CUDALM_VRAM_RESERVE_MB.\n"); }
     { const char*qe=getenv("CUDALM_QLM"); g_qlm_on = qe ? atoi(qe)!=0 : 0; }
     /* default Muon steps aside where it is unsupported or untested; an explicit CUDALM_MUON=1 keeps the old errors */
     if(g_muon && !g_muon_exp && (g_qlm_on||c.mod)){ g_muon=0; printf("[cudalm train] Muon off (default) for a %s model: AdamW\n",g_qlm_on?"QLM":"per-layer layout"); }
@@ -8078,6 +8080,15 @@ static void cmd_train(int argc,char**argv){
     if(g_ngram_on) ngram_load(optpath);
     if(g_eg_on) engram_load(optpath);
     t1_load(optpath);
+    /* after the ngram/engram tables exist, so the free VRAM auto_batch reads already excludes them */
+    int B=auto_batch(&c,np); int N=B*c.T;
+    moe_stash_decide(&c,np,N);
+    { size_t fr=0,tt=0; cudaMemGetInfo(&fr,&tt);
+      double use=(ga_bytes(N,1)+(double)opt_state_bytes(np))/1e9, head=(tt-(tt-fr))/1e9;
+      printf("[cudalm train] act=%.2f GB state=%.2f GB (B=%d T=%d, bf16 moments) | ~%.2f GB of %.2f GB, %.2f GB left for the desktop\n",
+             ga_bytes(N,1)/1e9, opt_state_bytes(np)/1e9, B, c.T, use, tt/1e9, head-use);
+      if(head-use < 0.8) printf("[cudalm train] WARNING: thin VRAM headroom - this GPU also drives the display.\n"
+                                "               If the driver resets, lower CUDALM_BATCH or raise CUDALM_VRAM_RESERVE_MB.\n"); }
     if(g_fused){ g_gsize=calc_goffsets(&c,&o,&g_goff);
                  g_gnpart=(float*)dmalloc((size_t)64*c.L*4);
                  ck(cudaMemset(g_gnpart,0,(size_t)64*c.L*4),"zero gnpart"); }
