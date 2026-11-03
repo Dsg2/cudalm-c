@@ -191,7 +191,8 @@ cudalm train mymodel data\anneal 1
 ```
 
 **Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every; default 10000 since 20f, 0 turns it off) runs `lmeval` on the checkpoint saved
-at or after every N steps of the stage, and once more at the end. It runs as a child process; training waits, and that time
+at or after every N steps of the stage, and once more at the end. It runs in-process on the training weights and buffers
+(no second copy of the model in VRAM; same scores as `lmeval`; `CUDALM_BENCH_CHILD=1` uses the old child process); training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
 By default it runs every task (HellaSwag, ARC-E, ARC-C, PIQA, LAMBADA, ArithMark) on its full set; `CUDALM_BENCH_TASKS`
 (comma list) and `CUDALM_BENCH_N` (items per task) narrow it. Each bench also saves its per-item dump to

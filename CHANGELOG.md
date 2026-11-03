@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-11-03
 
+- README.md: update benchmark description to note in-process mode
+- cudalm.cu: add CUDALM_BENCH_CHILD env flag
+- cudalm.cu: add lmeval_core function for in-process scoring
+- cudalm.cu: add LeRes struct and refactor train_bench to use it
+
+## Unreleased - 2026-11-03
+
 - Add static size_t mem_tok_bytes(int N) function
 - Add static size_t mem_tok_bytes(N) call in ga_bytes for VRAM report
 - Move VRAM headroom check to after ngram/engram load
