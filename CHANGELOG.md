@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - 2026-11-03
+
+- README.md: document CUDALM_STAGE, CUDALM_DECAY_SHAPE, and new TUI form fields
+- cudalm.cu: add g_stage_kind, g_dshape, and updated lr_at logic for stable/decay stages
+- tui.cuh: add LR schedule, peak LR, warmup, decay frac, decay shape, LR floor form fields and t_train_sched()
+
 ## Unreleased - 2026-10-30
 
 - README.md: update tokenizer usage line to include [maxdigits] option

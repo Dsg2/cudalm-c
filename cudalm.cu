@@ -3241,6 +3241,9 @@ static int g_nkeep=0;
 /* WSD by default (CUDALM_SCHED=cosine reverts) + CUDALM_WSD_DECAY (fraction of the run spent cooling down) */
 static int   g_wsd=1;
 static float g_wsd_decay=0.15f;
+/* CUDALM_STAGE (WSD only): 0 wsd, 1 stable = warmup + hold, no decay; 2 decay = warmup, then decay over the whole stage.
+ * stable then decay on a second corpus = the 2-stage pipeline. CUDALM_DECAY_SHAPE: 0 1-sqrt, 1 linear, 2 cosine. */
+static int   g_stage_kind=0, g_dshape=0;
 /* CUDALM_REWARMUP=N: ramp the scheduled rate over the first N iterations of THIS
  * session. The built-in warmup keys off the absolute iteration, so it never
  * fires on a resume -- but a resume that also changes corpus or schedule can
@@ -6485,10 +6488,11 @@ static float lr_at(int it,int iters,float lr,float warmup,int wsd,float dfrac){
             base=lo+0.5f*(1+cosf(3.14159265f*(it-warmup)/span))*(lr-lo);
         } else {
             int d=(int)(iters*dfrac); if(d<1) d=1;
-            int s=iters-d; if(s<(int)warmup) s=(int)warmup;
-            if(it<s) base=lr;
+            int s=g_stage_kind==2?0:iters-d; if(s<(int)warmup) s=(int)warmup;
+            if(it<s||g_stage_kind==1) base=lr;
             else { float x=(float)(it-s)/(float)(iters-s>0?iters-s:1); if(x>1.0f) x=1.0f;
-                   base=lo+(lr-lo)*(1.0f-sqrtf(x)); }
+                   float y=g_dshape==1?1.0f-x:g_dshape==2?0.5f*(1.0f+cosf(3.14159265f*x)):1.0f-sqrtf(x);
+                   base=lo+(lr-lo)*y; }
         }
     }
     if(g_rewarm>0){                    /* ramp whatever the schedule asked for */
@@ -6725,6 +6729,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_WD","0.1","optim","weight decay for AdamW, Muon and QLM (CUDALM_QLM_WD is the old name)",0},
  {"CUDALM_SCHED","wsd","optim","wsd | cosine",0},
  {"CUDALM_WSD_DECAY","0.15","optim","WSD decay fraction",1},
+ {"CUDALM_STAGE","wsd","optim","wsd (warmup, hold, decay the last WSD_DECAY) | stable (warmup + hold, no decay) | decay (warmup, then decay the whole stage; auto LR keeps the full peak)",1},
+ {"CUDALM_DECAY_SHAPE","sqrt","optim","decay curve: sqrt (1-sqrt) | linear | cosine",1},
  {"CUDALM_REWARMUP","0","optim","re-warmup iters after resume",1},
  {"CUDALM_ITERS","auto","optim","pin ONE schedule over iters 0..N of the whole run (else: epochs of this corpus, as a new stage)",1},
  {"CUDALM_LR_BOOST","","optim","LR multiplier for CUDALM_LR_BOOST_LAYERS",0},
@@ -8185,7 +8191,7 @@ static void cmd_train(int argc,char**argv){
      * Saves are atomic+fsynced so a frequent cadence is safe, it just costs
      * ~1.5 s of I/O each time. CUDALM_SAVE_EVERY overrides. */
     { const char*e=getenv("CUDALM_SAVE_EVERY"); if(e){ int v=atoi(e); if(v>=10) save_every=v; } }
-    float lr=default_lr_for(&c)*(g_stage0>0?LR_STAGE_MUL:1.0f), warmup=100.0f;
+    float lr=default_lr_for(&c)*(g_stage0>0&&!(g_wsd&&g_stage_kind==2)?LR_STAGE_MUL:1.0f), warmup=100.0f;   /* a decay stage continues the peak */
     /* CUDALM_LR overrides the peak. Needed after `grow`: a grown checkpoint has
      * no optimizer state, so training restarts at iter 0 and would otherwise ramp
      * back to the full from-scratch peak (2e-4 here) and wash out the weights the
@@ -8232,8 +8238,11 @@ static void cmd_train(int argc,char**argv){
     g_start_iter=start_iter;
     if(fe_dim(c.D)&&g_qlm_on){ fprintf(stderr,"[emb] CUDALM_EMB_E does not combine with QLM\n"); exit(1); }
     if(!g_qlm_on) fe_init(optpath,start_iter,P+o.emb);
-    { int S=iters-g_stage0, d=(int)(S*g_wsd_decay);
-      if(g_wsd) printf("[cudalm train] schedule WSD: warmup %d, hold %g, cooldown over the last %.0f%% of the stage (%d iters, from iter %d) to %g\n",
+    { int S=iters-g_stage0, d=(int)(S*g_wsd_decay); const char*shp=g_dshape==1?"linear":g_dshape==2?"cosine":"1-sqrt";
+      if(g_wsd&&g_stage_kind==1) printf("[cudalm train] schedule stable: warmup %d, hold %g to the end of the stage (no decay; finish with a decay stage)\n",(int)warmup,lr);
+      else if(g_wsd&&g_stage_kind==2) printf("[cudalm train] schedule decay: warmup %d to %g, then %s decay over the rest of the stage (%d iters) to %g\n",
+                       (int)warmup,lr,shp,S-(int)warmup,lr_minf()*lr);
+      else if(g_wsd) printf("[cudalm train] schedule WSD: warmup %d, hold %g, cooldown over the last %.0f%% of the stage (%d iters, from iter %d) to %g\n",
                        (int)warmup, lr, g_wsd_decay*100.0f, d, iters-d, lr_minf()*lr);
       else      printf("[cudalm train] schedule cosine: %g -> %g over iters %d..%d\n", lr, lr_minf()*lr, g_stage0, iters); }
     if(g_rewarm>0) printf("[cudalm train] re-warmup: ramping to the scheduled rate over %d iters from iter %d\n",
@@ -10716,6 +10725,8 @@ int main(int argc,char**argv){
       const char*sc=getenv("CUDALM_SCHED"); if(sc) g_wsd=strcmp(sc,"cosine")!=0;
       const char*wd=getenv("CUDALM_WSD_DECAY");
       if(wd){ float v=(float)atof(wd); if(v>0.0f && v<1.0f) g_wsd_decay=v; }
+      { const char*v=getenv("CUDALM_STAGE"); if(v) g_stage_kind=!strcmp(v,"stable")?1:!strcmp(v,"decay")?2:0;
+        v=getenv("CUDALM_DECAY_SHAPE"); if(v) g_dshape=!strcmp(v,"linear")?1:!strcmp(v,"cosine")?2:0; }
       const char*rw=getenv("CUDALM_REWARMUP"); if(rw){ int v=atoi(rw); if(v>0) g_rewarm=v; }
       { const char*ma=getenv("CUDALM_MOE_AUX"); if(ma){ float v=(float)atof(ma); if(v>=0.0f) g_moe_aux=v; printf("[moe] aux loss %.3f (CUDALM_MOE_AUX)\n",g_moe_aux); } }
       { const char*v;

@@ -32,6 +32,16 @@ static const TCmd T_CMDS[]={
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT,0,0,0,
     "Passes over THIS corpus from now on. A model trained before starts a new stage here (warmup + LR schedule\n"
     "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models\\<name>.bin.run)."},
+   {"LR schedule","wsd",F_ENV,"CUDALM_STAGE",0,"wsd|stable|decay","wsd = warmup, hold, decay over the last 'decay frac' (one-stage run).  stable = warmup + hold, no decay.\n"
+    "decay = short warmup, then decay over the whole stage. 2-stage pipeline: stable on corpus 1, then decay on corpus 2\n"
+    "(same model, same peak LR). Not saved to the model config: set it for every run."},
+   {" peak LR","",F_ENV,"CUDALM_LR",0,0,"Empty = the model config, else auto (by width; a new stage on a trained model gets 1/3 of it, except decay).\n"
+    "For a decay stage use the stable stage's peak. Saved to the model config."},
+   {" warmup","",F_ENV,"CUDALM_WARMUP",0,0,"Warmup iters at the start of this stage (empty = model config, else 100). A decay stage after stable\n"
+    "only needs a few (e.g. 10): the optimizer state is already warm. Saved to the model config."},
+   {" decay frac","",F_ENV,"CUDALM_WSD_DECAY",0,0,"wsd only: share of the stage spent decaying (empty = 0.15; 0 < x < 1)."},
+   {" decay shape","sqrt",F_ENV,"CUDALM_DECAY_SHAPE",0,"sqrt|linear|cosine","Decay curve from peak to floor: sqrt = 1-sqrt (fast drop, long tail; the default), linear, cosine."},
+   {" LR floor","",F_ENV,"CUDALM_LR_MIN",0,0,"LR at the end of the decay as a fraction of peak (empty = model config, else 0.1). Saved to the model config."},
    {"bench every","10000",F_ENV,"CUDALM_BENCH_EVERY",0,0,"0 = off (default 10000). N = every N steps of this stage, lmeval the checkpoint just saved (training waits,\n"
     "the time is left out of tok/s) and log the index + per-task scores to models\\<name>.bin.bench.tsv. Also runs at the end."},
    {" bench items","0",F_ENV,"CUDALM_BENCH_N",0,0,"Items per task (0 = full sets, the default).\n"
@@ -753,6 +763,21 @@ static void t_after(const TCmd*c,DWORD code,const char*lp,const char*o){
         if(k==13&&nx) t_form(&T_CMDS[t_ci(nx)]);
         return; } }
 
+/* Train: the LR plan this run will use (form value, else the model config, else the built-in default) */
+static void t_train_sched(const TCmd*c,char V[][T_MAXL]){
+    static const char*lb[]={"LR schedule"," peak LR"," warmup"," decay frac"," decay shape"," LR floor"};
+    char v[6][T_MAXL], p[1100], l[1024]; int ci=(int)(c-T_CMDS);
+    for(int i=0;i<6;i++){ int fi=t_fi(ci,lb[i]); snprintf(v[i],T_MAXL,"%s",fi<0?"":V[fi]); }
+    FILE*f=NULL; if(V[0][0]){ model_path(V[0],p,sizeof p-5); strcat(p,".env"); f=fopen(p,"rb"); }
+    while(f&&fgets(l,sizeof l,f)){ l[strcspn(l,"\r\n")]=0; char*eq=strchr(l,'='); if(!eq) continue; *eq=0;
+        int k=!strcmp(l,"CUDALM_LR")?1:!strcmp(l,"CUDALM_WARMUP")?2:!strcmp(l,"CUDALM_LR_MIN")?5:0;
+        if(k&&!v[k][0]) snprintf(v[k],T_MAXL,"%s \x1b[2m(config)\x1b[0m",eq+1); }
+    if(f) fclose(f);
+    const char*lr=v[1][0]?v[1]:"auto", *wu=v[2][0]?v[2]:"100", *fl=v[5][0]?v[5]:"0.1", *sh=v[4][0]?v[4]:"sqrt";
+    printf("\n  \x1b[1mLR plan\x1b[0m  warmup %s -> peak %s -> ",wu,lr);
+    if(!strcmp(v[0],"stable")) printf("hold to the end, no decay   \x1b[2mnext: decay stage on the second corpus\x1b[0m\n");
+    else if(!strcmp(v[0],"decay")) printf("%s decay over the whole stage to %s x peak\n",sh,fl);
+    else printf("hold, then %s decay over the last %.0f%% of the stage to %s x peak\n",sh,100*(v[3][0]?atof(v[3]):0.15),fl); }
 static void t_form(const TCmd*c){
     int ci=(int)(c-T_CMDS), nf=0; while(nf<T_NF && c->f[nf].label) nf++;
     t_form_init(ci); char (*V)[T_MAXL]=t_vals[ci];
@@ -772,6 +797,7 @@ static void t_form(const TCmd*c){
         if(mode>=0 || c->run) t_help(sel<nv?&c->f[vis[sel]]:NULL,sel<nv?V[vis[sel]]:"",c->run);
         printf("\n%s [ Run ]\x1b[0m\n\n\x1b[2m%s\x1b[0m\n",sel==nv?"\x1b[7m>":" ",ok?cl:err);
         t_panel(c,V,1);
+        if(t_is(c,"Train")) t_train_sched(c,V);
         if(mode>=0){ printf("\n"); t_new_stats(c,V); }
         if(msg[0]) printf("\x1b[33m%s\x1b[0m\n",msg); msg[0]=0;
         printf("\x1b[%d;1H\x1b[2mUp/Down move  Enter edit/pick  Left/Right cycle choice  Del clear  F5 run  %sEsc back\x1b[0m",t_rows(),
@@ -1044,7 +1070,8 @@ static int tui_check(int argc,char**argv){
         int ok=t_cmdline(c,V,cl,sizeof cl,err,sizeof err);
         printf("%-16s %s\n",c->title,ok?cl:err);
         if(c->grp==1||c->grp==3){ int np=t_panel(c,V,1); if(np) printf("  (%d problem%s)\n",np,np>1?"s":""); }
-        if(t_is(c,"New model")){ t_mode(c,V); t_new_stats(c,V); } }
+        if(t_is(c,"New model")){ t_mode(c,V); t_new_stats(c,V); }
+        if(t_is(c,"Train")) t_train_sched(c,V); }
     return 0; }
 static int tui_main(void){
     HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); DWORD m=0;

@@ -176,6 +176,20 @@ iterations 0..N of the model's whole life (`runs\sft.bat` uses it). `CUDALM_ITER
 `CUDALM_REWARMUP` and `CUDALM_PERM_BASE` are per-run settings: they are not saved to `.bin.env`, and old `.bin.env`
 files that contain them are ignored for those keys.
 
+**Two-stage schedule (warmup + stable, then decay on a second corpus).** `CUDALM_STAGE` picks the stage's LR shape:
+`wsd` (default: warmup, hold, decay over the last `CUDALM_WSD_DECAY`), `stable` (warmup, then hold the peak to the end
+of the stage, no decay) or `decay` (a short warmup, then decay over the whole stage to `CUDALM_LR_MIN` x peak; with an
+auto LR a decay stage keeps the full peak instead of the usual third). `CUDALM_DECAY_SHAPE` = `sqrt` (1-sqrt, default),
+`linear` or `cosine`. Both are per-run settings. In the TUI they are on the Train form (LR schedule, peak LR, warmup,
+decay frac, decay shape, LR floor), with a one-line LR plan under the form. Example:
+
+```
+set CUDALM_STAGE=stable& set CUDALM_WARMUP=1000& set CUDALM_LR=1e-3
+cudalm train mymodel data\pretrain 1
+set CUDALM_STAGE=decay& set CUDALM_WARMUP=10& set CUDALM_LR_MIN=0.02
+cudalm train mymodel data\anneal 1
+```
+
 **Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every; default 10000 since 20f, 0 turns it off) runs `lmeval` on the checkpoint saved
 at or after every N steps of the stage, and once more at the end. It runs as a child process; training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
