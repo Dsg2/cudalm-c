@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - 2026-11-04
+
+- save_rename: retry MoveFileExA 10 times with Sleep(100) for NTFS
+- add d2h_write: 64 MB host buffer for save device-to-host
+- opt_save: use d2h_write for bf16 optimizer save
+- ngram_save: replace malloc/cudaMemcpy chain with t1_rw/ng_tbl_rw
+- mu_save: replace malloc/cudaMemcpy with d2h_write
+
 ## Unreleased - 2026-11-03
 
 - README.md: update benchmark description to note in-process mode

@@ -510,8 +510,10 @@ static int save_commit(FILE*f,const char*tmp,const char*path){
 }
 static int save_rename(const char*tmp,const char*path){
 #ifdef _WIN32
-    /* MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH = atomic swap on NTFS */
-    return MoveFileExA(tmp,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+    /* MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH = atomic swap on NTFS. Retried: saves <1 s
+     * apart failed ~1 in 4 renames (a scanner still holding the previous file), never at real intervals */
+    for(int r=0;r<10;r++){ if(MoveFileExA(tmp,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) return 1; Sleep(100); }
+    return 0;
 #else
     /* rename() is atomic and replaces the target -- but on POSIX the DIRECTORY
      * ENTRY is not durable until the containing directory is itself fsynced.
@@ -528,6 +530,17 @@ static int save_rename(const char*tmp,const char*path){
     return 1;
 #endif
 }
+/* device -> file through one reused 64 MB host buffer, so a save needs no full-size host copy.
+ * 2026-11-04: a 40 GB explorer.exe leak exhausted commit, the per-save np-sized mallocs failed and
+ * a cudaMemcpy into NULL killed LS3. The buffer is allocated at the first save and kept. */
+static int d2h_write(FILE*f,const void*dev,size_t by){
+    static char*b=NULL; const size_t C=(size_t)64<<20;
+    if(!b) b=(char*)malloc(C);
+    if(!b){ if(g_sv_batch) g_sv_fail=1; fprintf(stderr,"[save] no host memory for the 64 MB staging buffer\n"); return 0; }
+    for(size_t o=0;o<by;o+=C){ size_t n=by-o<C?by-o:C;
+        ck(cudaMemcpy(b,(const char*)dev+o,n,cudaMemcpyDeviceToHost),"save d2h");
+        if(fwrite(b,1,n,f)!=n) return 0; }
+    return 1; }
 static void model_save_bundle(const char*path,const Cfg*c,const float*P,size_t n,const uint8_t*blob,int bl){
     char tmp[1200]; FILE*f=save_open(path,tmp,sizeof(tmp));
     Cfg pc; if(c->lp){ pc=*c; pc.L=c->lp; for(int v=c->L-1;v>=0;v--){ int l=c->lmap[v]; pc.lt[l]=c->lt[v]; pc.lE[l]=c->lE[v]; pc.lF[l]=c->lF[v]; } c=&pc; }
@@ -542,9 +555,10 @@ static void model_save_bundle(const char*path,const Cfg*c,const float*P,size_t n
 /* TOP2 = bf16 moments (half the size of TOPT). TOPT is still READ, converting
  * on the way in, so an optimizer state written before this change still
  * resumes -- LS-GROWN's .opt is 1.77 GB of fp32 and should not become dead. */
-static void opt_save(const char*path,int it,const bf16*M,const bf16*V,size_t n){
+static void opt_save_dev(const char*path,int it,const bf16*Md,const bf16*Vd,size_t n){
     char tmp[1200]; FILE*f=save_open(path,tmp,sizeof(tmp));
-    fwrite("TOP2",1,4,f); fwrite(&it,4,1,f); fwrite(M,2,n,f); fwrite(V,2,n,f);
+    int ok=fwrite("TOP2",1,4,f)==4&&fwrite(&it,4,1,f)==1&&d2h_write(f,Md,n*2)&&d2h_write(f,Vd,n*2);
+    if(!ok){ save_abort(f,tmp); fprintf(stderr,"optimizer save FAILED for %s (previous kept)\n",path); return; }
     if(!save_commit(f,tmp,path)) fprintf(stderr,"optimizer save FAILED for %s (previous kept)\n",path); }
 static int opt_load(const char*path,bf16*M,bf16*V,size_t n){
     FILE*f=fopen(path,"rb"); if(!f)return 0; char m[4]; int it=0;
@@ -4725,42 +4739,15 @@ static void ngram_update(float lr,int t){
  * Holds Wng + its bf16 moments, and the table state: q4 = digits+resid+int8
  * moments+scales+sref (g_ng is a pure render view, re-rendered on load); fp32 =
  * table + bf16 moments. Header ints validate config against env on resume. */
+static int t1_rw(FILE*f,void*dev,size_t by,int wr); static int ng_tbl_rw(FILE*f,int wr);
 static void ngram_save(const char*optpath,int it){
     char path[1200]; snprintf(path,sizeof path,"%s.ng",optpath);
     char tmp[1300]; FILE*f=save_open(path,tmp,sizeof tmp);
-    size_t nw=(size_t)g_ng_De*gC.D, nt=(size_t)g_ng_R*g_ng_De;
+    size_t nw=(size_t)g_ng_De*gC.D;
     int hdr[5]={g_ng_R,g_ng_De,g_ng_order,g_ng_q4,it};
     fwrite("NGR1",1,4,f); fwrite(hdr,4,5,f);
-    { float*wh=(float*)malloc(nw*4);
-      ck(cudaMemcpy(wh,g_ngW,nw*4,cudaMemcpyDeviceToHost),"ng save W");
-      fwrite(wh,4,nw,f); free(wh); }
-    { bf16*mh=(bf16*)malloc(nw*2),*vh=(bf16*)malloc(nw*2);
-      ck(cudaMemcpy(mh,g_ngWM,nw*2,cudaMemcpyDeviceToHost),"ng save WM");
-      ck(cudaMemcpy(vh,g_ngWV,nw*2,cudaMemcpyDeviceToHost),"ng save WV");
-      fwrite(mh,2,nw,f); fwrite(vh,2,nw,f); free(mh); free(vh); }
-    if(g_ng_q4){
-        int ng=g_ngq_ngrp; size_t nd=(nt+1)/2;
-        float sref=g_ngq_spH.sref; fwrite(&sref,4,1,f);
-        { signed char*b=(signed char*)malloc(nd);
-          ck(cudaMemcpy(b,g_ngq_d,nd,cudaMemcpyDeviceToHost),"ng save d"); fwrite(b,1,nd,f); free(b); }
-        { signed char*b=(signed char*)malloc(nt);
-          ck(cudaMemcpy(b,g_ngq_r,nt,cudaMemcpyDeviceToHost),"ng save r"); fwrite(b,1,nt,f); free(b); }
-        { signed char*b=(signed char*)malloc(nt);
-          ck(cudaMemcpy(b,g_ngq_m8,nt,cudaMemcpyDeviceToHost),"ng save m8"); fwrite(b,1,nt,f); free(b); }
-        { unsigned char*b=(unsigned char*)malloc(nt);
-          ck(cudaMemcpy(b,g_ngq_v8,nt,cudaMemcpyDeviceToHost),"ng save v8"); fwrite(b,1,nt,f); free(b); }
-        { float*sb=(float*)malloc((size_t)ng*4);
-          ck(cudaMemcpy(sb,g_ngq_s ,(size_t)ng*4,cudaMemcpyDeviceToHost),"ng save s");  fwrite(sb,4,ng,f);
-          ck(cudaMemcpy(sb,g_ngq_ms,(size_t)ng*4,cudaMemcpyDeviceToHost),"ng save ms"); fwrite(sb,4,ng,f);
-          ck(cudaMemcpy(sb,g_ngq_vs,(size_t)ng*4,cudaMemcpyDeviceToHost),"ng save vs"); fwrite(sb,4,ng,f); free(sb); }
-    } else {
-        { float*b=(float*)malloc(nt*4);
-          ck(cudaMemcpy(b,g_ng,nt*4,cudaMemcpyDeviceToHost),"ng save tbl"); fwrite(b,4,nt,f); free(b); }
-        { bf16*mh=(bf16*)malloc(nt*2),*vh=(bf16*)malloc(nt*2);
-          ck(cudaMemcpy(mh,g_ngM,nt*2,cudaMemcpyDeviceToHost),"ng save M");
-          ck(cudaMemcpy(vh,g_ngV,nt*2,cudaMemcpyDeviceToHost),"ng save V");
-          fwrite(mh,2,nt,f); fwrite(vh,2,nt,f); free(mh); free(vh); }
-    }
+    if(!(t1_rw(f,g_ngW,nw*4,1)&&t1_rw(f,g_ngWM,nw*2,1)&&t1_rw(f,g_ngWV,nw*2,1)&&ng_tbl_rw(f,1))){
+        save_abort(f,tmp); fprintf(stderr,"ngram save FAILED for %s (previous kept)\n",path); return; }
     if(!save_commit(f,tmp,path)) fprintf(stderr,"ngram save FAILED for %s (previous kept)\n",path);
 }
 static int ngram_load(const char*optpath){
@@ -4887,9 +4874,9 @@ static void t1_update(float lr,int t){
     if(g_attg||g_ng_gate) kchk("t1 adam",-1);
 }
 static int t1_rw(FILE*f,void*dev,size_t by,int wr){
-    void*h=malloc(by); int ok=1;
-    if(wr){ ck(cudaMemcpy(h,dev,by,cudaMemcpyDeviceToHost),"t1 d2h"); fwrite(h,1,by,f); }
-    else if((ok=fread(h,1,by,f)==by)) ck(cudaMemcpy(dev,h,by,cudaMemcpyHostToDevice),"t1 h2d");
+    if(wr) return d2h_write(f,dev,by);
+    void*h=malloc(by); int ok=h&&fread(h,1,by,f)==by;
+    if(ok) ck(cudaMemcpy(dev,h,by,cudaMemcpyHostToDevice),"t1 h2d");
     free(h); return ok;
 }
 /* sidecar <optpath>.t1: Wg(+m,v), ngram Wk(+m,v), router bias; header validates flags */
@@ -6360,11 +6347,8 @@ static void gpu_muon(float*P,float*G,float lr){
 static void mu_save(const char*optpath,int it,size_t np){
     if(!g_muon||g_qlm_on||!gMuM) return;
     char path[1200],tmp[1300]; snprintf(path,sizeof path,"%s.mu",optpath);
-    float*h=(float*)malloc(np*4); if(!h){ if(g_sv_batch) g_sv_fail=1; fprintf(stderr,"[muon] momentum save FAILED: out of host memory\n"); return; }
-    ck(cudaMemcpy(h,gMuM,np*4,cudaMemcpyDeviceToHost),"mu d2h");
     FILE*f=save_open(path,tmp,sizeof tmp); unsigned long long n=np;
-    int ok=fwrite("MUM1",1,4,f)==4&&fwrite(&it,4,1,f)==1&&fwrite(&n,8,1,f)==1&&fwrite(h,4,np,f)==np;
-    free(h);
+    int ok=fwrite("MUM1",1,4,f)==4&&fwrite(&it,4,1,f)==1&&fwrite(&n,8,1,f)==1&&d2h_write(f,gMuM,np*4);
     if(!ok){ save_abort(f,tmp); fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); return; }
     if(!save_commit(f,tmp,path)) fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); }
 static void mu_load(const char*optpath,size_t np,int start_iter){
@@ -7949,6 +7933,8 @@ static void lmeval_core(const char*tag,const float*P,const Off*o,GA*a,int*tokG,i
         tn+=k; if(*tn) tn++; }
     int D=gC.D, V=gC.V, *tok=(int*)malloc((size_t)N*4), *tgt=(int*)malloc((size_t)N*4);
     float*lp=(float*)malloc((size_t)N*4),*lg=(float*)malloc((size_t)CH_ROWS*V*4);
+    R->ns=0; R->ix=R->mi=NAN;
+    if(!tok||!tgt||!lp||!lg){ printf("[lmeval] out of host memory - skipped\n"); free(tok); free(tgt); free(lp); free(lg); return; }
     if(!quiet) printf("[lmeval] %s | Tmax %d | %d tokens per forward | tasks %s\n",tag,Tm,N,tl);
     R->ns=0; R->ix=R->mi=NAN; double t0=wall();
     /* Open SLM intelligence index inputs (acc_norm %): hellaswag, arc_easy, arc_challenge, piqa, arithmark */
@@ -8573,11 +8559,7 @@ static void cmd_train(int argc,char**argv){
         save_begin();
         model_save_bundle(mpath,&c,Ph,np,tok_blob,tok_len);
         if(!g_qlm_on){
-            bf16*mh=(bf16*)malloc(np*2),*vh=(bf16*)malloc(np*2);
-            ck(cudaMemcpy(mh,M,np*2,cudaMemcpyDeviceToHost),"M d2h");
-            ck(cudaMemcpy(vh,Vv,np*2,cudaMemcpyDeviceToHost),"V d2h");
-            opt_save(optpath,done,mh,vh,np); mu_save(optpath,done,np);
-            free(mh);free(vh);
+            opt_save_dev(optpath,done,M,Vv,np); mu_save(optpath,done,np);
         } else { char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(&QQ,qp,done); }
         if(g_ngram_on) ngram_save(optpath,done);
         if(g_eg_on) engram_save(optpath,done);
