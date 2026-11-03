@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-11-03
 
+- Add hd_warn() to cudalm.cu
+- Add hd_warn() to tui.cuh
+- Warn when head dims are not 8/16/32/64
+- Print warning in cmd_new and cmd_train
+
+## Unreleased - 2026-11-03
+
 - README.md: document CUDALM_STAGE, CUDALM_DECAY_SHAPE, and new TUI form fields
 - cudalm.cu: add g_stage_kind, g_dshape, and updated lr_at logic for stable/decay stages
 - tui.cuh: add LR schedule, peak LR, warmup, decay frac, decay shape, LR floor form fields and t_train_sched()

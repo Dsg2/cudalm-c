@@ -150,6 +150,12 @@ static float *dzero(size_t n){ float *p=(float*)dmalloc(n*4); ck(cudaMemset(p,0,
 typedef struct { int V,D,L,H,KV,F,T,hd,KD,half,eot,tmpl,n_mtp,n_exp,win,full_every,pool; float rope_base;
                  int mod,lt[64],lE[64],lF[64]; int lp,lb,lmap[64]; } Cfg;   /* mod: TLM7 per-layer FFN (lt 0 dense/1 MoE/2 pool); lp/lb/lmap: CUDALM_LOOP */
 static void cfg_derive(Cfg*c){ c->hd=c->D/c->H; c->KD=c->KV*c->hd; c->half=c->hd/2; }
+/* fast attention kernels are instantiated for head dims 8/16/32/64 only; anything else is ~10x slower */
+static const char* hd_warn(const Cfg*c){
+    static char b[300]; int h=c->hd; if(h==8||h==16||h==32||h==64) return NULL;
+    int n=snprintf(b,sizeof b,"head dim %d (D %d / H %d) has no fast attention kernel (8, 16, 32, 64 only): training is ~10x slower. Fast H for D=%d:",h,c->D,c->H,c->D);
+    for(int H=1;H<=c->D&&n<(int)sizeof b-8;H++) if(c->D%H==0){ int d=c->D/H; if(d==8||d==16||d==32||d==64) n+=snprintf(b+n,sizeof b-n," %d",H); }
+    return b; }
 static int lyT(const Cfg*c,int l){ return c->mod?c->lt[l]:c->n_exp>0?(c->pool?2:1):0; }
 static int lyE(const Cfg*c,int l){ return c->mod?c->lE[l]:c->n_exp; }
 static int lyF(const Cfg*c,int l){ return c->mod?c->lF[l]:c->F; }
@@ -7324,6 +7330,7 @@ static int cmd_new(int argc,char**argv){
       printf("      memory: %s\n",mem_name(m.mode)); pstats_print(&c,&m,g_topk,g_topkL,env_i("CUDALM_ATTN_GATE",0)!=0); }
     printf("      D=%d L=%d H=%d KV=%d F=%d T=%d V=%d (V is replaced by the data's vocab on first train)\n",
            c.D,c.L,c.H,c.KV,c.F,c.T,c.V);
+    if(hd_warn(&c)) printf("\x1b[33m[new] WARNING: %s\x1b[0m\n",hd_warn(&c));
     if(c.win>0){
         int rf=c.L*c.win;
         printf("      sliding attention: window %d, receptive field %d x %d = %d %s\n",
@@ -8229,6 +8236,7 @@ static void cmd_train(int argc,char**argv){
     }
     printf("[cudalm train] %s %s params=%zu B=%d V=%d lr=%g | corpus %d steps/epoch\n",
            name, trained?"(resume)":"(fresh)", np, B, c.V, lr, spe);
+    if(hd_warn(&c)) printf("[cudalm train] WARNING: %s\n",hd_warn(&c));
     if(pin_iters) printf("[cudalm train] CUDALM_ITERS=%d: one schedule over iters 0..%d (absolute), now at %d\n",iters,iters,start_iter);
     else if(run_note==1) printf("[cudalm train] continuing the unfinished stage: iters %d..%d (%.2f epochs of this corpus), now at %d, %d left\n",
                                 g_stage0,iters,(double)(iters-g_stage0)/spe,start_iter,iters-start_iter);

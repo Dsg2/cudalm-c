@@ -577,6 +577,7 @@ static void t_new_stats(const TCmd*c, char vals[][T_MAXL]){
     MemCfg m; mem_from_env(&m,cf.L);
     printf("\x1b[1mparams\x1b[0m  D=%d L=%d H=%d KV=%d F=%d \x1b[2m(V=%d from the preset; the first train resizes it to the data's vocab)\x1b[0m\n",
            cf.D,cf.L,cf.H,cf.KV,cf.F,cf.V);
+    if(hd_warn(&cf)) printf("  \x1b[1;33m%s\x1b[0m\n",hd_warn(&cf));
     pstats_print(&cf,&m,k,kl,env_i("CUDALM_ATTN_GATE",0)!=0);
     t_env_pop(); }
 
