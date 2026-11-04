@@ -38,6 +38,16 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+/* GPU series, chosen only by build.py --arch (nvcc -DCUDALM_ARCH=N); each build compiles just its own paths:
+ *    75  RTX 20  FA2 attention on m16n8k8 pairs, synchronous tile loads, fp32 GEMMs (no bf16 / FP8)
+ *    86  RTX 30  + m16n8k16 MMA, cp.async prefetch, bf16 GEMMs
+ *    89  RTX 40  + FP8 GEMMs
+ *   120  RTX 50  same paths as 89 */
+#ifndef CUDALM_ARCH
+#define CUDALM_ARCH 120
+#endif
+#define CA_AMP (CUDALM_ARCH>=80)   /* Ampere+: mma m16n8k16, cp.async, bf16 tensor cores */
+#define CA_FP8 (CUDALM_ARCH>=89)   /* Ada+: FP8 tensor cores */
 #ifdef CUDALM_CPU
 #include "cpu_rt.h"
 #else
@@ -1917,8 +1927,15 @@ static int attn_fwd_tc(const __half*Q,const __half*K,const __half*V,float*O,floa
  * domain. */
 #define FA_B 64
 __device__ __forceinline__ void fa_mma(float*c,const unsigned*a,const unsigned*b){
+#if CA_AMP
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
         :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]));
+#else /* Turing: k16 = two k8 steps; A regs {a0,a1} hold k 0-7, {a2,a3} k 8-15, B b0 / b1 likewise */
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5},{%6},{%0,%1,%2,%3};\n"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5},{%6},{%0,%1,%2,%3};\n"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[2]),"r"(a[3]),"r"(b[1]));
+#endif
 }
 __device__ __forceinline__ void fa_ld4(unsigned*r,const __half*p){
     unsigned s=(unsigned)__cvta_generic_to_shared(p);
@@ -1942,18 +1959,29 @@ __device__ __forceinline__ void fa_tile(__half*s,const __half*g,int r0,int T,int
 /* O6: same tile via cp.async (16 B per copy, rows past T zero-filled with plain stores) */
 template<int HD>
 __device__ __forceinline__ void fa_tile_cp(__half*s,const __half*g,int r0,int T,int bT,int ld,int c0){
+#if !CA_AMP
+    fa_tile<HD>(s,g,r0,T,bT,ld,c0); return;
+#endif
     for(int i=threadIdx.x;i<FA_B*HD/8;i+=128){
         int r=i/(HD/8), c=(i-r*(HD/8))*8; __half*d=s+r*(HD+8)+c;
         if(r0+r<T){ unsigned sa=(unsigned)__cvta_generic_to_shared(d);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"::"r"(sa),"l"(g+(size_t)(bT+r0+r)*ld+c0+c)); }
+#if CA_AMP
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"::"r"(sa),"l"(g+(size_t)(bT+r0+r)*ld+c0+c));
+#endif
+            (void)sa; }
         else *(uint4*)d=make_uint4(0,0,0,0);
     }
 }
 template<int CP,int HD>
 __device__ __forceinline__ void fa_fill(__half*s,const __half*g,int r0,int T,int bT,int ld,int c0){
     if(CP) fa_tile_cp<HD>(s,g,r0,T,bT,ld,c0); else fa_tile<HD>(s,g,r0,T,bT,ld,c0); }
+#if CA_AMP
 __device__ __forceinline__ void fa_commit(void){ asm volatile("cp.async.commit_group;\n"::); }
 __device__ __forceinline__ void fa_wait1(void){ asm volatile("cp.async.wait_group 1;\n"::); }
+#else
+__device__ __forceinline__ void fa_commit(void){}
+__device__ __forceinline__ void fa_wait1(void){}
+#endif
 /* B operand from an smem tile whose rows are the mma N index (keys for Q.K^T):
  * x4 = n-tiles 2p,2p+1 at k-step kk */
 #define FA_BN(sm,p,kk) ((sm)+(16*(p)+(ln&7)+8*(ln>>4))*LDS+16*(kk)+8*((ln>>3)&1))
@@ -2151,13 +2179,16 @@ void k_attn_bwd_dkv_fa(const __half*Q,const __half*K,const __half*V,const __half
     auto fill=[&](int i,int bq){ int h=kvh*grp+i/ntq, t0=kb+(i%ntq)*FA_B;
         fa_fill<CP,HD>(sQb[bq],Q,t0,T,b*T,D,h*HD); fa_fill<CP,HD>(sGb[bq],dA,t0,T,b*T,D,h*HD);
         if(threadIdx.x<FA_B){ int t=t0+threadIdx.x; const float*Lh=lse+(size_t)(b*H+h)*T, *Dh=Drow+(size_t)(b*H+h)*T;
+#if CA_AMP
             if(t<T&&CP){ unsigned a0=(unsigned)__cvta_generic_to_shared(&sLb[bq][threadIdx.x]), a1=(unsigned)__cvta_generic_to_shared(&sRb[bq][threadIdx.x]);
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"::"r"(a0),"l"(Lh+t));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"::"r"(a1),"l"(Dh+t));
                 if(d_dstart){ unsigned a2=(unsigned)__cvta_generic_to_shared(&sDb[bq][threadIdx.x]);
                     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"::"r"(a2),"l"(d_dstart+b*T+t)); }
                 else sDb[bq][threadIdx.x]=0; }
-            else { bool ok=t<T; sLb[bq][threadIdx.x]=ok?Lh[t]:0.f; sRb[bq][threadIdx.x]=ok?Dh[t]:0.f;
+            else
+#endif
+            { bool ok=t<T; sLb[bq][threadIdx.x]=ok?Lh[t]:0.f; sRb[bq][threadIdx.x]=ok?Dh[t]:0.f;
                 sDb[bq][threadIdx.x]=ok?(d_dstart?d_dstart[b*T+t]:0):T; } } };
     int bf=0;
     if(nti) fill(0,0);
@@ -2228,7 +2259,7 @@ void k_attn_bwd_dkv_fa(const __half*Q,const __half*K,const __half*V,const __half
 #undef FA_BK
 #undef FA_AG
 static int g_fa=1;      /* CUDALM_FA=0: wmma TC kernels */
-static int g_facp=1;    /* O6 CUDALM_FA_CP=0: synchronous tile loads (no cp.async prefetch) */
+static int g_facp=CA_AMP;    /* O6 CUDALM_FA_CP=0: synchronous tile loads (no cp.async prefetch) */
 static int attn_fwd_fa(const __half*Q,const __half*K,const __half*V,float*O,float*lse,
                        int win,int B,int T,int H,int KV,int hd,int D,int KD){
     if(!g_fa || hd!=64 || D%8 || KD%8) return 0;
@@ -2901,7 +2932,7 @@ static void gemm_ex(cublasOperation_t opB,cublasOperation_t opA,
  * E4M3 has ~3 mantissa bits (~3-4% per-GEMM error at 1024^3); fp32 accumulate +
  * fp32 master weights keep it trainable. Needs the non-QLM fp32-master path.
  * Dims not divisible by 16 fall back to fp16 gemm_ex. Default OFF. */
-static int g_fp8gemm=1;   /* default on: Stage-2 FP8 matches fp32 (val 7.29 vs 7.28); CUDALM_FP8_GEMM=0 to disable */
+static int g_fp8gemm=CA_FP8;   /* default on: Stage-2 FP8 matches fp32 (val 7.29 vs 7.28); CUDALM_FP8_GEMM=0 to disable */
 static int g_fp8dbg=0;   /* CUDALM_FP8_DBG=1: sync+check each FP8 GEMM to surface async faults */
 static cublasLtHandle_t LT=NULL;
 static void* g_fp8ws=NULL; static size_t g_fp8wscap=0;
@@ -3178,7 +3209,7 @@ static void g_atb(const float*A,const float*B,float*C,int M,int K,int N){
  * runs strictly after queue 0. FP8/FP16-eligible shapes keep their own path. */
 static int g_h16=1;       /* default on: FP8 lm_head writes fp16 logits, +2% tok/s, val unchanged; CUDALM_H16=0 to disable */
 static int g_headw8=0;    /* CUDALM_HEAD_W8: FP8 wgrad for the tied-embedding dEmb only */
-static int g_hbf=1;       /* CUDALM_HEAD_BF16=0: fp32 dlogits + TF32 dEmb in the FP8 head */
+static int g_hbf=CA_AMP;       /* CUDALM_HEAD_BF16=0: fp32 dlogits + TF32 dEmb in the FP8 head */
 static int g_moe_grp=7;   /* bitmask: 1 NN fwd, 2 TN dgrad, 4 NT wgrad (NT needs its own call: mixed into the dgrad call it gains nothing) */
 #define MG_MAXP 1024
 #define MG_RING 256
@@ -3835,7 +3866,7 @@ static void rpre_bwd(const float*P,float*G,const Off*og,const Off*rd,GA*a,int l,
 #include <cuda_bf16.h>
 typedef __nv_bfloat16 hbf;
 typedef __nv_bfloat162 hbf2;
-static int g_bffn=1, g_bfmoe=1;   /* CUDALM_BFFN / CUDALM_BFMOE */
+static int g_bffn=CA_AMP, g_bfmoe=CA_AMP;   /* CUDALM_BFFN / CUDALM_BFMOE */
 static long g_fwd_id=0;
 __global__ void k_f2bf(const float*s,hbf*d,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
@@ -6600,11 +6631,17 @@ static void cuda_init(void){
     printf("[cuda] %s | sm_%d%d | %.1f/%.1f GB free | %d SMs\n",
            pr.name,pr.major,pr.minor,fr/1e9,tt/1e9,pr.multiProcessorCount);
 #ifndef CUDALM_CPU
-    { /* per-arch gating; CUDALM_SIM_SM=86|89 applies a lower card's gates (fallback testing) */
-      int cc=pr.major*10+pr.minor; const char*e=getenv("CUDALM_SIM_SM");
-      if(e&&atoi(e)>0&&atoi(e)<cc){ cc=atoi(e); printf("[cuda] CUDALM_SIM_SM: gating as sm_%d\n",cc); }
-      if(cc<86){ fprintf(stderr,"[cuda] sm_%d%d is not supported: this build needs RTX 30 (sm_86) or newer\n",pr.major,pr.minor); exit(1); }
-      if(cc<89&&(g_fp8gemm||g_moef8)){ g_fp8gemm=g_moef8=0; printf("[cuda] FP8 GEMMs off: need sm_89+ (RTX 40/50)\n"); } }
+    { /* the series is fixed at build time; env flags cannot switch on paths this build left out */
+      int cc=pr.major*10+pr.minor;
+      if(cc<CUDALM_ARCH){ fprintf(stderr,"[cuda] this cudalm is built for sm_%d, but the GPU is sm_%d: rebuild with python build.py --arch %d\n",CUDALM_ARCH,cc,cc); exit(1); }
+#if !CA_FP8
+      g_fp8gemm=g_moef8=0;
+#endif
+#if !CA_AMP
+      g_facp=g_bffn=g_bfmoe=g_hbf=0;
+#endif
+      printf("[cuda] build: sm_%d paths (%s%s)%s\n",CUDALM_ARCH,CA_AMP?"m16n8k16 MMA, cp.async, bf16":"m16n8k8 MMA, fp32 GEMMs",
+             CA_FP8?", FP8":"",((cc>=80&&!CA_AMP)||(cc>=89&&!CA_FP8))?" -- built for an older series: python build.py --arch for this GPU is faster":""); }
 #endif
     g_tdr=tdr_budget_s();
     { const char*e=getenv("CUDALM_ATTN_CHUNK"); if(e){ int v=atoi(e); if(v>=8) g_attn_chunk=v; } }
@@ -6819,7 +6856,6 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MOE_GPERM","1","perf","MoE permutation on the GPU",0},
  {"CUDALM_MOE_MERGE","1","perf","top-2 passes as one grouped pass",0},
  {"CUDALM_FA_CP","1","perf","cp.async prefetch in FA2 attention",0},
- {"CUDALM_SIM_SM","0","perf","gate features as a lower card (86 = RTX 30, 89 = RTX 40)",0},
  {"CUDALM_CH_ROWS","2048","perf","head row chunk (>= 2048)",0},
  {"CUDALM_LRS_KEEP","1","optim","LRS keeps the x1.0 arm instead of retraining it",0},
  {"CUDALM_MAX_SECONDS","","per-run","clean stop after N seconds",1},

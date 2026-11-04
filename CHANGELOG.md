@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-11-04
 
+- README.md: replace tested-on and GPU support sections with Windows 11, RTX 50 (sm_120) and CUDA 12.9 baseline; add RTX 20/30/40/50 build table for --arch options
+- build.py: change --arch flag help text and validation logic to accept RTX series (75/86/89/120) instead of only 120/89/86
+- cudalm.cu: add CUDALM_ARCH compile-time path selection via -DCUDALM_ARCH; conditionally include cp.async and bf16 GEMMs for RTX 30/40/50
+
+## Unreleased - 2026-11-04
+
 - README.md: expand tested hardware and add GPU support section
 - build.py: extend --arch options and validation
 - cudalm.cu: add per-arch feature gating for lower GPUs
