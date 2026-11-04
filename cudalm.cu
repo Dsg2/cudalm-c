@@ -10753,11 +10753,7 @@ int main(int argc,char**argv){
     ensure_dirs();
     if(getenv("LMTUI_CHILD")) setvbuf(stdout,NULL,_IONBF,0);     /* the TUI pipes our output: keep it live */
     if(argc>2 && strcmp(argv[1],"new") && strcmp(argv[1],"bench") && strcmp(argv[1],"data")) side_apply(argv[2]);   /* before any env is read */
-#ifdef _WIN32
     if(argc>1 && !strcmp(argv[1],"data")) return cmd_data(argc,argv);
-#else
-    if(argc>1 && !strcmp(argv[1],"data")){ fprintf(stderr,"cudalm data is Windows-only: prepare the data on Windows and copy the folder over (the files are the same on Linux)\n"); return 1; }
-#endif
     if(argc>3 && (!strcmp(argv[1],"train") || !strcmp(argv[1],"eval"))){ static char dd[1200]; argv[3]=(char*)data_resolve(argv[3],dd,sizeof dd); }
     /* CUDALM_SEED pins the batch order so two runs see identical data -- the only
      * way to compare loss curves between two numeric paths (fp32 vs fp16). */
@@ -10835,6 +10831,8 @@ int main(int argc,char**argv){
       const char*mns=getenv("CUDALM_MUON_NS"); if(mns){ int v=atoi(mns); if(v>=1&&v<=20) g_muon_ns=v; } }
 #ifdef _WIN32
     if(argc<2 && _isatty(0) && _isatty(1)){ int r=tui_main(); if(r>=0) return r; }
+#else
+    if(argc<2 && isatty(0) && isatty(1)){ int r=tui_main(); if(r>=0) return r; }
 #endif
     if(argc<2 || !strcmp(argv[1],"help")){ fprintf(stderr,
         "cudalm - CUDA trainer/runner for tinylm models (no arguments = interactive menu)\n"
@@ -10886,9 +10884,7 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"qlmcheck")) { return cmd_qlmcheck(argc,argv); }
     if(!strcmp(argv[1],"info"))     { return cmd_info(argc,argv); }
     if(!strcmp(argv[1],"tokcheck")) { return cmd_tokcheck(argc,argv); }
-#ifdef _WIN32
     if(!strcmp(argv[1],"tuicheck")) { return tui_check(argc,argv); }
-#endif
 #ifndef CUDALM_CPU
     if(!strcmp(argv[1],"decheck"))  { return cmd_decheck(argc,argv); }
 #else

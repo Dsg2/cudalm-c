@@ -16,8 +16,10 @@ RTX 20/30/40 hardware.
 
 **Linux:** tested on Ubuntu 24.04 (WSL2, g++ 13) with the same GPU: `python3 build.py` (needs `build-essential`)
 gives `./cudalm`; selftest, `lmeval` (identical scores to Windows), training, resume and `run` all work, and training
-is ~2% faster than on Windows (no WDDM watchdog syncs). The data toolchain (`cudalm data`) and the console menu are
-Windows-only: prepare data on Windows and copy the folder over (the files are the same).
+is ~2% faster than on Windows (no WDDM watchdog syncs). The data toolchain (`cudalm data`) and the menu work too and
+write byte-identical tokenizers, canon maps and corpora to the Windows build. Linux needs `python3` for NFKC in canon maps
+and `curl` for the Hugging Face browser; the menu sends deleted folders to the Trash with `gio trash` and refuses to
+delete without it.
 
 **GPU support:** RTX 20, 30, 40 and 50. `build.py --arch` picks the series, and the source compiles only that series'
 paths (`CUDALM_ARCH`; nothing is switched at run time):

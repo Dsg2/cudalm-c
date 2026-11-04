@@ -1,4 +1,4 @@
-/* tui.cuh -- interactive menu when cudalm is started with no arguments (Windows console).
+/* tui.cuh -- interactive menu when cudalm is started with no arguments (Windows console or a POSIX terminal).
  * Each command is a form; Run launches this same exe as a child with the built argv, so every
  * command gets a fresh process (exit() paths and CUDA state stay as in normal CLI use) and inherits
  * the environment edited on the Environment screen (every setting in g_envreg, or a loaded *env.bat).
@@ -10,11 +10,34 @@
  * also saved to logs\<command>-<model>-<time>.log; the result screen offers the next step with the output pre-filled.
  * Data forms show a live panel (resolved output folder, free space, size estimate, problems) and ask before running
  * with problems. */
+#include <stdarg.h>
 #ifdef _WIN32
 #include <conio.h>
-#include <stdarg.h>
 #include <shellapi.h>
 #pragma comment(lib,"shell32.lib")
+#else
+#include <termios.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+/* keys: raw mode only while a key is read, so children see a normal terminal; escape sequences -> the _getch codes (1000+scan) */
+static int t_rawget(int ms){ unsigned char c; struct pollfd q={0,POLLIN,0}; if(ms>=0&&poll(&q,1,ms)<=0) return -1; return read(0,&c,1)==1?c:-1; }
+static int t_rawkey(int ms){ struct termios o,r; if(tcgetattr(0,&o)) return -1; r=o; r.c_lflag&=~(ICANON|ECHO|ISIG|IEXTEN); r.c_iflag&=~(ICRNL|IXON);
+    r.c_cc[VMIN]=1; r.c_cc[VTIME]=0; tcsetattr(0,TCSANOW,&r); fflush(stdout);
+    int c=t_rawget(ms);
+    if(c==27){ int a=t_rawget(40);
+        if(a=='['||a=='O'){ char b[16]; int n=0, x; while(n<15&&(x=t_rawget(40))>=0){ b[n++]=(char)x; if(x>='@'&&x<='~'&&!(x>='0'&&x<='9')&&x!=';') break; } b[n]=0;
+            char f=n?b[n-1]:0; int v=atoi(b);
+            c=f=='A'?1072:f=='B'?1080:f=='C'?1077:f=='D'?1075:f=='H'?1071:f=='F'?1079:(a=='O'&&f=='Q')?1060:
+              f=='~'?(v==1||v==7?1071:v==4||v==8?1079:v==5?1073:v==6?1081:v==3?1083:v==12?1060:v==15?1063:0):0;
+            if(!c) c=-2; }
+        else if(a>=0) c=-2; }
+    else if(c==127) c=8;
+    tcsetattr(0,TCSANOW,&o); return c; }
+static int _getch(void){ int c; while((c=t_rawkey(-1))==-2); return c<0?27:c; }
+static int _kbhit(void){ struct pollfd q={0,POLLIN,0}; return poll(&q,1,0)>0; }
+#endif
 
 enum { F_TEXT, F_MODEL, F_DATA, F_FILE, F_CHOICE, F_DIR, F_PATH, F_TOKD, F_OPT, F_ENV, F_MEM, F_FLAG };
 /* arg: choices "a|b" (F_CHOICE), the --flag (F_OPT, F_FLAG = valueless, passed when 1) or the env var (F_ENV).
@@ -31,7 +54,7 @@ static const TCmd T_CMDS[]={
  {"train","Train","continue training a model (create it first with New model)",
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"epochs","1",F_TEXT,0,0,0,
     "Passes over THIS corpus from now on. A model trained before starts a new stage here (warmup + LR schedule\n"
-    "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models\\<name>.bin.run)."},
+    "restart, sampling from epoch 0 of this corpus). Re-running after a stop finishes the stage (models" PSEP "<name>.bin.run)."},
    {"LR schedule","wsd",F_ENV,"CUDALM_STAGE",0,"wsd|stable|decay","wsd = warmup, hold, decay over the last 'decay frac' (one-stage run).  stable = warmup + hold, no decay.\n"
     "decay = short warmup, then decay over the whole stage. 2-stage pipeline: stable on corpus 1, then decay on corpus 2\n"
     "(same model, same peak LR). Not saved to the model config: set it for every run."},
@@ -43,7 +66,7 @@ static const TCmd T_CMDS[]={
    {" decay shape","sqrt",F_ENV,"CUDALM_DECAY_SHAPE",0,"sqrt|linear|cosine","Decay curve from peak to floor: sqrt = 1-sqrt (fast drop, long tail; the default), linear, cosine."},
    {" LR floor","",F_ENV,"CUDALM_LR_MIN",0,0,"LR at the end of the decay as a fraction of peak (empty = model config, else 0.1). Saved to the model config."},
    {"bench every","10000",F_ENV,"CUDALM_BENCH_EVERY",0,0,"0 = off (default 10000). N = every N steps of this stage, lmeval the checkpoint just saved (training waits,\n"
-    "the time is left out of tok/s) and log the index + per-task scores to models\\<name>.bin.bench.tsv. Also runs at the end."},
+    "the time is left out of tok/s) and log the index + per-task scores to models" PSEP "<name>.bin.bench.tsv. Also runs at the end."},
    {" bench items","0",F_ENV,"CUDALM_BENCH_N",0,0,"Items per task (0 = full sets, the default).\n"
     "Tasks: CUDALM_BENCH_TASKS (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)."}}},
  {"run","Generate","sample one continuation of a prompt",
@@ -66,8 +89,8 @@ static const TCmd T_CMDS[]={
    {"top-p","0",F_TEXT},{"rep pen","1",F_TEXT}}},
  {"eval","Eval","forward-only val loss + MoE utilisation (safe during training)",
   {{"model","",F_MODEL},{"data dir","",F_DATA},{"batches","20",F_TEXT},{"batch size","1",F_TEXT}}},
- {"new","New model","create models\\<name>.bin + config .bin.env (other settings: Environment screen, also saved)",
-  {{"name","",F_TEXT,0,0,0,"File name: creates models\\<name>.bin plus its config models\\<name>.bin.env.\n"
+ {"new","New model","create models" PSEP "<name>.bin + config .bin.env (other settings: Environment screen, also saved)",
+  {{"name","",F_TEXT,0,0,0,"File name: creates models" PSEP "<name>.bin plus its config models" PSEP "<name>.bin.env.\n"
      "Refused if the model already exists. Train it next with Train (model = this name)."},
    {"preset","s8w",F_CHOICE,T_PRESETS "|custom",0,0,"Model shape: width D, layers L, attention heads H (KV = shared key/value heads),\n"
      "FFN width F (per expert), default context T and vocab V. custom = set every shape value yourself below."},
@@ -127,7 +150,7 @@ static const TCmd T_CMDS[]={
    {"noise","",F_OPT,"--noise"}}},
  {"quantize","Quantize","shrink a checkpoint on disk",
   {{"in model","",F_MODEL},{"out .bin","",F_TEXT},{"mode","q4n",F_CHOICE,"q8|q4|q4n|fp16"}}},
- {"gguf","Export GGUF","model -> .gguf (runs export\\bin2gguf.py: python + numpy)",
+ {"gguf","Export GGUF","model -> .gguf (runs export" PSEP "bin2gguf.py: python + numpy)",
   {{"model","",F_MODEL},
    {"type","q4n",F_CHOICE,"q4n|q4|q8|fp16|f32",0,0,"Same modes as Quantize, applied to an fp32 model first.\n"
     "q4n = lossless for QLM models (smallest exact). q4 = 4-bit, lossy. q8 = 8-bit.\n"
@@ -147,7 +170,7 @@ static const TCmd T_CMDS[]={
   {{"model","",F_MODEL},{"tokens file","",F_PATH,0,0,".bin;.u16","uint16 token file made with this model's tokenizer, e.g. a corpus's val.bin."},
    {"max docs","1000000",F_TEXT},{"encoder","new",F_CHOICE,"new|old",0,0,"old = the pre-18b whole-string BPE (for comparison)."}},0,2},
  /* ---- Data tools (grp 1): text -> tokenizer -> corpus; all CPU ---- */
- {"data fetch","Download text","Hugging Face blend -> .jsonl text (resumable; runs prep\\fetch.py: python + pyarrow)",
+ {"data fetch","Download text","Hugging Face blend -> .jsonl text (resumable; runs prep" PSEP "fetch.py: python + pyarrow)",
   {{"profile","v3pre",F_CHOICE,"v3pre|v3sft|v3chat|web|code|math|cosmopedia|chat|tools",0,0,
      "v3pre = pretraining blend (web 34, code 20, synthetic 16, math 14, chat 10, tools 6 %); v3sft / v3chat = instruction blends;\n"
      "web, code, math, cosmopedia, chat, tools = one source each. Or type the https URL of a single .parquet/.json file,\n"
@@ -225,7 +248,7 @@ static const TCmd T_CMDS[]={
   {{"corpus","",F_DATA,0,0,0,"A corpus encoded from the rows file in order with val % = 0 and dedup = 0 (doc k = row k)."},
    {"rows","",F_PATH,0,0,".jsonl","jsonl rows: \"w\" = per-doc weight (GRPO advantage), or \"a0\"/\"tl\"/\"tp\" teacher log-probs\n"
     "(on-policy distillation, agentenv tscore)."}},
-  "Run: write <corpus>\\train.w (int8 per token).",3},
+  "Run: write <corpus>" PSEP "train.w (int8 per token).",3},
 };
 #define T_NCMD (int)(sizeof(T_CMDS)/sizeof(T_CMDS[0]))
 /* positional fields the CLI requires (by form title): Run refuses while one is empty */
@@ -238,14 +261,21 @@ static int t_req(const TCmd*c){ for(size_t i=0;i<sizeof T_REQ/sizeof T_REQ[0];i+
 enum { K_UP=1072, K_DOWN=1080, K_LEFT=1075, K_RIGHT=1077, K_PGUP=1073, K_PGDN=1081, K_HOME=1071, K_END=1079, K_F2=1060, K_F5=1063, K_DEL=1083 };
 #define T_MAXL 512
 #define T_INFO 220
+#define PSEP_BENCH "bench" PSEP
 static char t_items[T_MAXL][260], t_info[T_MAXL][T_INFO];
 static char t_profile[260]="(none)";
 
+#ifdef _WIN32
 static int t_key(void){ int c=_getch(); if(c==0||c==0xE0) return 1000+_getch(); return c; }
 static int t_rows(void){ CONSOLE_SCREEN_BUFFER_INFO b; if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&b))
     return b.srWindow.Bottom-b.srWindow.Top+1; return 25; }
 static int t_cols(void){ CONSOLE_SCREEN_BUFFER_INFO b; if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&b))
     return b.srWindow.Right-b.srWindow.Left+1; return 80; }
+#else
+static int t_key(void){ return _getch(); }
+static int t_rows(void){ struct winsize w; return !ioctl(1,TIOCGWINSZ,&w)&&w.ws_row?w.ws_row:25; }
+static int t_cols(void){ struct winsize w; return !ioctl(1,TIOCGWINSZ,&w)&&w.ws_col?w.ws_col:80; }
+#endif
 static void t_head(const char*title){
     printf("\x1b[2J\x1b[H\x1b[1;36mcudalm\x1b[0m  %s   \x1b[2m[%s]  profile: %s\x1b[0m\n\n",title,exe_dir(),t_profile); }
 static int t_envwanted(const char*k){ return !_strnicmp(k,"CUDALM_",7)||!_strnicmp(k,"QLM_",4)||!_strnicmp(k,"NGRAM_",6); }
@@ -286,7 +316,7 @@ static int t_pick(const char*title, const char*hint, int n, int sel){
 }
 static int t_ends(const char*s,const char*e){ size_t a=strlen(s),b=strlen(e); return a>=b && !_stricmp(s+a-b,e); }
 static int t_list_models(void){
-    char pat[800]; snprintf(pat,sizeof pat,"%s\\models\\*.bin",exe_dir());
+    char pat[800]; snprintf(pat,sizeof pat,"%s" PSEP "models" PSEP "*.bin",exe_dir());
     WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd); int n=0;
     if(h!=INVALID_HANDLE_VALUE){ do{ if(n>=T_MAXL || !t_ends(fd.cFileName,".bin")) continue;
         snprintf(t_items[n],260,"%.*s",(int)strlen(fd.cFileName)-4,fd.cFileName);
@@ -299,24 +329,24 @@ static int t_list_models(void){
     return n;
 }
 static long long t_meta_tokens(const char*dir){
-    char p[800]; snprintf(p,sizeof p,"%s\\meta.json",dir); size_t len; char*b=(char*)read_file(p,&len); if(!b) return -1;
+    char p[800]; snprintf(p,sizeof p,"%s" PSEP "meta.json",dir); size_t len; char*b=(char*)read_file(p,&len); if(!b) return -1;
     char*q=strstr(b,"\"total_tokens\""); long long v=q?_atoi64(strchr(q,':')+1):-1; free(b); return v; }
 /* short id of a folder's tokenizer.bin (0 = none): equal ids = identical tokenizer, which mix/append require */
 static unsigned t_tokhash(const char*dir){
     static char kp[32][1100]; static unsigned kh[32]; static int kn;
     for(int i=0;i<kn&&i<32;i++) if(!strcmp(kp[i],dir)) return kh[i];
-    char p[1200]; snprintf(p,sizeof p,"%s\\tokenizer.bin",dir); size_t n; char*b=(char*)read_file(p,&n); if(!b) return 0;
+    char p[1200]; snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",dir); size_t n; char*b=(char*)read_file(p,&n); if(!b) return 0;
     unsigned h=(unsigned)(d_fnv(b,n)&0xFFFFFF); free(b); if(!h) h=1;
     int i=kn++%32; snprintf(kp[i],sizeof kp[i],"%s",dir); kh[i]=h; return h; }
 /* folders under the data roots holding a corpus (train.bin) or, tok=1, any tokenizer.bin */
 static int t_list_dirs(int tok){
     char r[1024]; int n=0;
     for(int ri=0;d_root(ri,r,sizeof r);ri++){
-        char pat[1100]; snprintf(pat,sizeof pat,"%s\\*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+        char pat[1100]; snprintf(pat,sizeof pat,"%s" PSEP "*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
         if(h==INVALID_HANDLE_VALUE) continue;
         do{ if(n>=T_MAXL || !(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0]=='.') continue;
-            char d[1200], tb[1300], tk[1300]; snprintf(d,sizeof d,"%s\\%s",r,fd.cFileName);
-            snprintf(tb,sizeof tb,"%s\\train.bin",d); snprintf(tk,sizeof tk,"%s\\tokenizer.bin",d);
+            char d[1200], tb[1300], tk[1300]; snprintf(d,sizeof d,"%s" PSEP "%s",r,fd.cFileName);
+            snprintf(tb,sizeof tb,"%s" PSEP "train.bin",d); snprintf(tk,sizeof tk,"%s" PSEP "tokenizer.bin",d);
             int hc=d_exists(tb), ht=d_exists(tk); if(tok?!ht:!hc) continue;
             int V=0; FILE*f=fopen(tk,"rb"); if(f){ char m[4]; if(fread(m,1,4,f)!=4||fread(&V,4,1,f)!=1) V=0; fclose(f); }
             snprintf(t_items[n],260,"%s",d); long long t=hc?t_meta_tokens(d):-1;
@@ -332,10 +362,10 @@ static int t_list_dirs(int tok){
 /* glob in the exe dir and in bench\ (bench files are listed as bench\name) */
 static int t_list_glob(const char*glob){
     int n=0;
-    for(int d=0;d<2;d++){ char pat[400]; snprintf(pat,sizeof pat,"%s%s",d?"bench\\":"",glob);
+    for(int d=0;d<2;d++){ char pat[400]; snprintf(pat,sizeof pat,"%s%s",d?PSEP_BENCH:"",glob);
         WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
         if(h!=INVALID_HANDLE_VALUE){ do{ if(n<T_MAXL && !(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)){
-            snprintf(t_items[n],260,"%s%s",d?"bench\\":"",fd.cFileName); snprintf(t_info[n],T_INFO,"%8.1f KB",fd.nFileSizeLow/1024.0); n++; } }
+            snprintf(t_items[n],260,"%s%s",d?PSEP_BENCH:"",fd.cFileName); snprintf(t_info[n],T_INFO,"%8.1f KB",fd.nFileSizeLow/1024.0); n++; } }
             while(FindNextFileA(h,&fd)); FindClose(h); } }
     return n;
 }
@@ -359,10 +389,10 @@ static void t_browse(const char*label, char*val, int cap, const char*ext, int fi
     char cur[MAX_PATH]="", r[1200]; int sel=0;
     if(val[0]){ const char*s1=strchr(val,';'); char v1[1200]; snprintf(v1,sizeof v1,"%.*s",s1?(int)(s1-val):(int)strlen(val),val);
         data_resolve(v1,r,sizeof r); GetFullPathNameA(r,MAX_PATH,cur,NULL);
-        while(cur[0] && !d_isdir(cur)){ char*q=strrchr(cur,'\\'); if(!q){ cur[0]=0; break; } *q=0; } }
+        while(cur[0] && !d_isdir(cur)){ char*q=strrchr(cur,PSEPC); if(!q){ cur[0]=0; break; } *q=0; } }
     if(!cur[0]){ for(int i=0;d_root(i,r,sizeof r);i++) if(d_isdir(r)){ GetFullPathNameA(r,MAX_PATH,cur,NULL); break; } }
     for(;;){
-        size_t L=strlen(cur); if(L && cur[L-1]=='\\') cur[--L]=0;
+        size_t L=strlen(cur); if(L>1 && cur[L-1]==PSEPC) cur[--L]=0;
         int n=0, root=!cur[0];
         snprintf(t_items[n],260,"(type a path...)"); snprintf(t_info[n++],T_INFO,"several inputs: separate with ;");
         if(!root){ snprintf(t_items[n],260,"[ use this folder ]"); snprintf(t_info[n++],T_INFO,"%s",cur);
@@ -371,13 +401,13 @@ static void t_browse(const char*label, char*val, int cap, const char*ext, int fi
         if(root){ char b[256]; GetLogicalDriveStringsA(sizeof b,b);
             for(char*p=b;*p&&n<T_MAXL;p+=strlen(p)+1){ snprintf(t_items[n],260,"%.2s",p); t_info[n++][0]=0; } }
         else for(int pass=0;pass<1+files;pass++){
-            char pat[MAX_PATH+4]; snprintf(pat,sizeof pat,"%s\\*",cur); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+            char pat[MAX_PATH+4]; snprintf(pat,sizeof pat,"%s" PSEP "*",cur); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
             if(h==INVALID_HANDLE_VALUE) continue;
             do{ int dir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0; if(n>=T_MAXL||fd.cFileName[0]=='.'||dir!=(pass==0)) continue;
                 if(!dir && !t_extok(fd.cFileName,ext)) continue;
-                snprintf(t_items[n],260,"%s%s",fd.cFileName,dir?"\\":"");
-                if(dir){ char d[MAX_PATH+300],x[MAX_PATH+320]; snprintf(d,sizeof d,"%s\\%s",cur,fd.cFileName);
-                    snprintf(x,sizeof x,"%s\\train.bin",d); long long t=d_exists(x)?d_fsize(x)/2:-1; snprintf(x,sizeof x,"%s\\tokenizer.bin",d);
+                snprintf(t_items[n],260,"%s%s",fd.cFileName,dir?PSEP:"");
+                if(dir){ char d[MAX_PATH+300],x[MAX_PATH+320]; snprintf(d,sizeof d,"%s" PSEP "%s",cur,fd.cFileName);
+                    snprintf(x,sizeof x,"%s" PSEP "train.bin",d); long long t=d_exists(x)?d_fsize(x)/2:-1; snprintf(x,sizeof x,"%s" PSEP "tokenizer.bin",d);
                     if(t>=0) snprintf(t_info[n],T_INFO,"corpus %.1fM tok",t/1e6); else if(d_exists(x)) snprintf(t_info[n],T_INFO,"tokenizer"); else t_info[n][0]=0; }
                 else snprintf(t_info[n],T_INFO,"%10.1f MB",((double)fd.nFileSizeHigh*4294967296.0+fd.nFileSizeLow)/1048576.0);
                 n++; }while(FindNextFileA(h,&fd)); FindClose(h); }
@@ -386,11 +416,12 @@ static void t_browse(const char*label, char*val, int cap, const char*ext, int fi
         if(s<0) return;
         if(s==0){ t_edit(label,val,cap); return; }
         if(!root && s==1){ snprintf(val,cap,"%s",cur); return; }
-        if(!root && s==2){ char*q=strrchr(cur,'\\'); if(q) *q=0; else cur[0]=0; continue; }
+        if(!root && s==2){ char*q=strrchr(cur,PSEPC); if(q) *q=0; else cur[0]=0; continue; }
         if(s>=d0){ char nm[260]; snprintf(nm,sizeof nm,"%s",t_items[s]); size_t l=strlen(nm);
             if(root){ snprintf(cur,sizeof cur,"%s",nm); continue; }
-            if(l && nm[l-1]=='\\'){ nm[l-1]=0; size_t c=strlen(cur); snprintf(cur+c,sizeof cur-c,"\\%s",nm); continue; }
-            snprintf(val,cap,"%s\\%s",cur,nm); return; }
+            const char*sp=cur[strlen(cur)-1]==PSEPC?"":PSEP;
+            if(l && nm[l-1]==PSEPC){ nm[l-1]=0; size_t c=strlen(cur); snprintf(cur+c,sizeof cur-c,"%s%s",sp,nm); continue; }
+            snprintf(val,cap,"%s%s%s",cur,sp,nm); return; }
     }
 }
 /* ---- data helpers: sizes, free space, previews, pickers ---- */
@@ -403,9 +434,9 @@ static const char* t_hn(double v,char*o){ if(v>=1e9) sprintf(o,"%.2fB",v/1e9); e
     else if(v>=1e3) sprintf(o,"%.1fk",v/1e3); else sprintf(o,"%.0f",v); return o; }
 static double t_tree(const char*p,const char*ext,int*nf){          /* bytes of the files under p matching ext (NULL = all) */
     if(!d_isdir(p)){ if(!d_exists(p)||!t_extok(p,ext)) return 0; (*nf)++; return (double)d_fsize(p); }
-    char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",p); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd); double s=0;
+    char pat[1200]; snprintf(pat,sizeof pat,"%s" PSEP "*",p); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd); double s=0;
     if(h==INVALID_HANDLE_VALUE) return 0;
-    do{ if(fd.cFileName[0]=='.') continue; char q[1200]; snprintf(q,sizeof q,"%s\\%s",p,fd.cFileName);
+    do{ if(fd.cFileName[0]=='.') continue; char q[1200]; snprintf(q,sizeof q,"%s" PSEP "%s",p,fd.cFileName);
         if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) s+=t_tree(q,ext,nf);
         else if(t_extok(fd.cFileName,ext)){ s+=(double)fd.nFileSizeHigh*4294967296.0+fd.nFileSizeLow; (*nf)++; } }while(FindNextFileA(h,&fd));
     FindClose(h); return s; }
@@ -419,15 +450,15 @@ static double t_spec(const char*spec,const char*ext,int*nf){      /* ';' list of
 static double t_free(const char*path){                             /* free bytes on the drive of path (or its nearest parent) */
     char d[1200]; if(!GetFullPathNameA(path,sizeof d,d,NULL)) return -1;
     for(;;){ ULARGE_INTEGER f; if(GetDiskFreeSpaceExA(d,&f,NULL,NULL)) return (double)f.QuadPart;
-        char*q=strrchr(d,'\\'); if(!q) return -1; if(q<=d+2){ if(q[1]==0) return -1; q[1]=0; } else *q=0; } }
+        char*q=strrchr(d,PSEPC); if(!q) return -1; if(q<=d+2){ if(q[1]==0) return -1; q[1]=0; } else *q=0; } }
 static void t_corpus_pv(int sel){                                  /* corpus / tokenizer preview under a picker */
     const char*d=t_items[sel]; if(!d_isdir(d)) return; char p[1300],a[32],b[32]; size_t ml;
-    snprintf(p,sizeof p,"%s\\train.bin",d); double tr=d_exists(p)?d_fsize(p)/2.0:-1;
-    snprintf(p,sizeof p,"%s\\val.bin",d); double va=d_exists(p)?d_fsize(p)/2.0:0;
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",d); double tr=d_exists(p)?d_fsize(p)/2.0:-1;
+    snprintf(p,sizeof p,"%s" PSEP "val.bin",d); double va=d_exists(p)?d_fsize(p)/2.0:0;
     printf("\x1b[36m%s\x1b[0m\n",d);
     if(tr>=0) printf("  train %s tok   val %s tok   tokenizer %06x",t_hn(tr,a),t_hn(va,b),t_tokhash(d));
     else printf("  tokenizer only   %06x",t_tokhash(d));
-    snprintf(p,sizeof p,"%s\\meta.json",d); char*mj=(char*)read_file(p,&ml); if(!mj){ printf("\n"); return; }
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",d); char*mj=(char*)read_file(p,&ml); if(!mj){ printf("\n"); return; }
     mj=(char*)realloc(mj,ml+1); mj[ml]=0;
     const char*bb=jget(mj,"built_by"); if(bb){ DBuf x={0}; jdec(bb,&x); printf("   built by %s",x.p?x.p:""); free(x.p); }
     const char*h=jget(mj,"history"); int nh=0; if(h) for(const char*e=jfirst(h);e;e=jnext(e)) nh++; if(nh>1) printf("  (+%d appends)",nh-1);
@@ -448,10 +479,10 @@ static void t_pick_text(const char*label,char*val,int cap,const char*ext){
     int n=0; char r[1100],a[32];
     snprintf(t_items[n],260,"(type a path...)"); snprintf(t_info[n++],T_INFO,"several: separate with ;");
     snprintf(t_items[n],260,"[ browse files / folders... ]"); t_info[n++][0]=0;
-    for(int ri=0;d_root(ri,r,sizeof r);ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+    for(int ri=0;d_root(ri,r,sizeof r);ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s" PSEP "*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
         if(h==INVALID_HANDLE_VALUE) continue;
         do{ if(n>=T_MAXL||!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||fd.cFileName[0]=='.') continue;
-            char d[1200],q[1300]; snprintf(d,sizeof d,"%s\\%s",r,fd.cFileName); snprintf(q,sizeof q,"%s\\tokenizer.bin",d); if(d_exists(q)) continue;
+            char d[1200],q[1300]; snprintf(d,sizeof d,"%s" PSEP "%s",r,fd.cFileName); snprintf(q,sizeof q,"%s" PSEP "tokenizer.bin",d); if(d_exists(q)) continue;
             int nf=0; double b=t_tree(d,ext,&nf); if(!nf) continue;
             snprintf(t_items[n],260,"%s",d); snprintf(t_info[n++],T_INFO,"%6d files %10s",nf,t_hb(b,a)); }while(FindNextFileA(h,&fd)); FindClose(h); }
     memset(t_mark,0,sizeof t_mark);
@@ -477,6 +508,18 @@ static const char* t_choices(const TFld*f){
     if(f->kind==F_CHOICE) return f->arg;
     return (f->kind==F_ENV||f->kind==F_MEM||f->kind==F_FLAG)&&f->ext&&strchr(f->ext,'|') ? f->ext : NULL; }
 
+#ifndef _WIN32
+/* POSIX sh quoting: plain words as they are, the rest in '' */
+static void t_quote(char*o, size_t cap, const char*a){
+    size_t n=strlen(o); int need=!*a || a[strspn(a,"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./:=,+@%")]!=0;
+    #define PUT(c) do{ if(n+1<cap) o[n++]=(c); }while(0)
+    if(n) PUT(' ');
+    if(need) PUT('\'');
+    for(;*a;a++){ if(*a=='\''&&need){ PUT('\''); PUT('\\'); PUT('\''); PUT('\''); } else PUT(*a); }
+    if(need) PUT('\''); o[n]=0;
+    #undef PUT
+}
+#else
 /* Windows argv quoting (CommandLineToArgvW / MSVC CRT rules) */
 static void t_quote(char*o, size_t cap, const char*a){
     size_t n=strlen(o); int need=!*a || strpbrk(a," \t\"")!=NULL;
@@ -492,6 +535,16 @@ static void t_quote(char*o, size_t cap, const char*a){
     PUT('"'); o[n]=0;
     #undef PUT
 }
+#endif
+#ifndef _WIN32
+/* Ctrl+C while a command runs: Train gets its stop file, anything else SIGINT to its process group */
+static volatile pid_t t_child; static char t_stop[1100];
+static void t_sigint(int sig){ (void)sig;
+    if(!t_child) return;
+    if(t_stop[0]){ int fd=open(t_stop,O_WRONLY|O_CREAT,0644); if(fd>=0) close(fd);
+        static const char m[]="\n\x1b[33m[tui] wrote the .stop file - training stops and saves at the next 20-iter check\x1b[0m\n"; if(write(1,m,sizeof m-1)){} }
+    else kill(-t_child,SIGINT); }
+#else
 static volatile DWORD t_child; static char t_stop[1100];
 static BOOL WINAPI t_ctrl(DWORD ev){
     if(ev!=CTRL_C_EVENT && ev!=CTRL_BREAK_EVENT) return FALSE;
@@ -502,6 +555,7 @@ static BOOL WINAPI t_ctrl(DWORD ev){
     }
     return TRUE;
 }
+#endif
 
 /* builds "<exe> cmd args"; returns 0 and sets err on a gap in the positional args */
 static int t_cmdline(const TCmd*c, char vals[][T_MAXL], char*o, size_t cap, char*err, size_t ecap){
@@ -522,9 +576,23 @@ static int t_cmdline(const TCmd*c, char vals[][T_MAXL], char*o, size_t cap, char
 static DWORD t_spawn(const char*cl, const char*stop, const char*tag, char*lpo, size_t lcap){
     printf("\x1b[2J\x1b[H\x1b[1;36m> %s\x1b[0m\n\n",cl); fflush(stdout);
     char lp[600]; SYSTEMTIME tm; GetLocalTime(&tm); CreateDirectoryA("logs",NULL);
-    snprintf(lp,sizeof lp,"logs\\%s-%04d%02d%02d-%02d%02d%02d.log",tag,tm.wYear,tm.wMonth,tm.wDay,tm.wHour,tm.wMinute,tm.wSecond);
-    for(char*p=lp+5;*p;p++) if(strchr(" /\\:*?\"<>|",*p)) *p='_';
+    snprintf(lp,sizeof lp,"logs" PSEP "%s-%04d%02d%02d-%02d%02d%02d.log",tag,tm.wYear,tm.wMonth,tm.wDay,tm.wHour,tm.wMinute,tm.wSecond);
+    for(char*p=lp+strlen("logs" PSEP);*p;p++) if(strchr(" /\\:*?\"<>|",*p)) *p='_';
     FILE*lf=fopen(lp,"wb"); if(lf) fprintf(lf,"> %s\n\n",cl);
+#ifndef _WIN32
+    int pf[2]; DWORD t0=GetTickCount(), code=0; if(pipe(pf)) pf[0]=pf[1]=-1;
+    snprintf(t_stop,sizeof t_stop,"%s",stop?stop:""); lm_setenv("LMTUI_CHILD","1"); fflush(stdout);
+    pid_t pid=fork();
+    if(pid==0){ setpgid(0,0); signal(SIGINT,SIG_DFL); if(pf[1]>=0){ dup2(pf[1],1); dup2(pf[1],2); close(pf[0]); close(pf[1]); }
+        execl("/bin/sh","sh","-c",cl,(char*)NULL); _exit(127); }
+    if(pid<0) printf("fork failed (%d)\n",errno);
+    else { setpgid(pid,pid); t_child=pid; if(pf[1]>=0){ close(pf[1]); pf[1]=-1; }
+        if(pf[0]>=0){ char b[4096]; ssize_t n; for(;;){ n=read(pf[0],b,sizeof b); if(n<0&&errno==EINTR) continue; if(n<=0) break;
+            if(write(1,b,n)){} if(lf){ fwrite(b,1,n,lf); fflush(lf); } } }
+        int st=0; while(waitpid(pid,&st,0)<0&&errno==EINTR); t_child=0;
+        code=WIFEXITED(st)?(DWORD)WEXITSTATUS(st):128+(DWORD)WTERMSIG(st); }
+    lm_setenv("LMTUI_CHILD",""); if(pf[0]>=0) close(pf[0]); if(pf[1]>=0) close(pf[1]);
+#else
     SECURITY_ATTRIBUTES sa={sizeof sa,NULL,TRUE}; HANDLE rd=NULL,wr=NULL;
     if(!CreatePipe(&rd,&wr,&sa,0)) rd=wr=NULL; else SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);
     STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si;
@@ -538,9 +606,10 @@ static DWORD t_spawn(const char*cl, const char*stop, const char*tag, char*lpo, s
         WaitForSingleObject(pi.hProcess,INFINITE); t_child=0;
         GetExitCodeProcess(pi.hProcess,&code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
     lm_setenv("LMTUI_CHILD",""); if(wr) CloseHandle(wr); if(rd) CloseHandle(rd);
+#endif
     if(lf){ fprintf(lf,"\n[exit %lu, %.1f s]\n",code,(GetTickCount()-t0)/1000.0); fclose(lf); }
-    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  \x1b[2mlog: %s\\%s\x1b[0m\n",code?31:32,code,(GetTickCount()-t0)/1000.0,exe_dir(),lp);
-    if(lpo) snprintf(lpo,lcap,"%s\\%s",exe_dir(),lp);
+    printf("\n\x1b[1;%dm[exit %lu, %.1f s]\x1b[0m  \x1b[2mlog: %s" PSEP "%s\x1b[0m\n",code?31:32,code,(GetTickCount()-t0)/1000.0,exe_dir(),lp);
+    if(lpo) snprintf(lpo,lcap,"%s" PSEP "%s",exe_dir(),lp);
     return code;
 }
 
@@ -658,7 +727,7 @@ static void t_form_init(int ci){
     for(int i=0;i<nf;i++){ const TFld*f=&c->f[i]; const char*e=f->kind==F_ENV?getenv(f->arg):NULL;
         if(e&&*e&&!strncmp(f->arg,"NGRAM_",6)) envmem=1;
         snprintf(V[i],T_MAXL,"%s",e&&*e?e:f->def);
-        if(f->kind==F_FILE && f->def[0] && !d_exists(f->def)){ char b[300]; snprintf(b,sizeof b,"bench\\%s",f->def);
+        if(f->kind==F_FILE && f->def[0] && !d_exists(f->def)){ char b[300]; snprintf(b,sizeof b,"bench" PSEP "%s",f->def);
             if(d_exists(b)) snprintf(V[i],T_MAXL,"%s",b); } }
     for(int i=0;i<nf;i++) if(c->f[i].kind==F_MEM && envmem){   /* a loaded profile decides the mode */
         MemCfg m; mem_from_env(&m,64); snprintf(V[i],T_MAXL,"%s",mem_name(m.mode)); }
@@ -679,7 +748,7 @@ static double t_mixtab(char v[][T_MAXL],int draw){                 /* live blend
     char d[10][1200],a[32],b[32]; double n[10],w[10],ws=0,sum=0; unsigned h[10]; int k=0, idx[10];
     double rep=atof(v[2]); if(rep<=0) rep=1; double tot=d_count(v[1]);
     for(int i=0;i<10;i++){ const char*cv=v[4+2*i],*wv=v[5+2*i]; if(!cv[0]) continue;
-        data_resolve(cv,d[k],sizeof d[k]); char p[1300]; snprintf(p,sizeof p,"%s\\train.bin",d[k]); n[k]=d_exists(p)?d_fsize(p)/2.0:0;
+        data_resolve(cv,d[k],sizeof d[k]); char p[1300]; snprintf(p,sizeof p,"%s" PSEP "train.bin",d[k]); n[k]=d_exists(p)?d_fsize(p)/2.0:0;
         w[k]=wv[0]?atof(wv):0; h[k]=t_tokhash(d[k]); idx[k]=i+1;
         if(w[k]<=0) t_prob(draw,"'weight %d' must be > 0",i+1); else ws+=w[k];
         if(k&&h[k]&&h[0]&&h[k]!=h[0]) t_prob(draw,"corpus %d uses tokenizer %06x, corpus 1 uses %06x: mix refuses different tokenizers",i+1,h[k],h[0]);
@@ -705,7 +774,7 @@ static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the
     for(int i=0;i<T_NF&&c->f[i].label;i++){ const TFld*f=&c->f[i]; if(!v[i][0]||!t_vis(f,mode)||t_mixhide(c,v,i)) continue;
         if(f->kind==F_TOKD){ data_resolve(v[i],r,sizeof r);
             if(!t_tokhash(r)) t_prob(draw,"'%s': no tokenizer.bin in %s - Enter to pick one%s",f->label,r,t_is(c,"Build corpus")?", or make one with Train tokenizer or Tokenizer from model":""); }
-        else if(f->kind==F_DATA && !(t_is(c,"Build corpus")&&isnew)){ data_resolve(v[i],r,sizeof r); snprintf(q,sizeof q,"%s\\train.bin",r);
+        else if(f->kind==F_DATA && !(t_is(c,"Build corpus")&&isnew)){ data_resolve(v[i],r,sizeof r); snprintf(q,sizeof q,"%s" PSEP "train.bin",r);
             if(!d_exists(q)) t_prob(draw,"'%s': no corpus (train.bin) in %s",f->label,r); }
         else if(f->kind==F_PATH && !follow){ char sp[1024]; snprintf(sp,sizeof sp,"%s",v[i]);
             for(char*p=sp,*e;p;p=e){ e=strchr(p,';'); if(e) *e++=0; while(*p==' ') p++; if(!*p) continue; data_resolve(p,r,sizeof r);
@@ -730,8 +799,8 @@ static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the
         if(est>0&&fr>=0&&est>fr) t_prob(draw,"not enough space: needs about %s, %s free on that drive",t_hb(est,a),t_hb(fr,b));
         if(draw&&d_isdir(o)&&t_is(c,"Download text")) printf("  \x1b[2mthe folder exists: the download resumes into it\x1b[0m\n");
         if(draw&&d_isdir(o)&&t_is(c,"Convert files")) printf("  \x1b[2mthe folder exists: converted files are added to it\x1b[0m\n");
-        snprintf(q,sizeof q,"%s\\tokenizer.bin",o); if(t_is(c,"Train tokenizer")&&d_exists(q)) t_prob(draw,"%s already has a tokenizer - pick a new name",o);
-        snprintf(q,sizeof q,"%s\\train.bin",o);
+        snprintf(q,sizeof q,"%s" PSEP "tokenizer.bin",o); if(t_is(c,"Train tokenizer")&&d_exists(q)) t_prob(draw,"%s already has a tokenizer - pick a new name",o);
+        snprintf(q,sizeof q,"%s" PSEP "train.bin",o);
         if(((t_is(c,"Build corpus")&&isnew)||t_is(c,"Mix corpora"))&&d_exists(q)) t_prob(draw,"%s already holds a corpus - pick a new name%s",o,t_is(c,"Build corpus")?" (or mode append)":""); }
     if(t_is(c,"Corpus info")&&v[0][0]) data_resolve(v[0],t_outp,sizeof t_outp);
     return t_nprob; }
@@ -740,7 +809,7 @@ static int t_panel(const TCmd*c,char v[][T_MAXL],int draw){       /* returns the
 static const struct { const char*from,*to; } T_NEXT[]={{"Download text","Build corpus"},{"Convert files","Build corpus"},
     {"Train tokenizer","Build corpus"},{"Build corpus","Corpus info"},{"Mix corpora","Corpus info"},{"Corpus info","Train"},{"Loss weights","Train"}};
 static void t_handoff(const TCmd*c,const char*o){
-    char q[1300]; snprintf(q,sizeof q,"%s\\train.bin",o); int corpus=d_exists(q);
+    char q[1300]; snprintf(q,sizeof q,"%s" PSEP "train.bin",o); int corpus=d_exists(q);
     if(t_is(c,"Download text")||t_is(c,"Convert files")){ t_set("Build corpus","text",o); t_set("Train tokenizer","text",o); }
     else if(t_is(c,"Train tokenizer")){ t_set("Build corpus","tokenizer",o); t_set("Canon map","tokenizer",o); }
     else if(corpus&&(t_is(c,"Build corpus")||t_is(c,"Mix corpora")||t_is(c,"Corpus info"))){
@@ -928,7 +997,7 @@ static void t_model_cfg(void){
 
 /* data roots: built-in, data_roots.txt (add / remove here) or CUDALM_DATA_ROOTS */
 static void t_roots(void){
-    int sel=0; char fp[1100]; snprintf(fp,sizeof fp,"%s\\data_roots.txt",exe_dir());
+    int sel=0; char fp[1100]; snprintf(fp,sizeof fp,"%s" PSEP "data_roots.txt",exe_dir());
     for(;;){ char x[1200],a[32]; const char*env=getenv("CUDALM_DATA_ROOTS"); int ev=env&&*env, n=0, nr=0;
         for(int i=0;d_root(i,x,sizeof x)&&n<T_MAXL-2;i++,nr++){ snprintf(t_items[n],260,"%s",x); double fr=d_isdir(x)?t_free(x):-1;
             char fs[48]; if(fr>=0) snprintf(fs,sizeof fs,"%s free",t_hb(fr,a)); else snprintf(fs,sizeof fs,"(missing)");
@@ -949,16 +1018,21 @@ static void t_roots(void){
                 if(!gone&&!strcmp(t,t_items[s])){ gone=1; continue; } fwrite(l,1,e-l,f); }
             if(f) fclose(f); free(b); } } }
 /* every folder under the data roots: type, size, date; open / info / rename / Recycle Bin */
+#ifdef _WIN32
+#define T_BIN "Recycle Bin"
+#else
+#define T_BIN "Trash"
+#endif
 static void t_manage(void){
     static char pth[T_MAXL][1100]; int sel=0;
     for(;;){ int n=0; char r[1100],a[32];
         printf("\x1b[2J\x1b[H  scanning the data roots...\n"); fflush(stdout);
-        for(int ri=0;d_root(ri,r,sizeof r)&&n<T_MAXL;ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+        for(int ri=0;d_root(ri,r,sizeof r)&&n<T_MAXL;ri++){ char pat[1200]; snprintf(pat,sizeof pat,"%s" PSEP "*",r); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
             if(h==INVALID_HANDLE_VALUE) continue;
             do{ if(n>=T_MAXL||!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||fd.cFileName[0]=='.') continue;
-                char d[1200],q[1300]; snprintf(d,sizeof d,"%s\\%s",r,fd.cFileName); int nf=0,tn=0; double sz=t_tree(d,NULL,&nf);
-                snprintf(q,sizeof q,"%s\\train.bin",d); const char*ty=d_exists(q)?"corpus":NULL;
-                if(!ty){ snprintf(q,sizeof q,"%s\\tokenizer.bin",d); ty=d_exists(q)?"tokenizer":NULL; }
+                char d[1200],q[1300]; snprintf(d,sizeof d,"%s" PSEP "%s",r,fd.cFileName); int nf=0,tn=0; double sz=t_tree(d,NULL,&nf);
+                snprintf(q,sizeof q,"%s" PSEP "train.bin",d); const char*ty=d_exists(q)?"corpus":NULL;
+                if(!ty){ snprintf(q,sizeof q,"%s" PSEP "tokenizer.bin",d); ty=d_exists(q)?"tokenizer":NULL; }
                 if(!ty){ t_tree(d,T_TEXTIN,&tn); ty=tn?"text":"other"; }
                 SYSTEMTIME st; FileTimeToSystemTime(&fd.ftLastWriteTime,&st);
                 snprintf(pth[n],1100,"%s",d); snprintf(t_items[n],260,"%s",d);
@@ -970,7 +1044,7 @@ static void t_manage(void){
         snprintf(t_items[0],260,"Open in Explorer"); t_info[0][0]=0;
         snprintf(t_items[1],260,"Info"); snprintf(t_info[1],T_INFO,"cudalm data info (corpus / tokenizer folders)");
         snprintf(t_items[2],260,"Rename..."); t_info[2][0]=0;
-        snprintf(t_items[3],260,"Delete to the Recycle Bin..."); snprintf(t_info[3],T_INFO,"can be restored from the Recycle Bin");
+        snprintf(t_items[3],260,"Delete to the " T_BIN "..."); snprintf(t_info[3],T_INFO,"can be restored from the " T_BIN);
         int act=t_pick(d,NULL,4,0);
         if(act==0) ShellExecuteA(NULL,"explore",d,NULL,NULL,SW_SHOWNORMAL);
         else if(act==1){ char exe[MAX_PATH],cl[2600],lp[700]; GetModuleFileNameA(0,exe,sizeof exe); cl[0]=0; t_quote(cl,sizeof cl,exe);
@@ -978,10 +1052,18 @@ static void t_manage(void){
         else if(act==2){ char nm[260]; snprintf(nm,sizeof nm,"%s",d_base(d));
             if(t_edit("new name",nm,sizeof nm)&&nm[0]&&!strpbrk(nm,"\\/:*?\"<>|")){ char to[1400]; snprintf(to,sizeof to,"%.*s%s",(int)(d_base(d)-d),d,nm);
                 if(!MoveFileA(d,to)) t_note("rename failed (error %lu) - is it in use?",GetLastError()); } }
-        else if(act==3){ char y[16]=""; t_head("delete"); printf("  send %s to the Recycle Bin?\n  type yes and Enter to confirm, Esc to cancel\n",d);
-            if(t_edit("confirm",y,sizeof y)&&!strcmp(y,"yes")){ char fr[1102]; memset(fr,0,sizeof fr); snprintf(fr,sizeof fr-1,"%s",d);
+        else if(act==3){ char y[16]=""; t_head("delete"); printf("  send %s to the " T_BIN "?\n  type yes and Enter to confirm, Esc to cancel\n",d);
+            if(t_edit("confirm",y,sizeof y)&&!strcmp(y,"yes")){
+#ifndef _WIN32
+                /* gio trash (freedesktop Trash, restorable); no permanent delete without it */
+                if(system("command -v gio >/dev/null 2>&1")){ t_note("not deleted: needs 'gio' (glib) for the Trash - delete it yourself if you are sure"); continue; }
+                char cl[2600]="gio trash --"; t_quote(cl,sizeof cl,d); strcat(cl," 2>&1");
+                int rc=system(cl); if(rc) t_note("not deleted (gio trash exit %d)",rc); } } } }
+#else
+                char fr[1102]; memset(fr,0,sizeof fr); snprintf(fr,sizeof fr-1,"%s",d);
                 SHFILEOPSTRUCTA op; memset(&op,0,sizeof op); op.wFunc=FO_DELETE; op.pFrom=fr; op.fFlags=FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_WANTNUKEWARNING;
                 int rc=SHFileOperationA(&op); if(rc||op.fAnyOperationsAborted) t_note("not deleted (code %d)",rc); } } } }
+#endif
 /* ---- Hugging Face browser: search -> config / split -> columns + first rows -> Download text, filled in ---- */
 static HfDs t_hfd[100];
 static void t_hf_pv(int sel){ const HfDs*d=&t_hfd[sel]; char a[32], s[400]; int w=t_cols()-4; if(w<40) w=40; if(w>300) w=300;
@@ -1075,9 +1157,15 @@ static int tui_check(int argc,char**argv){
         if(t_is(c,"Train")) t_train_sched(c,V); }
     return 0; }
 static int tui_main(void){
+#ifdef _WIN32
     HANDLE ho=GetStdHandle(STD_OUTPUT_HANDLE); DWORD m=0;
     if(!GetConsoleMode(ho,&m) || !SetConsoleMode(ho,m|0x0004)) return -1;  /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */
     SetConsoleOutputCP(CP_UTF8); SetConsoleCtrlHandler(t_ctrl,TRUE); SetCurrentDirectoryA(exe_dir());
+#else
+    struct termios tt; if(tcgetattr(0,&tt)) return -1;
+    struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=t_sigint; sigaction(SIGINT,&sa,NULL); signal(SIGPIPE,SIG_IGN);
+    if(chdir(exe_dir())){}
+#endif
     int sel=0;
     for(;;){
         int n=0, ids[T_NCMD];
@@ -1085,7 +1173,7 @@ static int tui_main(void){
         int nc=n;
         snprintf(t_items[n],260,"Data tools..."); snprintf(t_info[n++],T_INFO,"download text, train a tokenizer, build / mix / inspect corpora, loss weights");
         snprintf(t_items[n],260,"Diagnostics..."); snprintf(t_info[n++],T_INFO,"selftest, decode check, tokenizer check, QLM check");
-        snprintf(t_items[n],260,"Model config"); snprintf(t_info[n++],T_INFO,"edit a model's saved settings (models\\<name>.bin.env)");
+        snprintf(t_items[n],260,"Model config"); snprintf(t_info[n++],T_INFO,"edit a model's saved settings (models" PSEP "<name>.bin.env)");
         snprintf(t_items[n],260,"Environment / profile"); snprintf(t_info[n++],T_INFO,"all CUDALM_* QLM_* NGRAM_* settings for the commands");
         snprintf(t_items[n],260,"Quit"); t_info[n++][0]=0;
         int s=t_pick("main menu","Up/Down  Enter open  Esc quit   (cudalm help = CLI usage)",n,sel);
@@ -1098,4 +1186,3 @@ static int tui_main(void){
         else { t_st.file=0; t_reg(&t_st,"Environment (inherited by every command; saved into a model's config by new/train)"); }
     }
 }
-#endif

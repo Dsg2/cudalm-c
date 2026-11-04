@@ -32,11 +32,106 @@ static void d_split(const unsigned char*s,int n,unsigned*cp,int*off,DPieceFn f,v
         f(ctx,s+off[i],off[j]-off[i]); i=j; } }
 #ifdef _WIN32
 #pragma comment(lib,"normaliz.lib")
+#else
+/* ---- POSIX stand-ins for the Win32 calls the data tools and the menu use (Windows keeps the real ones) ---- */
+#include <dirent.h>
+#include <fnmatch.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <strings.h>
+#include <errno.h>
+#include <time.h>
+extern char **environ;
+typedef unsigned long DWORD; typedef int BOOL; typedef void* HANDLE; typedef void* LPVOID;
+#define WINAPI
+#ifndef MAX_PATH
+#define MAX_PATH 4096
+#endif
+#define FALSE 0
+#define TRUE 1
+#define INFINITE 0xFFFFFFFFu
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#define INVALID_FILE_ATTRIBUTES 0xFFFFFFFFu
+#define FILE_ATTRIBUTE_DIRECTORY 0x10u
+#define MOVEFILE_REPLACE_EXISTING 1
+#define ALL_PROCESSOR_GROUPS 0xffff
+#define SW_SHOWNORMAL 1
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#define _strdup strdup
+#define _atoi64 atoll
+#define _popen(c,m) popen((c),"r")
+#define _pclose pclose
+#define GetLastError() ((DWORD)errno)
+typedef struct { unsigned long long QuadPart; } ULARGE_INTEGER;
+typedef struct { unsigned short wYear,wMonth,wDayOfWeek,wDay,wHour,wMinute,wSecond,wMilliseconds; } SYSTEMTIME;
+typedef struct { time_t t; } FILETIME;
+typedef struct { DWORD dwFileAttributes; FILETIME ftLastWriteTime; DWORD nFileSizeHigh,nFileSizeLow; char cFileName[256]; } WIN32_FIND_DATAA;
+static DWORD GetFileAttributesA(const char*p){ struct stat s; return stat(p,&s)?INVALID_FILE_ATTRIBUTES:S_ISDIR(s.st_mode)?FILE_ATTRIBUTE_DIRECTORY:0; }
+static BOOL GetDiskFreeSpaceExA(const char*p,ULARGE_INTEGER*f,void*a,void*b){ (void)a; (void)b; struct statvfs s; if(statvfs(p,&s)) return 0;
+    f->QuadPart=(unsigned long long)s.f_bavail*s.f_frsize; return 1; }
+static BOOL CreateDirectoryA(const char*p,void*a){ (void)a; return mkdir(p,0755)==0; }
+static BOOL CopyFileA(const char*a,const char*b,BOOL x){ (void)x; return lm_copyfile(a,b); }
+static BOOL MoveFileExA(const char*a,const char*b,DWORD f){ (void)f; return rename(a,b)==0; }
+static BOOL MoveFileA(const char*a,const char*b){ if(lm_exists(b)){ errno=EEXIST; return 0; } return rename(a,b)==0; }
+static DWORD GetTickCount(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (DWORD)t.tv_sec*1000+t.tv_nsec/1000000; }
+static void Sleep(DWORD ms){ lm_sleep_ms((unsigned)ms); }
+static void lm_systime(const struct tm*t,SYSTEMTIME*s){ s->wYear=t->tm_year+1900; s->wMonth=t->tm_mon+1; s->wDayOfWeek=t->tm_wday; s->wDay=t->tm_mday;
+    s->wHour=t->tm_hour; s->wMinute=t->tm_min; s->wSecond=t->tm_sec; s->wMilliseconds=0; }
+static void GetLocalTime(SYSTEMTIME*s){ time_t n=time(NULL); struct tm t; localtime_r(&n,&t); lm_systime(&t,s); }
+static BOOL FileTimeToSystemTime(const FILETIME*f,SYSTEMTIME*s){ struct tm t; gmtime_r(&f->t,&t); lm_systime(&t,s); return 1; }   /* UTC, as on Windows */
+static DWORD GetActiveProcessorCount(int g){ (void)g; long n=sysconf(_SC_NPROCESSORS_ONLN); return n>0?(DWORD)n:1; }
+static DWORD GetModuleFileNameA(void*m,char*o,DWORD cap){ (void)m; ssize_t n=readlink("/proc/self/exe",o,cap-1); if(n<0) n=0; o[n]=0; return (DWORD)n; }
+static DWORD GetFullPathNameA(const char*p,DWORD cap,char*o,char**fp){   /* absolute + lexically normalised; need not exist */
+    (void)fp; char b[MAX_PATH*2]; if(*p=='/') snprintf(b,sizeof b,"%s",p); else { char c[MAX_PATH]; if(!getcwd(c,sizeof c)) return 0; snprintf(b,sizeof b,"%s/%s",c,p); }
+    char*seg[512]; int n=0; for(char*s=strtok(b,"/");s&&n<512;s=strtok(NULL,"/")){ if(!strcmp(s,".")) continue; if(!strcmp(s,"..")){ if(n) n--; continue; } seg[n++]=s; }
+    size_t l=0; o[0]=0; for(int i=0;i<n;i++) l+=snprintf(o+l,l<cap?cap-l:0,"/%s",seg[i]);
+    if(!n) snprintf(o,cap,"/"); return l<cap?(DWORD)(n?l:1):0; }
+static DWORD GetLogicalDriveStringsA(DWORD cap,char*o){ if(cap<3) return 0; o[0]='/'; o[1]=0; o[2]=0; return 2; }
+static char* GetEnvironmentStringsA(void){ size_t n=1; for(char**e=environ;*e;e++) n+=strlen(*e)+1;
+    char*b=(char*)malloc(n),*p=b; for(char**e=environ;*e;e++){ size_t l=strlen(*e)+1; memcpy(p,*e,l); p+=l; } *p=0; return b; }
+static void FreeEnvironmentStringsA(char*b){ free(b); }
+static void ShellExecuteA(void*w,const char*verb,const char*path,void*a,void*d,int s){   /* open in the desktop's default app, if there is one */
+    (void)w; (void)verb; (void)a; (void)d; (void)s; char q[2400]; size_t n=0;
+    for(const char*c=path;*c&&n+5<sizeof q;c++){ if(*c=='\'') n+=snprintf(q+n,sizeof q-n,"'\\''"); else q[n++]=*c; } q[n]=0;
+    char cl[2600]; snprintf(cl,sizeof cl,"(xdg-open '%s' || wslview '%s') >/dev/null 2>&1 &",q,q); if(system(cl)){} }
+/* FindFirstFileA: "dir/glob", entries sorted like NTFS (case-insensitive, upper-case order) so walks match Windows */
+typedef struct { int n,i; WIN32_FIND_DATAA*e; } LmFind;
+static int lm_fcmp(const void*a,const void*b){ const unsigned char*x=(const unsigned char*)((const WIN32_FIND_DATAA*)a)->cFileName,*y=(const unsigned char*)((const WIN32_FIND_DATAA*)b)->cFileName;
+    for(;;x++,y++){ int c=toupper(*x)-toupper(*y); if(c||!*x) return c; } }
+static HANDLE FindFirstFileA(const char*pat,WIN32_FIND_DATAA*fd){
+    char dir[MAX_PATH]; const char*g=strrchr(pat,'/');
+    if(g){ snprintf(dir,sizeof dir,"%.*s",g==pat?1:(int)(g-pat),pat); g++; } else { snprintf(dir,sizeof dir,"."); g=pat; }
+    DIR*d=opendir(dir); if(!d) return INVALID_HANDLE_VALUE;
+    LmFind*f=(LmFind*)calloc(1,sizeof *f); int cap=0; struct dirent*e;
+    while((e=readdir(d))){ if(fnmatch(g,e->d_name,FNM_CASEFOLD)) continue;
+        char p[MAX_PATH+300]; snprintf(p,sizeof p,"%s/%s",dir,e->d_name); struct stat s; if(stat(p,&s)) continue;
+        if(f->n==cap){ cap=cap?cap*2:64; f->e=(WIN32_FIND_DATAA*)realloc(f->e,cap*sizeof *f->e); }
+        WIN32_FIND_DATAA*x=&f->e[f->n++]; x->dwFileAttributes=S_ISDIR(s.st_mode)?FILE_ATTRIBUTE_DIRECTORY:0; x->ftLastWriteTime.t=s.st_mtime;
+        x->nFileSizeHigh=(DWORD)((unsigned long long)s.st_size>>32); x->nFileSizeLow=(DWORD)(s.st_size&0xFFFFFFFFu); snprintf(x->cFileName,sizeof x->cFileName,"%s",e->d_name); }
+    closedir(d);
+    if(!f->n){ free(f->e); free(f); return INVALID_HANDLE_VALUE; }
+    qsort(f->e,f->n,sizeof *f->e,lm_fcmp); *fd=f->e[f->i++]; return f; }
+static BOOL FindNextFileA(HANDLE h,WIN32_FIND_DATAA*fd){ LmFind*f=(LmFind*)h; if(f->i>=f->n) return 0; *fd=f->e[f->i++]; return 1; }
+static BOOL FindClose(HANDLE h){ LmFind*f=(LmFind*)h; free(f->e); free(f); return 1; }
+/* threads: CreateThread / WaitForMultipleObjects / CloseHandle on pthreads (thread handles only) */
+typedef struct { pthread_t t; DWORD (*fn)(LPVOID); LPVOID a; } LmThr;
+static void* lm_thr(void*p){ LmThr*t=(LmThr*)p; t->fn(t->a); return NULL; }
+static HANDLE CreateThread(void*sa,size_t st,DWORD (*fn)(LPVOID),LPVOID a,DWORD fl,DWORD*id){ (void)sa; (void)st; (void)fl; (void)id;
+    LmThr*t=(LmThr*)malloc(sizeof *t); t->fn=fn; t->a=a; if(pthread_create(&t->t,NULL,lm_thr,t)){ free(t); return NULL; } return t; }
+static DWORD WaitForMultipleObjects(DWORD n,HANDLE*h,BOOL all,DWORD ms){ (void)all; (void)ms; for(DWORD i=0;i<n;i++) if(h[i]) pthread_join(((LmThr*)h[i])->t,NULL); return 0; }
+static BOOL CloseHandle(HANDLE h){ free(h); return 1; }
+#endif
+#define PSEPC (PSEP[0])
 
 static void data_roots(char*o,size_t cap){ const char*e=getenv("CUDALM_DATA_ROOTS");
     if(e&&*e){ snprintf(o,cap,"%s",e); return; }
-    snprintf(o,cap,"%s\\data;%s\\prep\\data",exe_dir(),exe_dir());
-    char p[1100],l[1024]; snprintf(p,sizeof p,"%s\\data_roots.txt",exe_dir()); FILE*f=fopen(p,"r"); if(!f) return;
+    snprintf(o,cap,"%s" PSEP "data;%s" PSEP "prep" PSEP "data",exe_dir(),exe_dir());
+    char p[1100],l[1024]; snprintf(p,sizeof p,"%s" PSEP "data_roots.txt",exe_dir()); FILE*f=fopen(p,"r"); if(!f) return;
     while(fgets(l,sizeof l,f)){ l[strcspn(l,"\r\n")]=0; size_t n=strlen(o);
         if(*l && *l!='#' && n+strlen(l)+2<cap) snprintf(o+n,cap-n,";%s",l); }
     fclose(f); }
@@ -46,8 +141,14 @@ static int d_isdir(const char*p){ DWORD a=GetFileAttributesA(p); return a!=INVAL
 static int d_exists(const char*p){ return GetFileAttributesA(p)!=INVALID_FILE_ATTRIBUTES; }
 static int d_bare(const char*n){ return !strpbrk(n,"\\/:"); }
 static const char*d_base(const char*p){ for(const char*q=p;*q;q++) if(*q=='\\'||*q=='/') p=q+1; return p; }
-static long long d_fsize(const char*p){ WIN32_FILE_ATTRIBUTE_DATA a; if(!GetFileAttributesExA(p,GetFileExInfoStandard,&a)) return -1;
-    return ((long long)a.nFileSizeHigh<<32)|a.nFileSizeLow; }
+static long long d_fsize(const char*p){
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA a; if(!GetFileAttributesExA(p,GetFileExInfoStandard,&a)) return -1;
+    return ((long long)a.nFileSizeHigh<<32)|a.nFileSizeLow;
+#else
+    struct stat a; return stat(p,&a)?-1:(long long)a.st_size;
+#endif
+}
 static int d_ends(const char*s,const char*e){ size_t a=strlen(s),b=strlen(e); return a>=b && !_stricmp(s+a-b,e); }
 /* token / byte counts: plain numbers, 1e9, or a k / M / B (G) / T suffix (1B = 1e9); <0 if unparsable */
 static double d_count(const char*s){ char*e; double v=strtod(s,&e); if(e==s) return -1; while(*e==' ') e++;
@@ -56,14 +157,14 @@ static double d_count(const char*s){ char*e; double v=strtod(s,&e); if(e==s) ret
     return e[1]?-1:v; }
 static const char* data_resolve(const char*n,char*o,size_t cap){
     snprintf(o,cap,"%s",n); if(!*n||!d_bare(n)||d_isdir(n)) return o;
-    char r[1024],p[1200]; for(int i=0;d_root(i,r,sizeof r);i++){ snprintf(p,sizeof p,"%s\\%s",r,n); if(d_isdir(p)){ snprintf(o,cap,"%s",p); break; } }
+    char r[1024],p[1200]; for(int i=0;d_root(i,r,sizeof r);i++){ snprintf(p,sizeof p,"%s" PSEP "%s",r,n); if(d_isdir(p)){ snprintf(o,cap,"%s",p); break; } }
     return o; }
 static const char* data_outdir(const char*n,char*o,size_t cap){
     if(!d_bare(n)){ snprintf(o,cap,"%s",n); return o; }
     char r[1024],best[1024]=""; unsigned long long bf=0;
     for(int i=0;d_root(i,r,sizeof r);i++){ ULARGE_INTEGER fr; if(d_isdir(r)&&GetDiskFreeSpaceExA(r,&fr,NULL,NULL)&&fr.QuadPart>bf){ bf=fr.QuadPart; snprintf(best,sizeof best,"%s",r); } }
     if(!best[0]){ d_root(0,best,sizeof best); lm_mkdir(best); }
-    snprintf(o,cap,"%s\\%s",best,n); return o; }
+    snprintf(o,cap,"%s" PSEP "%s",best,n); return o; }
 
 /* ---------------- growable buffer + minimal JSON reader ---------------- */
 typedef struct { char*p; size_t n,cap; } DBuf;
@@ -263,11 +364,11 @@ typedef struct { char**f; int n,cap,npq; } DFiles;
 static void d_addf(DFiles*l,const char*p){ if(l->n==l->cap){ l->cap=l->cap?l->cap*2:64; l->f=(char**)realloc(l->f,sizeof(char*)*l->cap); } l->f[l->n++]=_strdup(p); }
 static int d_textfile(const char*n){ return d_ends(n,".jsonl")||d_ends(n,".json")||d_ends(n,".txt"); }
 static void d_walk(DFiles*l,const char*dir){
-    char pat[1200]; snprintf(pat,sizeof pat,"%s\\*",dir); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
+    char pat[1200]; snprintf(pat,sizeof pat,"%s" PSEP "*",dir); WIN32_FIND_DATAA fd; HANDLE h=FindFirstFileA(pat,&fd);
     if(h==INVALID_HANDLE_VALUE) return;
     do{ if(fd.cFileName[0]=='.'||fd.cFileName[0]=='_'||!_stricmp(fd.cFileName,"sources.json")||!_stricmp(fd.cFileName,"meta.json")   /* metadata of */
            ||!_stricmp(fd.cFileName,"tokenizer.json")||!_stricmp(fd.cFileName,"template.txt")) continue;                        /* fetch.py / a corpus */
-        char p[1200]; snprintf(p,sizeof p,"%s\\%s",dir,fd.cFileName);
+        char p[1200]; snprintf(p,sizeof p,"%s" PSEP "%s",dir,fd.cFileName);
         if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) d_walk(l,p);
         else if(d_textfile(fd.cFileName)) d_addf(l,p); else if(d_ends(fd.cFileName,".parquet")) l->npq++;
     }while(FindNextFileA(h,&fd)); FindClose(h); }
@@ -326,7 +427,7 @@ typedef struct { int V,eot,nm,base[256]; size_t mcap; uint64_t*mkey; int*mnew,*m
 static size_t dt_slot(const DTok*t,uint64_t k){ size_t i=(size_t)((k*0x9E3779B97F4A7C15ULL)>>20)&(t->mcap-1);
     while(t->mrank[i]>=0 && t->mkey[i]!=k) i=(i+1)&(t->mcap-1); return i; }
 static DTok* dtok_load(const char*dir){
-    char p[1200]; snprintf(p,sizeof p,"%s\\tokenizer.bin",dir); size_t len; uint8_t*b=read_file(p,&len);
+    char p[1200]; snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",dir); size_t len; uint8_t*b=read_file(p,&len);
     if(!b){ fprintf(stderr,"[data] no tokenizer.bin in %s\n",dir); return NULL; }
     DTok*t=(DTok*)calloc(1,sizeof(DTok)); t->blob=b; t->blen=len; t->tk=tok_parse(b,len,0);
     Rd r={b,b+len}; r.p+=4; rd(&r,&t->V,4); rd(&r,&t->eot,4); rd(&r,&t->nm,4);
@@ -364,8 +465,8 @@ static void de_text(DEnc*e,const char*s,size_t n){ const char*end=s+n;
 static int d_samefile(const char*a,const char*b){ size_t la,lb; uint8_t*x=read_file(a,&la),*y=read_file(b,&lb);
     int same=x&&y&&la==lb&&!memcmp(x,y,la); free(x); free(y); return same; }
 static void d_copy(const char*sd,const char*dd,const char*nm){ char a[1200],b[1200];
-    snprintf(a,sizeof a,"%s\\%s",sd,nm); snprintf(b,sizeof b,"%s\\%s",dd,nm); if(d_exists(a)) CopyFileA(a,b,FALSE); }
-static void d_template(const char*dir){ char p[1200]; snprintf(p,sizeof p,"%s\\template.txt",dir);
+    snprintf(a,sizeof a,"%s" PSEP "%s",sd,nm); snprintf(b,sizeof b,"%s" PSEP "%s",dd,nm); if(d_exists(a)) CopyFileA(a,b,FALSE); }
+static void d_template(const char*dir){ char p[1200]; snprintf(p,sizeof p,"%s" PSEP "template.txt",dir);
     if(!d_exists(p)){ FILE*f=fopen(p,"wb"); if(f){ fputs("chatml",f); fclose(f); } } }
 static void d_now(char*o,size_t cap){ SYSTEMTIME s; GetLocalTime(&s); snprintf(o,cap,"%04d-%02d-%02d %02d:%02d",s.wYear,s.wMonth,s.wDay,s.wHour,s.wMinute); }
 
@@ -373,16 +474,38 @@ static void d_now(char*o,size_t cap){ SYSTEMTIME s; GetLocalTime(&s); snprintf(o
 static int d_canon(const DTok*t,const char*outp){
     int V=t->V; uint16_t*cn=(uint16_t*)malloc(2*V); size_t hc=1; while(hc<(size_t)V*4) hc<<=1;
     uint64_t*hk=(uint64_t*)calloc(hc,8); int*hv=(int*)malloc(4*hc); int merged=0;
+#ifndef _WIN32
+    char*kb=NULL; int*kl_=(int*)calloc(V,4); size_t*ko=(size_t*)calloc(V,sizeof(size_t));
+    { /* python3: NFKC, then each char's one-to-one lowercase (as LCMAP_LOWERCASE), leading spaces stripped; -1 = invalid UTF-8 */
+      static const char*py="import sys,struct,unicodedata as u\na=open(sys.argv[1],'rb').read();o=open(sys.argv[2],'wb');p=0\n"
+        "while p<len(a):\n n=struct.unpack_from('<i',a,p)[0];p+=4;b=a[p:p+n];p+=n\n try:s=b.decode()\n except Exception:o.write(struct.pack('<i',-1));continue\n"
+        " s=''.join(c.lower()[0] for c in u.normalize('NFKC',s)).lstrip(' ').encode('utf-8','surrogatepass');o.write(struct.pack('<i',len(s))+s)\n";
+      char d[]="/tmp/cudalm_canonXXXXXX"; if(mkdtemp(d)){ char fs[64],fi[64],fo[64],cl[400]; snprintf(fs,64,"%s/c.py",d); snprintf(fi,64,"%s/in",d); snprintf(fo,64,"%s/out",d);
+        FILE*a=fopen(fs,"wb"),*b=fopen(fi,"wb");
+        if(a&&b){ fputs(py,a); for(int i=0;i<V;i++){ int l=(i==t->eot||t->tk->declen[i]<=0)?0:t->tk->declen[i]; fwrite(&l,4,1,b); if(l) fwrite(t->tk->dec[i],1,l,b); } }
+        if(a) fclose(a); if(b) fclose(b);
+        snprintf(cl,sizeof cl,"%s -I %s %s %s",py_cmd(),fs,fi,fo); size_t n=0;
+        if(!system(cl)&&(kb=(char*)read_file(fo,&n))){ size_t q=0; for(int i=0;i<V&&q+4<=n;i++){ memcpy(&kl_[i],kb+q,4); q+=4; ko[i]=q; if(kl_[i]>0) q+=kl_[i]; } }
+        else fprintf(stderr,"[canon] needs %s (unicodedata) for NFKC on this system\n",py_cmd());
+        remove(fs); remove(fi); remove(fo); rmdir(d); } }
+#endif
     for(int i=0;i<V;i++){ cn[i]=(uint16_t)i; if(i==t->eot||t->tk->declen[i]<=0) continue;
+#ifdef _WIN32
         wchar_t w[600],nz[2400],lw[2400]; char key[4800];
         int wl=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,(const char*)t->tk->dec[i],t->tk->declen[i],w,600); if(wl<=0) continue;
         int nl=NormalizeString(NormalizationKC,w,wl,nz,2400); if(nl<=0) continue;
         int ll=LCMapStringEx(LOCALE_NAME_INVARIANT,LCMAP_LOWERCASE,nz,nl,lw,2400,NULL,NULL,0); if(ll<=0) continue;
         int s=0; while(s<ll&&lw[s]==L' ') s++; if(s==ll) continue;
         int kl=WideCharToMultiByte(CP_UTF8,0,lw+s,ll-s,key,sizeof key,NULL,NULL); if(kl<=0) continue;
+#else
+        if(!kb) break; int kl=kl_[i]; if(kl<=0) continue; const char*key=kb+ko[i];
+#endif
         uint64_t h=1469598103934665603ULL; for(int j=0;j<kl;j++) h=(h^(unsigned char)key[j])*1099511628211ULL; if(!h) h=1;
         size_t j=h&(hc-1); while(hk[j]&&hk[j]!=h) j=(j+1)&(hc-1);
         if(hk[j]){ cn[i]=(uint16_t)hv[j]; merged++; } else { hk[j]=h; hv[j]=i; } }
+#ifndef _WIN32
+    free(kl_); free(ko); if(!kb){ free(cn); free(hk); free(hv); return 1; } free(kb);
+#endif
     FILE*f=fopen(outp,"wb"); if(f){ fwrite(cn,2,V,f); fclose(f); }
     printf("[canon] %s: V=%d, %d tokens merged into %d classes\n",outp,V,merged,V-merged);
     free(cn); free(hk); free(hv); return f?0:1; }
@@ -449,8 +572,8 @@ static void d_meta_old(const char*path,DEc*c,DBuf*inputs,DBuf*hist){   /* carry 
         if(v) for(const char*e=jfirst(v);e;e=jnext(e)){ const char*q=jskip(e); if(!q) break; if(o->n) db_s(o,", "); db_put(o,e,q-e); } }
     free(b); }
 static void d_meta_write(const char*out,const DTok*t,const char*tokdir,DEc*c,DBuf*inputs,DBuf*hist){
-    char p[1200],q[1200]; snprintf(q,sizeof q,"%s\\meta.json.tmp",out); FILE*f=fopen(q,"wb"); if(!f) return;
-    snprintf(p,sizeof p,"%s\\train.bin",out); long long tr=d_fsize(p)/2; snprintf(p,sizeof p,"%s\\val.bin",out); long long va=d_fsize(p); va=va>0?va/2:0;
+    char p[1200],q[1200]; snprintf(q,sizeof q,"%s" PSEP "meta.json.tmp",out); FILE*f=fopen(q,"wb"); if(!f) return;
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",out); long long tr=d_fsize(p)/2; snprintf(p,sizeof p,"%s" PSEP "val.bin",out); long long va=d_fsize(p); va=va>0?va/2:0;
     const char*nm=d_base(out);
     fprintf(f,"{\n  \"profile\": "); jesc(f,nm);
     fprintf(f,",\n  \"vocab_size\": %d,\n  \"eot_id\": %d,\n  \"total_tokens\": %lld,\n  \"train_tokens\": %lld,\n  \"val_tokens\": %lld,\n",t->V,t->eot,tr+va,tr,va);
@@ -461,19 +584,19 @@ static void d_meta_write(const char*out,const DTok*t,const char*tokdir,DEc*c,DBu
     for(int i=0;i<c->ncat;i++){ DCat*x=&c->cat[i]; fprintf(f,"    "); jesc(f,x->k);
         fprintf(f,": {\"docs\": %lld, \"tokens\": %lld, \"pct\": %.2f}%s\n",x->docs+x->odocs,x->tok+x->otok,100.0*(x->tok+x->otok)/(tt?tt:1),i+1<c->ncat?",":""); }
     fprintf(f,"  }\n}\n"); fclose(f);
-    snprintf(p,sizeof p,"%s\\meta.json",out); MoveFileExA(q,p,MOVEFILE_REPLACE_EXISTING); }
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",out); MoveFileExA(q,p,MOVEFILE_REPLACE_EXISTING); }
 static int cmd_data_encode(int argc,char**argv){
     if(argc<7){ fprintf(stderr,"usage: cudalm data encode <new|append> <out> <inputs> <tokenizer_dir> [val%%=1] [dedup=1] [follow=0]\n"); return 1; }
     int append=!strcmp(argv[3],"append"); if(!append && strcmp(argv[3],"new")){ fprintf(stderr,"mode must be new or append\n"); return 1; }
     char out[1200],tokd[1200],p[1200],q[1200]; DFiles fl;
     if(append) data_resolve(argv[4],out,sizeof out); else data_outdir(argv[4],out,sizeof out);
     data_resolve(argv[6],tokd,sizeof tokd);
-    snprintf(p,sizeof p,"%s\\train.bin",out);
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",out);
     if(append && !d_exists(p)){ fprintf(stderr,"[encode] append: no corpus at %s\n",out); return 1; }
     if(!append && d_exists(p)){ fprintf(stderr,"[encode] %s already holds a corpus - pick a new name, or mode=append to add to it\n",out); return 1; }
     DTok*t=dtok_load(tokd); if(!t) return 1;
     if(t->V>65536){ fprintf(stderr,"[encode] vocab %d does not fit uint16 tokens\n",t->V); return 1; }
-    if(append){ snprintf(q,sizeof q,"%s\\tokenizer.bin",tokd); snprintf(p,sizeof p,"%s\\tokenizer.bin",out);
+    if(append){ snprintf(q,sizeof q,"%s" PSEP "tokenizer.bin",tokd); snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",out);
         if(!d_samefile(p,q)){ fprintf(stderr,"[encode] REFUSED: %s uses a different tokenizer than %s\n"
             "         (appending would mix two token->text mappings in one train.bin)\n",out,tokd); return 1; } }
     if(!d_inputs(argv[5],&fl)) return 1;
@@ -483,11 +606,11 @@ static int cmd_data_encode(int argc,char**argv){
     double vp=argc>7?atof(argv[7]):1.0; c.vN=vp>0?(int)(100.0/vp+0.5):0; if(vp>0&&c.vN<2) c.vN=2;
     c.dedup=argc>8?atoi(argv[8]):1; int follow=argc>9?atoi(argv[9]):0;
     c.T=d_nthreads(); for(int i=0;i<c.T;i++) c.jb[i].e.t=t;
-    snprintf(p,sizeof p,"%s\\train.bin",out); c.ft=fopen(p,append?"ab":"wb");
-    snprintf(p,sizeof p,"%s\\val.bin",out); c.fv=append?NULL:fopen(p,"wb");
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",out); c.ft=fopen(p,append?"ab":"wb");
+    snprintf(p,sizeof p,"%s" PSEP "val.bin",out); c.fv=append?NULL:fopen(p,"wb");
     if(!c.ft||(!append&&!c.fv)){ fprintf(stderr,"[encode] cannot write in %s\n",out); return 1; }
-    DBuf inputs={0},hist={0}; snprintf(p,sizeof p,"%s\\meta.json",out); long long tr0=0;
-    if(append){ d_meta_old(p,&c,&inputs,&hist); snprintf(q,sizeof q,"%s\\train.bin",out); tr0=d_fsize(q)/2; }
+    DBuf inputs={0},hist={0}; snprintf(p,sizeof p,"%s" PSEP "meta.json",out); long long tr0=0;
+    if(append){ d_meta_old(p,&c,&inputs,&hist); snprintf(q,sizeof q,"%s" PSEP "train.bin",out); tr0=d_fsize(q)/2; }
     printf("[encode] %s %s <- %d file(s), tokenizer %s (V=%d), %d threads, val %s, dedup %s%s\n",append?"append to":"new",out,fl.n,tokd,t->V,c.T,
            append?"unchanged (append adds to train.bin only)":vp>0?"every Nth doc":"none",c.dedup?"on":"off",follow?", follow":"");
     if(!append&&vp>0) printf("         val = every %d-th doc (%.2f%%)\n",c.vN,100.0/c.vN);
@@ -556,13 +679,13 @@ static void d_jtok(FILE*f,const unsigned*u,const uint8_t*s,int n){       /* toke
     fputc('"',f); }
 /* <dir>\tokenizer.json (HF ByteLevel BPE) from <dir>\tokenizer.bin, so HF tools and fetch.py can read the tokenizer */
 static int d_tokjson(const char*dir){
-    char p[1200]; size_t n; snprintf(p,sizeof p,"%s\\tokenizer.bin",dir); uint8_t*b=read_file(p,&n);
+    char p[1200]; size_t n; snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",dir); uint8_t*b=read_file(p,&n);
     if(!b||n<16||memcmp(b,"TLTK",4)){ free(b); fprintf(stderr,"[tokenizer] %s is not a TLTK tokenizer\n",p); return 0; }
     int V,eot,m; memcpy(&V,b+4,4); memcpy(&eot,b+8,4); memcpy(&m,b+12,4);
     const uint8_t**t=(const uint8_t**)malloc(sizeof(*t)*V); int*tl=(int*)malloc(4*V); const uint8_t*q=b+16,*e=b+n;
     for(int i=0;i<V;i++){ if(q+4>e) break; memcpy(&tl[i],q,4); t[i]=q+4; q+=4+tl[i]; }
     q+=4*256; unsigned u[256]; d_b2u(u);
-    snprintf(p,sizeof p,"%s\\tokenizer.json",dir); FILE*f=fopen(p,"wb"); if(!f){ free(t); free(tl); free(b); return 0; }
+    snprintf(p,sizeof p,"%s" PSEP "tokenizer.json",dir); FILE*f=fopen(p,"wb"); if(!f){ free(t); free(tl); free(b); return 0; }
     fprintf(f,"{\n  \"version\": \"1.0\",\n  \"truncation\": null,\n  \"padding\": null,\n  \"added_tokens\": [\n    {\n      \"id\": %d,\n"
               "      \"content\": \"<|endoftext|>\",\n      \"single_word\": false,\n      \"lstrip\": false,\n      \"rstrip\": false,\n"
               "      \"normalized\": false,\n      \"special\": true\n    }\n  ],\n  \"normalizer\": null,\n"
@@ -582,7 +705,7 @@ static int cmd_data_tokenizer(int argc,char**argv){
     char out[1200],p[1200]; data_outdir(argv[3],out,sizeof out); DFiles fl;
     int V=argc>5?atoi(argv[5]):16384; double mb=argc>6?atof(argv[6]):300; int maxd=argc>7?atoi(argv[7]):0;
     if(V<512||V>65535){ fprintf(stderr,"[tokenizer] vocab must be 512..65535 (tokens are stored as uint16)\n"); return 1; }
-    snprintf(p,sizeof p,"%s\\tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer] %s already has a tokenizer - pick a new name\n",out); return 1; }
+    snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer] %s already has a tokenizer - pick a new name\n",out); return 1; }
     if(!d_inputs(argv[4],&fl)) return 1;
     static DTr x; memset(&x,0,sizeof x); x.budget=(long long)(mb*1e6); x.fi=-1; x.nf=fl.n;
     DWORD t0=GetTickCount(); g_dbad=0;
@@ -640,10 +763,10 @@ static int cmd_data_tokenizer(int argc,char**argv){
     fclose(f);
     d_tokjson(out);
     d_template(out);
-    snprintf(p,sizeof p,"%s\\meta.json",out); f=fopen(p,"wb");
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",out); f=fopen(p,"wb");
     fprintf(f,"{\n  \"vocab_size\": %d,\n  \"eot_id\": 0,\n  \"built_by\": \"cudalm data tokenizer\",\n  \"sample_bytes\": %lld,\n  \"inputs\": [",V,x.used);
     jesc(f,argv[4]); fprintf(f,"]\n}\n"); fclose(f);
-    DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s\\canon.bin",out); d_canon(t,p);
+    DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s" PSEP "canon.bin",out); d_canon(t,p);
     printf("[tokenizer] %s: V=%d (%d merges%s), %.1f s\n",out,V,m,V<Vwant?" - ran out of pairs seen twice":"",(GetTickCount()-t0)/1000.0);
     return 0; }
 
@@ -653,7 +776,7 @@ static int cmd_data_tokfrom(int argc,char**argv){
     char mp[1024],out[1200],p[1200]; model_path(argv[3],mp,sizeof mp); if(!d_exists(mp)) snprintf(mp,sizeof mp,"%s",argv[3]);
     if(!d_exists(mp)){ fprintf(stderr,"[tokenizer-from] no model %s\n",argv[3]); return 1; }
     data_outdir(argv[4],out,sizeof out);
-    snprintf(p,sizeof p,"%s\\tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer-from] %s already has a tokenizer - pick a new name\n",out); return 1; }
+    snprintf(p,sizeof p,"%s" PSEP "tokenizer.bin",out); if(d_exists(p)){ fprintf(stderr,"[tokenizer-from] %s already has a tokenizer - pick a new name\n",out); return 1; }
     Cfg c; Tok*tk=NULL; float*P=model_load_full(mp,&c,&tk); free(P);
     if(!tk||!g_tokblob){ fprintf(stderr,"[tokenizer-from] %s has no tokenizer (untrained?)\n",mp); return 1; }
     if(!CreateDirectoryA(out,NULL)&&!d_isdir(out)){ fprintf(stderr,"[tokenizer-from] cannot create %s\n",out); return 1; }
@@ -661,18 +784,26 @@ static int cmd_data_tokfrom(int argc,char**argv){
     fclose(f);
     if(!d_tokjson(out)) return 1;
     d_template(out);
-    snprintf(p,sizeof p,"%s\\meta.json",out); f=fopen(p,"wb");
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",out); f=fopen(p,"wb");
     if(f){ fprintf(f,"{\n  \"vocab_size\": %d,\n  \"eot_id\": %d,\n  \"built_by\": \"cudalm data tokenizer-from\",\n  \"model\": ",tk->V,tk->eot); jesc(f,mp); fprintf(f,"\n}\n"); fclose(f); }
-    DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s\\canon.bin",out); d_canon(t,p);
+    DTok*t=dtok_load(out); snprintf(p,sizeof p,"%s" PSEP "canon.bin",out); d_canon(t,p);
     printf("[tokenizer-from] %s -> %s: V=%d, %d merges, eot %d\n",mp,out,tk->V,tk->nmerges,tk->eot); return 0; }
 
 /* ---------------- mix: weighted blend of corpora (doc-level, shuffled) ---------------- */
+#ifdef _WIN32
 typedef struct { HANDLE f,m; const uint16_t*p; size_t n,nb; } DMap;
 static int dmap(DMap*d,const char*path){ memset(d,0,sizeof *d);
     d->f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,NULL); if(d->f==INVALID_HANDLE_VALUE){ d->f=NULL; return 0; }
     LARGE_INTEGER s; GetFileSizeEx(d->f,&s); d->nb=(size_t)s.QuadPart; d->n=d->nb/2; if(!d->nb) return 1;
     d->m=CreateFileMappingA(d->f,NULL,PAGE_READONLY,0,0,NULL); d->p=d->m?(const uint16_t*)MapViewOfFile(d->m,FILE_MAP_READ,0,0,0):NULL; return d->p!=NULL; }
 static void dunmap(DMap*d){ if(d->p) UnmapViewOfFile(d->p); if(d->m) CloseHandle(d->m); if(d->f) CloseHandle(d->f); memset(d,0,sizeof *d); }
+#else
+typedef struct { int f; const uint16_t*p; size_t n,nb; } DMap;
+static int dmap(DMap*d,const char*path){ memset(d,0,sizeof *d); d->f=open(path,O_RDONLY); if(d->f<0){ d->f=0; return 0; }
+    struct stat s; fstat(d->f,&s); d->nb=(size_t)s.st_size; d->n=d->nb/2; if(!d->nb) return 1;
+    void*m=mmap(NULL,d->nb,PROT_READ,MAP_SHARED,d->f,0); if(m==MAP_FAILED) return 0; madvise(m,d->nb,MADV_SEQUENTIAL); d->p=(const uint16_t*)m; return 1; }
+static void dunmap(DMap*d){ if(d->p) munmap((void*)d->p,d->nb); if(d->f) close(d->f); memset(d,0,sizeof *d); }
+#endif
 typedef struct { uint64_t s; uint32_t n; } DSpan;
 static DSpan* d_docs(const DMap*m,int eot,size_t*nd){         /* doc spans (each ends in eot) */
     size_t cap=1<<16,n=0,s=0; DSpan*d=(DSpan*)malloc(sizeof(DSpan)*cap);
@@ -685,7 +816,7 @@ static int cmd_data_mix(int argc,char**argv){
     if(argc<9||(argc-7)%2){ fprintf(stderr,"usage: cudalm data mix <out> <train_tokens|0> <max_repeat> <val_tokens> <corpus> <weight> [<corpus> <weight> ...]\n"
         "  train_tokens 0 = as many as the weights allow without exceeding max_repeat on any corpus\n"); return 1; }
     char out[1200],p[1200]; data_outdir(argv[3],out,sizeof out);
-    snprintf(p,sizeof p,"%s\\train.bin",out); if(d_exists(p)){ fprintf(stderr,"[mix] %s already holds a corpus - pick a new name\n",out); return 1; }
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",out); if(d_exists(p)){ fprintf(stderr,"[mix] %s already holds a corpus - pick a new name\n",out); return 1; }
     double total=d_count(argv[4]), rep=atof(argv[5]), vtok=d_count(argv[6]); if(rep<=0) rep=1;
     if(total<0||vtok<0){ fprintf(stderr,"[mix] train/val tokens must be numbers (suffixes k M B allowed)\n"); return 1; }
     int ns=(argc-7)/2; if(ns>16){ fprintf(stderr,"[mix] at most 16 corpora\n"); return 1; }
@@ -693,9 +824,9 @@ static int cmd_data_mix(int argc,char**argv){
     for(int i=0;i<ns;i++){ data_resolve(argv[7+2*i],dir[i],sizeof dir[i]); w[i]=atof(argv[8+2*i]); ws+=w[i];
         DTok*t=dtok_load(dir[i]); if(!t) return 1;
         if(!t0) t0=t; else if(t->blen!=t0->blen||memcmp(t->blob,t0->blob,t->blen)){ fprintf(stderr,"[mix] REFUSED: %s uses a different tokenizer than %s\n",dir[i],dir[0]); return 1; }
-        snprintf(p,sizeof p,"%s\\train.bin",dir[i]); if(!dmap(&tr[i],p)||!tr[i].n){ fprintf(stderr,"[mix] no train.bin in %s\n",dir[i]); return 1; }
-        snprintf(p,sizeof p,"%s\\val.bin",dir[i]); dmap(&va[i],p);
-        snprintf(p,sizeof p,"%s\\train.w",dir[i]); if(dmap(&tw[i],p)){ if(tw[i].nb!=tr[i].n){ fprintf(stderr,"[mix] %s: train.w is not one byte per token\n",dir[i]); return 1; } anyw=1; }
+        snprintf(p,sizeof p,"%s" PSEP "train.bin",dir[i]); if(!dmap(&tr[i],p)||!tr[i].n){ fprintf(stderr,"[mix] no train.bin in %s\n",dir[i]); return 1; }
+        snprintf(p,sizeof p,"%s" PSEP "val.bin",dir[i]); dmap(&va[i],p);
+        snprintf(p,sizeof p,"%s" PSEP "train.w",dir[i]); if(dmap(&tw[i],p)){ if(tw[i].nb!=tr[i].n){ fprintf(stderr,"[mix] %s: train.w is not one byte per token\n",dir[i]); return 1; } anyw=1; }
         dd[i]=d_docs(&tr[i],t0->eot,&nd[i]);
         printf("[mix] %-24s %10.1fM tok %9zu docs  weight %g\n",d_base(dir[i]),tr[i].n/1e6,nd[i],w[i]); fflush(stdout); }
     if(ws<=0){ fprintf(stderr,"[mix] weights must be > 0\n"); return 1; }
@@ -712,8 +843,8 @@ static int cmd_data_mix(int argc,char**argv){
     for(size_t a=n?n-1:0;a>0;a--){ size_t b=d_rnd()%(a+1); uint64_t x=sel[a]; sel[a]=sel[b]; sel[b]=x; }
     if(!CreateDirectoryA(out,NULL)&&!d_isdir(out)){ fprintf(stderr,"[mix] cannot create %s\n",out); return 1; }
     const char*cp[]={"tokenizer.bin","tokenizer.json","template.txt","canon.bin"}; for(int i=0;i<4;i++) d_copy(dir[0],out,cp[i]); d_template(out);
-    snprintf(p,sizeof p,"%s\\train.bin",out); FILE*ft=fopen(p,"wb"); snprintf(p,sizeof p,"%s\\val.bin",out); FILE*fv=fopen(p,"wb");
-    FILE*fw=NULL; static int8_t one[65536]; if(anyw){ snprintf(p,sizeof p,"%s\\train.w",out); fw=fopen(p,"wb"); memset(one,32,sizeof one); }
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",out); FILE*ft=fopen(p,"wb"); snprintf(p,sizeof p,"%s" PSEP "val.bin",out); FILE*fv=fopen(p,"wb");
+    FILE*fw=NULL; static int8_t one[65536]; if(anyw){ snprintf(p,sizeof p,"%s" PSEP "train.w",out); fw=fopen(p,"wb"); memset(one,32,sizeof one); }
     long long ntr=0,nva=0; DWORD t0s=GetTickCount(),tl=t0s;
     for(size_t k=0;k<n;k++){ int i=(int)(sel[k]>>40); DSpan*s=&dd[i][sel[k]&0xFFFFFFFFFFull]; fwrite(tr[i].p+s->s,2,s->n,ft); ntr+=s->n;
         if(fw){ if(tw[i].p) fwrite((const int8_t*)tw[i].p+s->s,1,s->n,fw); else for(size_t q=0;q<s->n;q+=sizeof one) fwrite(one,1,s->n-q<sizeof one?s->n-q:sizeof one,fw); }
@@ -723,7 +854,7 @@ static int cmd_data_mix(int argc,char**argv){
         for(size_t j=0;j<va[i].n && vgot[i]<want;j++) if(va[i].p[j]==t0->eot){ fwrite(va[i].p+s,2,j+1-s,fv); vgot[i]+=j+1-s; s=j+1; }
         nva+=(long long)vgot[i]; }
     fclose(ft); fclose(fv); if(fw){ fclose(fw); printf("[mix] wrote train.w (per-token weights; 1.0 for corpora without one)\n"); }
-    snprintf(p,sizeof p,"%s\\meta.json",out); FILE*f=fopen(p,"wb"); const char*nm=d_base(out);
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",out); FILE*f=fopen(p,"wb"); const char*nm=d_base(out);
     fprintf(f,"{\n  \"profile\": "); jesc(f,nm);
     fprintf(f,",\n  \"vocab_size\": %d,\n  \"eot_id\": %d,\n  \"total_tokens\": %lld,\n  \"train_tokens\": %lld,\n  \"val_tokens\": %lld,\n  \"max_repeat\": %g,\n"
               "  \"built_by\": \"cudalm data mix\",\n  \"categories\": {\n",t0->V,t0->eot,ntr+nva,ntr,nva,rep);
@@ -747,13 +878,13 @@ static int u32cmp(const void*a,const void*b){ uint32_t x=*(const uint32_t*)a,y=*
 static int cmd_data_info(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm data info <corpus|tokenizer dir>\n"); return 1; }
     char dir[1200],p[1200]; data_resolve(argv[3],dir,sizeof dir); DTok*t=dtok_load(dir); if(!t) return 1;
-    snprintf(p,sizeof p,"%s\\template.txt",dir); size_t tl; char*tp=(char*)read_file(p,&tl);
-    snprintf(p,sizeof p,"%s\\canon.bin",dir); long long cs=d_fsize(p);
+    snprintf(p,sizeof p,"%s" PSEP "template.txt",dir); size_t tl; char*tp=(char*)read_file(p,&tl);
+    snprintf(p,sizeof p,"%s" PSEP "canon.bin",dir); long long cs=d_fsize(p);
     printf("\x1b[1m%s\x1b[0m\n  tokenizer  V=%d  eot=%d  merges=%d  template=%.*s  canon.bin %s\n",dir,t->V,t->eot,t->nm,tp?(int)(tl>16?16:tl):4,tp?tp:"none",
            cs==2LL*t->V?"yes":cs>0?"WRONG SIZE":"no");
     { int lo=1,li=0; for(int i=0;i<t->V;i++) if(t->tk->declen[i]>lo){ lo=t->tk->declen[i]; li=i; }
       printf("  longest token #%d (%d bytes): \"%.*s\"\n",li,lo,lo>60?60:lo,(const char*)t->tk->dec[li]); }
-    snprintf(p,sizeof p,"%s\\meta.json",dir); size_t ml; char*mj=(char*)read_file(p,&ml);
+    snprintf(p,sizeof p,"%s" PSEP "meta.json",dir); size_t ml; char*mj=(char*)read_file(p,&ml);
     if(mj){ mj=(char*)realloc(mj,ml+1); mj[ml]=0; const char*v=jget(mj,"categories");
         if(v&&jfirst(v)){ printf("  categories (meta.json):\n");
             for(const char*k=jfirst(v);k&&*k=='"';k=jobj_next(k)){ const char*o=jobj_val(k); if(!o) break; DBuf nm={0}; jdec(k,&nm);
@@ -761,7 +892,7 @@ static int cmd_data_info(int argc,char**argv){
                 printf("    %-28s %10.1fM tok",nm.p,x?_atoi64(x)/1e6:0.0); if(d) printf(" %9lld docs",_atoi64(d)); if(pc) printf("  %5.1f%%",atof(pc)); printf("\n"); free(nm.p); } }
         v=jget(mj,"history"); if(v) for(const char*e=jfirst(v);e;e=jnext(e)){ DBuf h={0}; jdec(e,&h); printf("  history: %s\n",h.p?h.p:""); free(h.p); }
         free(mj); }
-    for(int f=0;f<2;f++){ DMap m; snprintf(p,sizeof p,"%s\\%s",dir,f?"val.bin":"train.bin"); if(!dmap(&m,p)){ if(!f) printf("  (no train.bin - a tokenizer-only folder)\n"); continue; }
+    for(int f=0;f<2;f++){ DMap m; snprintf(p,sizeof p,"%s" PSEP "%s",dir,f?"val.bin":"train.bin"); if(!dmap(&m,p)){ if(!f) printf("  (no train.bin - a tokenizer-only folder)\n"); continue; }
         size_t nd=0; DSpan*d=d_docs(&m,t->eot,&nd); size_t bad=0; uint16_t mx=0; for(size_t i=0;i<m.n;i++){ if(m.p[i]>=t->V) bad++; if(m.p[i]>mx) mx=m.p[i]; }
         uint32_t*l=(uint32_t*)malloc(4*(nd?nd:1)); for(size_t i=0;i<nd;i++) l[i]=d[i].n; qsort(l,nd,4,u32cmp);
         printf("  %s  %10.2fM tok  %9zu docs  doc len mean %.0f p50 %u p90 %u max %u  | max id %u%s\n",f?"val.bin  ":"train.bin",m.n/1e6,nd,
@@ -774,6 +905,17 @@ static int cmd_data_info(int argc,char**argv){
 
 /* ---------------- hf: browse Hugging Face datasets (search, splits, first rows) over WinINet, loaded at run time ---------------- */
 static int d_http(const char*url,DBuf*o){          /* GET -> o (NUL-terminated); returns the HTTP status, 0 = no connection */
+#ifndef _WIN32
+    /* curl; HF_TOKEN goes in a private header file, never on the command line */
+    o->n=0; db_s(o,""); char d[]="/tmp/cudalm_httpXXXXXX"; if(!mkdtemp(d)) return 0;
+    char hp[64],bp[64],cl[3000],u[2048]; snprintf(hp,64,"%s/h",d); snprintf(bp,64,"%s/b",d);
+    const char*tk=getenv("HF_TOKEN"); FILE*h=fopen(hp,"wb"); if(h){ if(tk&&*tk) fprintf(h,"Authorization: Bearer %s\n",tk); fclose(h); chmod(hp,0600); }
+    size_t k=0; for(const char*c=url;*c&&k+5<sizeof u;c++){ if(*c=='\'') k+=snprintf(u+k,sizeof u-k,"'\\''"); else u[k++]=*c; } u[k]=0;
+    snprintf(cl,sizeof cl,"curl -sL -A cudalm -H @%s -o %s -w '%%{http_code}' '%s' 2>/dev/null",hp,bp,u);
+    int st=0; FILE*p=popen(cl,"r"); if(p){ if(fscanf(p,"%d",&st)!=1) st=0; pclose(p); }
+    size_t n; char*b=(char*)read_file(bp,&n); if(b){ db_put(o,b,n); free(b); }
+    remove(hp); remove(bp); rmdir(d); return st;
+#else
     static HMODULE m; static FARPROC f[5]; static const char*fn[5]={"InternetOpenA","InternetOpenUrlA","InternetReadFile","InternetCloseHandle","HttpQueryInfoA"};
     if(!m){ if(!(m=LoadLibraryA("wininet.dll"))) return 0; for(int i=0;i<5;i++) if(!(f[i]=GetProcAddress(m,fn[i]))) return 0; }
     typedef void*(WINAPI*Op)(const char*,DWORD,const char*,const char*,DWORD); typedef void*(WINAPI*Ou)(void*,const char*,const char*,DWORD,DWORD,DWORD_PTR);
@@ -784,7 +926,9 @@ static int d_http(const char*url,DBuf*o){          /* GET -> o (NUL-terminated);
     DWORD st=0,sl=sizeof st; char b[16384]; DWORD n;
     if(r){ ((Qi)f[4])(r,19|0x20000000u,&st,&sl,NULL);                                       /* STATUS_CODE | FLAG_NUMBER */
         while(((Rd)f[2])(r,b,sizeof b,&n)&&n) db_put(o,b,n); ((Cl)f[3])(r); }
-    ((Cl)f[3])(ss); return (int)st; }
+    ((Cl)f[3])(ss); return (int)st;
+#endif
+}
 static void d_urlenc(const char*s,char*o,size_t cap){ size_t n=0;
     for(;*s&&n+4<cap;s++){ unsigned char c=(unsigned char)*s; if(isalnum(c)||strchr("-_.~/",c)) o[n++]=c; else n+=snprintf(o+n,cap-n,"%%%02X",c); } o[n]=0; }
 static const char* d_hb2(double b,char*o){ if(b>=1e9) sprintf(o,"%.1f GB",b/1e9); else if(b>=1e6) sprintf(o,"%.0f MB",b/1e6); else sprintf(o,"%.0f KB",b/1e3); return o; }
@@ -893,10 +1037,14 @@ static int d_peek(const char*src,DBuf*rj,char*err,size_t ecap){   /* first rows 
             int k=hf_default(h,n); if(!cfg[0]) snprintf(cfg,sizeof cfg,"%s",h[k].cfg); if(!sp[0]) snprintf(sp,sizeof sp,"%s",h[k].split); }
         int st=hf_rows(s,cfg,sp,rj); if(st==200) return 1; d_jstr(jget(rj->p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,st?"HTTP %d":"no connection",st); return 0; }
     char r[1200],cl[3000]; data_resolve(src,r,sizeof r); if(!d_exists(r)){ snprintf(err,ecap,"not found: %s",src); return 0; }
+#ifdef _WIN32
     snprintf(cl,sizeof cl,"\"%s \"%s\\prep\\fetch.py\" peek \"%s\" 3 2>NUL\"",py_cmd(),exe_dir(),r);
+#else
+    snprintf(cl,sizeof cl,"%s \"%s/prep/fetch.py\" peek \"%s\" 3 2>/dev/null",py_cmd(),exe_dir(),r);
+#endif
     FILE*f=_popen(cl,"rb"); if(!f){ snprintf(err,ecap,"cannot run python (%s)",py_cmd()); return 0; }
     char b[16384]; size_t n; while((n=fread(b,1,sizeof b,f))>0) db_put(rj,b,n); _pclose(f);
-    if(jget(rj->p,"rows")) return 1; d_jstr(jget(rj->p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,"python gave no rows (%s; prep\\fetch.py present?)",py_cmd()); return 0; }
+    if(jget(rj->p,"rows")) return 1; d_jstr(jget(rj->p,"error"),err,ecap); if(!err[0]) snprintf(err,ecap,"python gave no rows (%s; prep" PSEP "fetch.py present?)",py_cmd()); return 0; }
 static void d_peek_print(const char*rj,const char*tpl,int maxr){
     const char*r0=d_row(rj,0); if(!r0){ printf("  (no rows)\n"); return; }
     char nm[64][64],kd[64]; int nc=d_cols(r0,nm,kd,64); DWs w={0}; const char*how=tpl_auto(r0);
@@ -946,20 +1094,20 @@ static int cmd_data_fetch(int argc,char**argv){
     if(argc<5){ fprintf(stderr,"usage: cudalm data fetch <profile|url|hf:user/dataset[:config[:split]]> <out> [target_tokens] [--template T]   download\n"
         "       cudalm data fetch <file|folder> <out> [category] [--template T]       convert parquet/json/jsonl\n"
         "  template: text=a+b | chat=col | user=q+ctx,assistant=a (+ system=col, tools=col); default auto-detect.\n"
-        "  Check one first: cudalm data peek <source> [template]\n  profiles: py -3 prep\\fetch.py list\n"); return 1; }
+        "  Check one first: cudalm data peek <source> [template]\n  profiles: py -3 prep" PSEP "fetch.py list\n"); return 1; }
     if(*tpl){ DTpl t; char e[200]; if(!tpl_parse(tpl,&t,e,sizeof e)){ fprintf(stderr,"[fetch] %s\n",e); return 1; } }
     char out[1200],src[1200],cl[4096]; data_outdir(argv[4],out,sizeof out); data_resolve(argv[3],src,sizeof src);
     int conv=_strnicmp(argv[3],"http",4) && _strnicmp(argv[3],"hf:",3) && (!d_bare(argv[3])||strchr(argv[3],'.')||d_isdir(src)) && d_exists(src);   /* other bare word = profile */
     char x[64]=""; if(argc>5) snprintf(x,sizeof x,"%s",argv[5]);
     if(!conv&&argc>5){ double t=d_count(argv[5]); if(t<=0){ fprintf(stderr,"[fetch] target tokens must be a number (suffixes k M B allowed)\n"); return 1; } snprintf(x,sizeof x,"%.0f",t); }
     if(*tpl&&!x[0]&&!conv) snprintf(x,sizeof x,"1000000000");
-    snprintf(cl,sizeof cl,"%s -u \"%s\\prep\\fetch.py\" %s \"%s\" \"%s\" \"%s\" \"%s\"",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x,tpl);
+    snprintf(cl,sizeof cl,"%s -u \"%s" PSEP "prep" PSEP "fetch.py\" %s \"%s\" \"%s\" \"%s\" \"%s\"",py_cmd(),exe_dir(),conv?"convert":"get",conv?src:argv[3],out,x,tpl);
     return run_cmd(cl); }
 
 static int cmd_data_canon(int argc,char**argv){
     if(argc<4){ fprintf(stderr,"usage: cudalm data canon <tokenizer|corpus dir> [out.bin]\n"); return 1; }
     char dir[1200],p[1200]; data_resolve(argv[3],dir,sizeof dir); DTok*t=dtok_load(dir); if(!t) return 1;
-    if(argc>4) snprintf(p,sizeof p,"%s",argv[4]); else snprintf(p,sizeof p,"%s\\canon.bin",dir);
+    if(argc>4) snprintf(p,sizeof p,"%s",argv[4]); else snprintf(p,sizeof p,"%s" PSEP "canon.bin",dir);
     return d_canon(t,p); }
 
 /* weights <corpus> <rows.jsonl>: train.w (int8, one per token) for a corpus encoded from those rows in order with
@@ -975,10 +1123,10 @@ static double* d_nums(const char*v,int*n){ int cap=256; double*a=(double*)malloc
 static int cmd_data_weights(int argc,char**argv){
     if(argc<5){ fprintf(stderr,"usage: cudalm data weights <corpus> <rows.jsonl>\n"); return 1; }
     char dir[1200],p[1200]; data_resolve(argv[3],dir,sizeof dir); DTok*t=dtok_load(dir); if(!t) return 1;
-    snprintf(p,sizeof p,"%s\\train.bin",dir); DMap m; if(!dmap(&m,p)||!m.n){ fprintf(stderr,"[weights] no train.bin in %s\n",dir); return 1; }
+    snprintf(p,sizeof p,"%s" PSEP "train.bin",dir); DMap m; if(!dmap(&m,p)||!m.n){ fprintf(stderr,"[weights] no train.bin in %s\n",dir); return 1; }
     size_t nd,len; DSpan*dd=d_docs(&m,t->eot,&nd); char*b=(char*)read_file(argv[4],&len); if(!b){ fprintf(stderr,"[weights] cannot read %s\n",argv[4]); return 1; }
     b=(char*)realloc(b,len+1); b[len]=0;
-    snprintf(p,sizeof p,"%s\\train.w",dir); FILE*o=fopen(p,"wb"); size_t k=0; long long pos=0,neg=0,opd=0,mis=0; int8_t buf[65536];
+    snprintf(p,sizeof p,"%s" PSEP "train.w",dir); FILE*o=fopen(p,"wb"); size_t k=0; long long pos=0,neg=0,opd=0,mis=0; int8_t buf[65536];
     for(char*l=b,*e;l<b+len;l=e+1){ e=strchr(l,'\n'); if(!e) e=b+len; *e=0; while(*l==' '||*l=='\r') l++; if(*l!='{') continue;
         if(k>=nd){ fprintf(stderr,"[weights] more rows than docs (%zu)\n",nd); return 1; }
         const char*v=jget(l,"w"),*tl=jget(l,"tl"),*tp=jget(l,"tp"),*a0v=jget(l,"a0");
@@ -1034,6 +1182,3 @@ static int cmd_data(int argc,char**argv){
         "  inputs: files or folders (.jsonl .json .txt), ';'-separated\n"
         "  data roots: %s  (CUDALM_DATA_ROOTS)\n",roots);
     return 1; }
-#else
-static const char* data_resolve(const char*n,char*o,size_t cap){ snprintf(o,cap,"%s",n); return o; }
-#endif

@@ -17,7 +17,7 @@ What it does:
      one, the x64 compiler + Windows SDK (~290 MB download) are unpacked from Microsoft's package feed into .deps/msvc
      (no install, no admin; asks you to accept the Build Tools license, or pass --accept-msvc-license).
      --install-msvc instead runs Microsoft's Build Tools installer (admin, several GB).
-     Linux uses g++ from PATH (Linux builds are untested; `cudalm data` is Windows-only).
+     Linux uses g++ from PATH (tested on Ubuntu 24.04 / WSL2).
   3. GPU series: --arch 75 / 86 / 89 / 120 (or rtx20 / rtx30 / rtx40 / rtx50), default = what nvidia-smi reports,
      else 120. It is passed to the source as -DCUDALM_ARCH, which picks that series' code paths at compile time
      (RTX 20: m16n8k8 MMA + fp32 GEMMs; RTX 30: + m16n8k16, cp.async, bf16; RTX 40/50: + FP8). The exe runs on
@@ -300,7 +300,7 @@ def main():
     if a.python_deps: run([sys.executable, "-m", "pip", "install", "-r", os.path.join(HERE, "requirements.txt")], dry=dry)
     if not dry:
         for d in ("data", "models"): os.makedirs(os.path.join(HERE, d), exist_ok=True)
-    log("done. Run it with no arguments for the menu, or `cudalm help`." if WIN else "done. Run `./cudalm help` (the menu and `cudalm data` are Windows-only).")
+    log("done. Run it with no arguments for the menu, or `cudalm help`." if WIN else "done. Run ./cudalm with no arguments for the menu, or `./cudalm help`.")
 
 def build_cpu(a, dry):
     gxx = shutil.which("g++")

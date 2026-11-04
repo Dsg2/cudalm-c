@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-11-04
 
+- README.md: document Linux build on Ubuntu 24.04/WSL2 and menu data toolchain
+- build.py: add Linux g++ testing and menu help message
+- cudalm.cu: remove Windows-only data flag and TUI condition
+- data.cuh: add POSIX file operations for Linux data toolchain
+- tui.cuh: adjust TUI condition for Linux
+
+## Unreleased - 2026-11-04
+
 - Update README.md with Linux testing info and Windows-only toolchain notes
 - Add curl-based download fallback in build.py
 - Update cudalm.cu to use lm_exists instead of d_exists for benchmark file checks
