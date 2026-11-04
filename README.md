@@ -10,8 +10,12 @@ chat benchmark, and GGUF export.
 - Everything except the optional helper tools is C/C++ in `cudalm.cu` plus a few headers. The only external library is cuBLAS.
 - No NVIDIA GPU? `python build.py --cpu` builds the same program for the CPU (OpenMP + AVX2). See [CPU build](#cpu-build).
 
-**Tested on:** Windows 11, an RTX 50-series GPU (sm_120), and CUDA 12.9. Other architectures (`--arch 89`, `86`, ...)
-and Linux should compile, but they are untested. The data tools and the console menu are Windows-only.
+**Tested on:** Windows 11, an RTX 50-series GPU (sm_120), and CUDA 12.9. RTX 30 (sm_86) and RTX 40 (sm_89) builds are
+checked on that card by compiling for those architectures and applying their feature gates (`CUDALM_SIM_SM`), not yet on
+real RTX 30/40 hardware. Linux should compile but is untested. The data tools and the console menu are Windows-only.
+
+**GPU support:** RTX 30 / 40 / 50 (sm_86 and newer). FP8 GEMMs need sm_89+, so on RTX 30 they switch off at startup
+(about 4% slower, same loss). RTX 20 and older are refused: the kernels use bf16, cp.async and m16n8k16 tensor-core MMA.
 
 ## Build
 
@@ -25,7 +29,7 @@ python build.py
 |---|---|
 | CUDA (nvcc, cudart, cccl, cuBLAS) | `--cuda DIR`, or an installed toolkit (`CUDA_PATH` / `nvcc` on PATH, ≥ 12.8 for sm_120). Otherwise it downloads NVIDIA's redistributable archives (~650 MB, sha256-checked) into `.deps/cuda-12.9.1/`. |
 | Host C++ compiler | Windows: MSVC from Visual Studio 2022 Build Tools, found via vswhere. Without Visual Studio it offers a **portable MSVC**: just the x64 compiler and Windows SDK, unpacked from Microsoft's package feed into `.deps/msvc/` (~290 MB download, ~750 MB on disk, no install, no admin). This accepts the VS Build Tools license; pass `--accept-msvc-license` to skip the prompt. `--install-msvc` runs Microsoft's full installer instead (admin, ~3 GB). Linux: `g++`. |
-| GPU arch | `--arch` if given, otherwise read from `nvidia-smi`, otherwise 120. |
+| GPU arch | `--arch` if given (`120`, `89`, `86`, a list like `86,120`, or `all` = one exe for RTX 30/40/50 plus PTX for newer GPUs; ~3x build time), otherwise read from `nvidia-smi`, otherwise 120. |
 | NVIDIA driver | Must already be installed (a driver supporting CUDA 12.9 or newer). |
 
 The result is `cudalm.exe`, with the two cuBLAS DLLs copied next to it. Other options:

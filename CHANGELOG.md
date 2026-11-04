@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-11-04
 
+- README.md: expand tested hardware and add GPU support section
+- build.py: extend --arch options and validation
+- cudalm.cu: add per-arch feature gating for lower GPUs
+
+## Unreleased - 2026-11-04
+
 - save_rename: retry MoveFileExA 10 times with Sleep(100) for NTFS
 - add d2h_write: 64 MB host buffer for save device-to-host
 - opt_save: use d2h_write for bf16 optimizer save

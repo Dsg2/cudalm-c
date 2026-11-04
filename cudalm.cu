@@ -6599,6 +6599,13 @@ static void cuda_init(void){
     size_t fr=0,tt=0; cudaMemGetInfo(&fr,&tt);
     printf("[cuda] %s | sm_%d%d | %.1f/%.1f GB free | %d SMs\n",
            pr.name,pr.major,pr.minor,fr/1e9,tt/1e9,pr.multiProcessorCount);
+#ifndef CUDALM_CPU
+    { /* per-arch gating; CUDALM_SIM_SM=86|89 applies a lower card's gates (fallback testing) */
+      int cc=pr.major*10+pr.minor; const char*e=getenv("CUDALM_SIM_SM");
+      if(e&&atoi(e)>0&&atoi(e)<cc){ cc=atoi(e); printf("[cuda] CUDALM_SIM_SM: gating as sm_%d\n",cc); }
+      if(cc<86){ fprintf(stderr,"[cuda] sm_%d%d is not supported: this build needs RTX 30 (sm_86) or newer\n",pr.major,pr.minor); exit(1); }
+      if(cc<89&&(g_fp8gemm||g_moef8)){ g_fp8gemm=g_moef8=0; printf("[cuda] FP8 GEMMs off: need sm_89+ (RTX 40/50)\n"); } }
+#endif
     g_tdr=tdr_budget_s();
     { const char*e=getenv("CUDALM_ATTN_CHUNK"); if(e){ int v=atoi(e); if(v>=8) g_attn_chunk=v; } }
 #if defined(_WIN32) && !defined(CUDALM_CPU)
@@ -6812,6 +6819,7 @@ static const EnvReg g_envreg[]={
  {"CUDALM_MOE_GPERM","1","perf","MoE permutation on the GPU",0},
  {"CUDALM_MOE_MERGE","1","perf","top-2 passes as one grouped pass",0},
  {"CUDALM_FA_CP","1","perf","cp.async prefetch in FA2 attention",0},
+ {"CUDALM_SIM_SM","0","perf","gate features as a lower card (86 = RTX 30, 89 = RTX 40)",0},
  {"CUDALM_CH_ROWS","2048","perf","head row chunk (>= 2048)",0},
  {"CUDALM_LRS_KEEP","1","optim","LRS keeps the x1.0 arm instead of retraining it",0},
  {"CUDALM_MAX_SECONDS","","per-run","clean stop after N seconds",1},

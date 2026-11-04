@@ -18,7 +18,8 @@ What it does:
      (no install, no admin; asks you to accept the Build Tools license, or pass --accept-msvc-license).
      --install-msvc instead runs Microsoft's Build Tools installer (admin, several GB).
      Linux uses g++ from PATH (Linux builds are untested; `cudalm data` is Windows-only).
-  3. GPU arch: --arch (e.g. 120 / 89 / 86), default = what nvidia-smi reports, else 120. Only sm_120 is tested.
+  3. GPU arch: --arch 120 / 89 / 86, a list (86,120), or "all" (RTX 30/40/50 in one exe + PTX for newer GPUs);
+     default = what nvidia-smi reports, else 120. sm_86 (RTX 30) is the minimum.
   4. nvcc -O3 ... -> cudalm(.exe); on Windows the cuBLAS DLLs are copied next to the exe.
 """
 import argparse, glob, hashlib, json, os, platform, re, shutil, subprocess, sys, tarfile, urllib.parse, urllib.request, zipfile
@@ -236,7 +237,7 @@ def main():
     ap.add_argument("--cuda", help="use this CUDA toolkit folder (bin/nvcc, include, lib)")
     ap.add_argument("--cuda-version", default="12.9.1", help="redist version to download (default 12.9.1)")
     ap.add_argument("--download-cuda", action="store_true", help="download CUDA even if one is installed")
-    ap.add_argument("--arch", default="auto", help="GPU arch, e.g. 120 (RTX 50xx), 89 (RTX 40xx); default: detect")
+    ap.add_argument("--arch", default="auto", help="GPU arch: 120 (RTX 50), 89 (RTX 40), 86 (RTX 30), a list like 86,120, or all; default: detect")
     ap.add_argument("--out", default="cudalm", help="exe name (default cudalm)")
     ap.add_argument("--tools", action="store_true", help="also build judge and teachgen (bench/, teach/)")
     ap.add_argument("--python-deps", action="store_true", help="pip install requirements.txt")
@@ -252,8 +253,12 @@ def main():
     arch = a.arch if a.arch != "auto" else (det or "120")
     if a.arch == "auto": log(f"GPU arch sm_{arch}" + ("" if det else " (default)"))
     if not det: log("warning: no NVIDIA GPU found (nvidia-smi) -- cudalm will build but needs an NVIDIA GPU + driver to run")
-    if arch != "120": log(f"note: only sm_120 has been tested; sm_{arch} builds are best effort")
-    need = (12, 8) if int(arch) >= 120 else (12, 0)
+    archs = ["86", "89", "120"] if arch == "all" else [x.strip() for x in arch.split(",")]
+    if not all(x.isdigit() for x in archs): die(f"bad --arch {arch}")
+    if min(map(int, archs)) < 86: die("sm_86 (RTX 30) or newer is required: the kernels use bf16, cp.async and m16n8k16 tensor-core MMA")
+    need = (12, 8) if max(map(int, archs)) >= 120 else (12, 0)
+    top = max(archs, key=int)
+    gencode = [f"-gencode=arch=compute_{x},code=sm_{x}" for x in archs] + [f"-gencode=arch=compute_{top},code=compute_{top}"]
 
     # host compiler first, so a missing MSVC fails before the CUDA download
     env = msvc_env(a, dry) if WIN else dict(os.environ)
@@ -271,10 +276,10 @@ def main():
     nvcc = os.path.join(cuda, "bin", "nvcc.exe" if WIN else "nvcc")
     exe = os.path.join(HERE, a.out + (".exe" if WIN else ""))
     lib = os.path.join(cuda, "lib", "x64") if WIN else os.path.join(cuda, "lib64" if os.path.isdir(os.path.join(cuda, "lib64")) else "lib")
-    cmd = [nvcc, "-O3", f"-arch=sm_{arch}", "-diag-suppress", "177,221,550", "-cudart", "static", "-I" + os.path.join(cuda, "include"), "-L" + lib,
+    cmd = [nvcc, "-O3", *gencode, "-diag-suppress", "177,221,550", "-cudart", "static", "-I" + os.path.join(cuda, "include"), "-L" + lib,
            "-o", exe, os.path.join(HERE, "cudalm.cu"), "-lcublas", "-lcublasLt"]
     cmd += ["-allow-unsupported-compiler", "-ladvapi32"] if WIN else ["-Xlinker", "-rpath=" + lib]
-    log("compiling cudalm (a few minutes)")
+    log(f"compiling cudalm for sm_{', sm_'.join(archs)} (a few minutes per arch)")
     if run(cmd, env=env, dry=dry, cwd=HERE): die("nvcc failed (see the messages above)")
     if WIN and not dry:
         for f in os.listdir(os.path.join(cuda, "bin")):
