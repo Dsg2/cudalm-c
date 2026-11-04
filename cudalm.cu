@@ -7967,9 +7967,9 @@ static void lmeval_core(const char*tag,const float*P,const Off*o,GA*a,int*tokG,i
     if(!bd||!*bd){ snprintf(bdd,sizeof bdd,"%s" PSEP "bench",exe_dir()); bd=bdd; }
     for(char*tn=tl;*tn;){ size_t k=strcspn(tn,","); char fp[1200];       /* missing task files: download + convert once */
         snprintf(fp,sizeof fp,"%s" PSEP "%.*s.tsv",bd,(int)k,tn);
-        if(!strstr(fp+strlen(bd),".tsv.tsv") && !d_exists(fp)){ char sp[1200],cl[3000];
+        if(!strstr(fp+strlen(bd),".tsv.tsv") && !lm_exists(fp)){ char sp[1200],cl[3000];
             snprintf(sp,sizeof sp,"%s" PSEP "bench" PSEP "lmeval_prep.py",exe_dir());
-            if(!d_exists(sp)) snprintf(sp,sizeof sp,"%s" PSEP "lmeval_prep.py",exe_dir());
+            if(!lm_exists(sp)) snprintf(sp,sizeof sp,"%s" PSEP "lmeval_prep.py",exe_dir());
             snprintf(cl,sizeof cl,"%s -u \"%s\" \"%s\"",py_cmd(),sp,bd);
             printf("[lmeval] %s missing - fetching the benchmark files\n",fp); fflush(stdout);
             if(run_cmd(cl)) fprintf(stderr,"[lmeval] lmeval_prep.py failed (needs python + pyarrow; CUDALM_PYTHON picks the interpreter)\n");
@@ -9616,7 +9616,7 @@ static void grow_sidecars(const char*in,const char*out,const int*src,const int*i
     snprintf(a,sizeof a,"%s.opt.fe",in); snprintf(b,sizeof b,"%s.opt.fe",out);
     if(lm_copyfile(a,b)) printf("[grow] factorized embedding %s -> %s\n",a,b);
     snprintf(a,sizeof a,"%s.opt.x1",in);
-    if(d_exists(a)) printf("[grow] note: %s (canon/shared side params) is not carried over\n",a);
+    if(lm_exists(a)) printf("[grow] note: %s (canon/shared side params) is not carried over\n",a);
 }
 static int cmd_grow(int argc,char**argv){
     if(argc<4){ fprintf(stderr,
@@ -10755,6 +10755,8 @@ int main(int argc,char**argv){
     if(argc>2 && strcmp(argv[1],"new") && strcmp(argv[1],"bench") && strcmp(argv[1],"data")) side_apply(argv[2]);   /* before any env is read */
 #ifdef _WIN32
     if(argc>1 && !strcmp(argv[1],"data")) return cmd_data(argc,argv);
+#else
+    if(argc>1 && !strcmp(argv[1],"data")){ fprintf(stderr,"cudalm data is Windows-only: prepare the data on Windows and copy the folder over (the files are the same on Linux)\n"); return 1; }
 #endif
     if(argc>3 && (!strcmp(argv[1],"train") || !strcmp(argv[1],"eval"))){ static char dd[1200]; argv[3]=(char*)data_resolve(argv[3],dd,sizeof dd); }
     /* CUDALM_SEED pins the batch order so two runs see identical data -- the only

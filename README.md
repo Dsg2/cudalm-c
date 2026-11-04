@@ -12,7 +12,12 @@ chat benchmark, and GGUF export.
 
 **Tested on:** Windows 11, an RTX 50-series GPU (sm_120), and CUDA 12.9. The RTX 20/30/40 builds are checked on that
 card: each series' build runs there through its PTX, with exactly that series' code paths. They have not been run on real
-RTX 20/30/40 hardware. Linux should compile but is untested. The data tools and the console menu are Windows-only.
+RTX 20/30/40 hardware.
+
+**Linux:** tested on Ubuntu 24.04 (WSL2, g++ 13) with the same GPU: `python3 build.py` (needs `build-essential`)
+gives `./cudalm`; selftest, `lmeval` (identical scores to Windows), training, resume and `run` all work, and training
+is ~2% faster than on Windows (no WDDM watchdog syncs). The data toolchain (`cudalm data`) and the console menu are
+Windows-only: prepare data on Windows and copy the folder over (the files are the same).
 
 **GPU support:** RTX 20, 30, 40 and 50. `build.py --arch` picks the series, and the source compiles only that series'
 paths (`CUDALM_ARCH`; nothing is switched at run time):

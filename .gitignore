@@ -3,6 +3,8 @@ data/
 models/
 bench/judge/
 *.exe
+/cudalm
+/cudalm_cpu
 *.dll
 *.obj
 *.exp

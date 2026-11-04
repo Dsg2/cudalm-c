@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-11-04
 
+- Update README.md with Linux testing info and Windows-only toolchain notes
+- Add curl-based download fallback in build.py
+- Update cudalm.cu to use lm_exists instead of d_exists for benchmark file checks
+- Add Windows-only data toolchain guard in cudalm.cu
+
+## Unreleased - 2026-11-04
+
 - README.md: replace tested-on and GPU support sections with Windows 11, RTX 50 (sm_120) and CUDA 12.9 baseline; add RTX 20/30/40/50 build table for --arch options
 - build.py: change --arch flag help text and validation logic to accept RTX series (75/86/89/120) instead of only 120/89/86
 - cudalm.cu: add CUDALM_ARCH compile-time path selection via -DCUDALM_ARCH; conditionally include cp.async and bf16 GEMMs for RTX 30/40/50

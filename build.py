@@ -50,6 +50,10 @@ def fetch(url, dst, sha=None, dry=False):
     if dry: log("would download", url); return dst
     log("downloading", url)
     tmp = dst + ".part"
+    curl = shutil.which("curl")     # urllib can crawl at ~70 KB/s on long CDN transfers where curl does not
+    if curl and not subprocess.run([curl, "-fL", "--retry", "5", "--connect-timeout", "30", "-o", tmp, url]).returncode:
+        if sha and sha256(tmp) != sha: os.remove(tmp); die(f"checksum mismatch for {url}")
+        os.replace(tmp, dst); return dst
     for attempt in range(5):
         try:
             with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
@@ -296,7 +300,7 @@ def main():
     if a.python_deps: run([sys.executable, "-m", "pip", "install", "-r", os.path.join(HERE, "requirements.txt")], dry=dry)
     if not dry:
         for d in ("data", "models"): os.makedirs(os.path.join(HERE, d), exist_ok=True)
-    log("done. Run it with no arguments for the menu, or `cudalm help`.")
+    log("done. Run it with no arguments for the menu, or `cudalm help`." if WIN else "done. Run `./cudalm help` (the menu and `cudalm data` are Windows-only).")
 
 def build_cpu(a, dry):
     gxx = shutil.which("g++")
