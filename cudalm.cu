@@ -8341,7 +8341,8 @@ static void cmd_train(int argc,char**argv){
     }
     rope_tables(&c);
     GA*a=ga_new(N,1); a->tr=1; int*tokG=(int*)dmalloc((size_t)N*4),*tgtG=(int*)dmalloc((size_t)N*4);
-    g_tb=TbCtx{P,&o,a,tokG,tgtG,N,mtk?mtk:dtk};
+    { const char*e=getenv("CUDALM_BENCH_EVERY");   /* a fresh model has no tokenizer; dtk can't encode (no rank[]) */
+      g_tb=TbCtx{P,&o,a,tokG,tgtG,N,mtk?mtk:(e?atoi(e):10000)>0?tok_parse(tok_blob,tlz,1):dtk}; }
     /* tok/tgt double-buffered in pinned memory so the upload is async and the
      * host builds batch n+1 while step n runs; upev[b] guards reuse of buffer b */
     int*tokb,*tgtb; cudaEvent_t upev[2];

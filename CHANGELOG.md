@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-11-16
+
+- cudalm.cu: modify g_tb initialization in cmd_train to use env var
+- If CUDALM_BENCH_EVERY is set, parse its value as tokenizer rank
+- Otherwise fall back to default dtk tokenizer
+- Change adds 1 line and adjusts tokenizer selection logic
+
 ## Unreleased - 2026-11-04
 
 - README.md: document Linux build on Ubuntu 24.04/WSL2 and menu data toolchain
