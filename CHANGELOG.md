@@ -2,10 +2,14 @@
 
 ## Unreleased - 2026-11-16
 
-- cudalm.cu: modify g_tb initialization in cmd_train to use env var
-- If CUDALM_BENCH_EVERY is set, parse its value as tokenizer rank
-- Otherwise fall back to default dtk tokenizer
-- Change adds 1 line and adjusts tokenizer selection logic
+- CHANGELOG.md: update Unreleased entry to document tokenizer fix
+- CHANGELOG.md: replace old tokenizer selection logic with full tokenizer for bench
+
+## Unreleased - 2026-11-16
+
+- cudalm.cu: fix crash (access violation) at the first in-process bench of a freshly created model. A new model
+  file has no tokenizer, so train handed the bench the data tokenizer parsed without its encode tables; it now
+  parses a full tokenizer for the bench when benches are on (CUDALM_BENCH_EVERY > 0, the default).
 
 ## Unreleased - 2026-11-04
 
