@@ -2,10 +2,6 @@
 
 ## Unreleased - 2026-11-22
 
-- Hugging Face export, lm-eval helpers, timed checkpoints, bf16 Muon momentum, monitor
-
-## Unreleased - 2026-11-22
-
 - **Hugging Face export.** `cudalm hf <name> <dir> [fp32|bf16]` writes a transformers folder with a custom `cudalm`
   architecture (`trust_remote_code`): safetensors weights, config, tokenizer + chat template, model card. Model code in
   `export/hf/`, tokenizer converter `export/tltk2hf.py`. `cudalm logits` dumps full-vocab logits (the CPU build is the
