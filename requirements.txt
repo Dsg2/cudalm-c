@@ -1,3 +1,6 @@
 pyarrow      # prep/fetch.py: parquet datasets
 numpy        # export/bin2gguf.py, prep/legacy
 tokenizers   # prep/legacy only
+safetensors  # loading the cudalm hf export (written by C); with torch + transformers below
+torch        # export/hf_check.py, export/hf_diag.py
+transformers # export/hf (5.x), export/hf_check.py, export/hf_tokcheck.py

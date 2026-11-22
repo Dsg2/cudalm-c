@@ -15,7 +15,7 @@ card: each series' build runs there through its PTX, with exactly that series' c
 RTX 20/30/40 hardware.
 
 **Linux:** tested on Ubuntu 24.04 (WSL2, g++ 13) with the same GPU: `python3 build.py` (needs `build-essential`)
-gives `./cudalm`; selftest, `lmeval` (identical scores to Windows), training, resume and `run` all work, and training
+gives `./cudalm`; selftest, `lmeval` (identical scores to Windows), training, resume, `run` and `serve` all work, and training
 is ~2% faster than on Windows (no WDDM watchdog syncs). The data toolchain (`cudalm data`) and the menu work too and
 write byte-identical tokenizers, canon maps and corpora to the Windows build. Linux needs `python3` for NFKC in canon maps
 and `curl` for the Hugging Face browser; the menu sends deleted folders to the Trash with `gio trash` and refuses to
@@ -135,10 +135,13 @@ cudalm lens-tune <name> <data_dir> [steps=500] [tokens/step=8192] [T=1024]
                                                      10M model; plot with scripts/lensplot.py <out.png> <table.tsv>...
 cudalm quantize  <in> <out.bin> [q8|q4|q4n|fp16]
 cudalm gguf      <name|model.bin> [q4n|q4|q8|fp16|f32] [tinylm|llama] [out.gguf]
+cudalm hf        <name|model.bin> <dir> [fp32|bf16]   Hugging Face transformers folder (see below)
+cudalm logits    <name|model.bin> <ids.txt> <out.f32> full-vocab logits per line of token ids (CPU build = fp32 reference)
 cudalm info      <name>
 cudalm serve     <name> [port=8090]                  HTTP /completion for agentenv (continuous batching, CUDALM_SERVE_SLOTS;
                                                      "num_first":1 forces a number as the first sampled token)
                                                      and /logprob for scoring (see below)
+cudalm monitor   [--port 8091] [--bind ip] [--token-file f]  read-only HTTP view of training runs: dashboard at /, JSON under /api/ (no GPU use)
 cudalm data      <fetch|tokenizer|encode|mix|info|canon> ...
 cudalm help                                        all commands + every environment variable
 ```
@@ -212,13 +215,21 @@ cudalm train mymodel data\anneal 1
 ```
 
 **Benchmarks during training.** `CUDALM_BENCH_EVERY=N` (TUI: Train > bench every; default 10000 since 20f, 0 turns it off) runs `lmeval` on the checkpoint saved
-at or after every N steps of the stage, and once more at the end. It runs in-process on the training weights and buffers
+every N steps of the stage, and once more at the end. It runs in-process on the training weights and buffers
 (no second copy of the model in VRAM; same scores as `lmeval`; `CUDALM_BENCH_CHILD=1` uses the old child process); training waits, and that time
 is left out of tok/s. It prints the Open SLM index with per-task scores and appends a row to `models\<name>.bin.bench.tsv`.
 By default it runs every task (HellaSwag, ARC-E, ARC-C, PIQA, LAMBADA, ArithMark) on its full set; `CUDALM_BENCH_TASKS`
 (comma list) and `CUDALM_BENCH_N` (items per task) narrow it. Each bench also saves its per-item dump to
 `models\<name>.bin.items\it<N>.tsv`, prints the paired comparison with the previous bench, and adds the margin index as
 the last column of `bench.tsv`.
+
+**Checkpoints.** `train` saves the model and its optimizer state (`.bin`, `.opt`, `.opt.mu`, `.opt.ng`, ...) every
+`CUDALM_SAVE_MIN` minutes of wall clock (default 30), plus at every keep snapshot (`CUDALM_KEEP_EVERY`, copied as
+`*_it<N>`) and every bench step, and at the end or on a stop. A 200M-parameter model writes ~1.6 GB per save, so the
+interval is a trade between the work a crash costs and SSD wear. `CUDALM_SAVE_EVERY=N` saves every N steps instead.
+Both are per-run settings (not stored in `<model>.bin.env`). Saves are atomic: every file of a set is written to a
+`.tmp`, fsynced, and renamed only when the whole set succeeded. Muon momentum (`.opt.mu`) is stored as bf16 (fp32
+files from older builds still load).
 
 In the menu every command is a form (required fields are checked before Run). Its output is shown live and also
 saved to `logs\<command>-<model>-<time>.log`, e.g. the chatbench log is the input for `bench\judgerun.bat`. Diagnostics
@@ -299,6 +310,51 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 - `tinylm` (default, type default q4n): exact. Keeps top-k routing, router bias and the ngram/engram memory.
 - `llama` (type default q8; q8|fp16|f32): stock llama.cpp `deepseek` arch. Routes top-1 and drops ngram/engram, so it is lossy.
 
+### Hugging Face export
+
+`cudalm hf <name> <dir> [fp32|bf16]` writes a transformers folder with a custom `cudalm` architecture
+(`trust_remote_code=True`). The folder holds `model.safetensors`, `config.json`, `generation_config.json`, the
+tokenizer (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, made by `export\tltk2hf.py` with
+`CUDALM_PYTHON`), the modeling code copied from `export\hf\`, and a `README.md` model card. The model is loaded the way
+`run` does it (`.env`, `.opt.ng`, `.opt.t1`), so the n-gram table is written as rendered floats for every qtype.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained(d, trust_remote_code=True)
+m = AutoModelForCausalLM.from_pretrained(d, trust_remote_code=True, dtype="float32")
+ids = tok.apply_chat_template([{"role": "user", "content": "Hi"}], add_generation_prompt=True, return_tensors="pt")
+out = m.generate(ids, max_new_tokens=64, stop_strings=["<|user|>"], tokenizer=tok)
+```
+
+- **Covered:** GQA, RoPE, sliding window + full layers, MoE (softmax gate, top-k per layer, per-slot router bias),
+  attention output gate, hashed n-gram table (bigram/trigram, q4 or fp32, optional gate), value residual. `hf` refuses
+  what the port lacks: looped layers, UniPool, sparse engram, canon layers, shared expert, `CUDALM_ROUTER_PRE`,
+  `CUDALM_ROUTE_MODE`, factorized embedding.
+- **Checks:** `export\hf_tokcheck.py` (tokenizer ids and decode vs cudalm) and `export\hf_check.py <cudalm_cpu.exe>
+  <model.bin> <workdir> [--val val.bin]...` (needs torch + transformers 5.x). hf_check exports the model, then compares
+  the HF model with `cudalm logits` from the CPU build, the fp32 reference: fp32 logits (max |Δ| ≤ 1e-3, argmax equal),
+  greedy decoding with and without the KV cache (including across the sliding window), the chat template, and bf16
+  (top-1 agreement ≥ 99.5% where the fp32 top-2 margin is ≥ 0.1, mean KL ≤ 5e-3). A MoE token whose router scores tie
+  exactly can pick a different expert in each implementation; hf_check skips a sequence from such a tie on
+  (`export\hf_diag.py` shows the gaps).
+- **lm-evaluation-harness:** the export runs as an `hf` model. `export\lmeval\arithmark3.yaml` adds ArithMark 3.0 as
+  task `arithmark3`. `cudalm lmeval` starts every sequence with EOT, but lm-eval adds no BOS by default; to score the
+  way cudalm does, make a tokenizer copy that prepends EOT (`python export\lmeval\eot_tokenizer.py <dir> <dir>\tok_eot`)
+  and pass it with `add_bos_token=True`:
+
+  ```
+  lm_eval run --model hf --model_args pretrained=<dir>,tokenizer=<dir>\tok_eot,add_bos_token=True,trust_remote_code=True,dtype=float32
+      --tasks hellaswag,arc_easy,arc_challenge,piqa,lambada_openai,arithmark3 --include_path export\lmeval
+      --device cuda:0 --batch_size 32 --log_samples --output_path <out>
+  ```
+
+  lm-eval's `acc_norm` divides by the characters of the choice, while cudalm divides by its UTF-8 bytes. So
+  `acc_norm` can differ by a few tenths, even when every log-likelihood matches. `export\lmeval\compare.py
+  <items.tsv> <bench_dir> <out>...` re-scores lm-eval's logged samples by bytes. It then compares them item by item
+  with a `CUDALM_LMEVAL_ITEMS=<items.tsv> cudalm lmeval <model> all` dump. On LS4-200M-A50M-B with the EOT tokenizer,
+  ≥ 99.9% of picks agree, the per-item margins correlate at 1.000, and the index is 14.10 byte-normalised (13.99 with
+  lm-eval's `acc_norm`) vs cudalm's 14.08. Without EOT it is 13.69, and 91–98% of picks agree.
+
 ## Layout
 
 | Path | What |
@@ -307,6 +363,9 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 | `qlm.cuh` | 4-bit weights + integer AdamW (QLM) |
 | `cpu_rt.h`, `cpu_kern.h` | CPU build only: CUDA runtime/cuBLAS stand-in (AVX2 SGEMM) and OpenMP/AVX2 kernels |
 | `tui.cuh` | Console menu (Windows) |
+| `net.cuh` | Sockets, threads and JSON helpers for `serve` and `monitor` (Windows and Linux) |
+| `monitor.cuh` | `cudalm monitor`: read-only HTTP view of training runs (status files, logs, benches, NVML) |
+| `monitor.html` | The monitor's dashboard page; `python embedhtml.py` regenerates `monitor_html.h` from it |
 | `data.cuh` | `cudalm data`: BPE trainer, encoder, mixer, canon map (CPU, Windows) |
 | `uniclass.h` | Unicode tables for the GPT-2 pre-tokenizer regex |
 | `build.py` | Toolchain download and build (`--cpu` for the CPU build) |
@@ -321,6 +380,9 @@ fp16/f32 keep floats; a quantized model exports as its own type.
 | `teach\teachtok.c` | Teacher jsonl → train/val token bins with the model's tokenizer (special tokens matched literally) |
 | `agent\agentenv.c` | Agent evals against `cudalm serve` (or a teacher server): tool use, code pass@k, task generation |
 | `export\bin2gguf.py` | Model `.bin` → GGUF (needs numpy) |
+| `export\hf\`, `export\tltk2hf.py` | Hugging Face export: `cudalm` transformers model code and the TLTK → `tokenizer.json` converter (used by `cudalm hf`) |
+| `export\hf_check.py`, `hf_tokcheck.py`, `hf_diag.py` | Checks of the HF export against the CPU build (logits, greedy decoding, bf16, tokenizer) |
+| `export\lmeval\` | lm-evaluation-harness helpers: ArithMark 3.0 task, EOT-prefix tokenizer, per-item comparison with `cudalm lmeval` |
 
 ## Recipe notes
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased - 2026-11-22
+
+- Hugging Face export, lm-eval helpers, timed checkpoints, bf16 Muon momentum, monitor
+
+## Unreleased - 2026-11-22
+
+- **Hugging Face export.** `cudalm hf <name> <dir> [fp32|bf16]` writes a transformers folder with a custom `cudalm`
+  architecture (`trust_remote_code`): safetensors weights, config, tokenizer + chat template, model card. Model code in
+  `export/hf/`, tokenizer converter `export/tltk2hf.py`. `cudalm logits` dumps full-vocab logits (the CPU build is the
+  fp32 reference). `export/hf_check.py` checks the export against it: fp32 logits, greedy decoding with and without the
+  KV cache (also across the sliding window), the chat template and bf16 agreement. `hf_tokcheck.py` checks tokenizer
+  ids, `hf_diag.py` explains MoE routing ties. lm-evaluation-harness runs on the export: `export\lmeval\` has an
+  ArithMark 3.0 task, an EOT-prefix tokenizer that makes lm-eval score as `cudalm lmeval` does, and `compare.py` (per-item
+  agreement ≥ 99.9% on LS4-200M-A50M-B).
+- **Checkpoints by wall clock.** `train` saves every `CUDALM_SAVE_MIN` minutes (default 30) plus at every keep
+  snapshot and bench step, instead of every ~200 steps; a 200M-parameter model wrote ~1.6 GB every 3 minutes.
+  `CUDALM_SAVE_EVERY=N` keeps the step cadence. Both are per-run settings, no longer stored in `<model>.bin.env`
+  (an old value there is ignored with a note). With timed saves, benches run exactly every `CUDALM_BENCH_EVERY` steps.
+- Muon momentum (`.opt.mu`) is saved as bf16, half the size; fp32 files from older builds still load.
+- **`cudalm monitor`** (`monitor.cuh`, `monitor.html` → `monitor_html.h` via `embedhtml.py`): read-only HTTP view of
+  training runs. Dashboard at `/` (run cards, loss / II / margin charts, log tail, GPU), JSON under `/api/`, optional
+  token, `--allow-stop`. `train` writes `<model>.bin.status.json` (`CUDALM_STATUS=0` turns it off).
+- `net.cuh`: the socket layer of `serve`, now portable; `cudalm serve` builds and runs on Linux.
+
 ## Unreleased - 2026-11-16
 
 - CHANGELOG.md: update Unreleased entry to document tokenizer fix

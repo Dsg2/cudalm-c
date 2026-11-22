@@ -543,13 +543,24 @@ static int save_rename(const char*tmp,const char*path){
 /* device -> file through one reused 64 MB host buffer, so a save needs no full-size host copy.
  * 2026-11-04: a 40 GB explorer.exe leak exhausted commit, the per-save np-sized mallocs failed and
  * a cudaMemcpy into NULL killed LS3. The buffer is allocated at the first save and kept. */
+#define STAGE_BY ((size_t)64<<20)
+static char*stage_buf(void){
+    static char*b=NULL; if(!b) b=(char*)malloc(STAGE_BY);
+    if(!b){ if(g_sv_batch) g_sv_fail=1; fprintf(stderr,"[save] no host memory for the 64 MB staging buffer\n"); }
+    return b; }
 static int d2h_write(FILE*f,const void*dev,size_t by){
-    static char*b=NULL; const size_t C=(size_t)64<<20;
-    if(!b) b=(char*)malloc(C);
-    if(!b){ if(g_sv_batch) g_sv_fail=1; fprintf(stderr,"[save] no host memory for the 64 MB staging buffer\n"); return 0; }
-    for(size_t o=0;o<by;o+=C){ size_t n=by-o<C?by-o:C;
+    char*b=stage_buf(); if(!b) return 0;
+    for(size_t o=0;o<by;o+=STAGE_BY){ size_t n=by-o<STAGE_BY?by-o:STAGE_BY;
         ck(cudaMemcpy(b,(const char*)dev+o,n,cudaMemcpyDeviceToHost),"save d2h");
         if(fwrite(b,1,n,f)!=n) return 0; }
+    return 1; }
+/* fp32 device array -> bf16 in the file (round to nearest even), converted in place in the staging buffer */
+static int d2h_write_bf16(FILE*f,const float*dev,size_t n){
+    uint32_t*b=(uint32_t*)stage_buf(); if(!b) return 0; const size_t C=STAGE_BY/4; uint16_t*h=(uint16_t*)b;
+    for(size_t o=0;o<n;o+=C){ size_t k=n-o<C?n-o:C;
+        ck(cudaMemcpy(b,dev+o,k*4,cudaMemcpyDeviceToHost),"save d2h");
+        for(size_t i=0;i<k;i++){ uint32_t u=b[i]; h[i]=(uint16_t)((u+0x7FFFu+((u>>16)&1u))>>16); }
+        if(fwrite(h,2,k,f)!=k) return 0; }
     return 1; }
 static void model_save_bundle(const char*path,const Cfg*c,const float*P,size_t n,const uint8_t*blob,int bl){
     char tmp[1200]; FILE*f=save_open(path,tmp,sizeof(tmp));
@@ -6373,13 +6384,14 @@ static void gpu_muon(float*P,float*G,float lr){
     }
     kchk("muon",-1);
 }
-/* sidecar <optpath>.mu: Muon's fp32 momentum. The .opt file holds only the AdamW moments,
- * so without it every resume of a CUDALM_MUON=1 run restarted the momentum at zero. */
+/* sidecar <optpath>.mu: Muon's momentum. The .opt file holds only the AdamW moments,
+ * so without it every resume of a CUDALM_MUON=1 run restarted the momentum at zero.
+ * Stored as bf16 since 22d ("MUB1", half the bytes; training keeps fp32); fp32 "MUM1" still loads. */
 static void mu_save(const char*optpath,int it,size_t np){
     if(!g_muon||g_qlm_on||!gMuM) return;
     char path[1200],tmp[1300]; snprintf(path,sizeof path,"%s.mu",optpath);
     FILE*f=save_open(path,tmp,sizeof tmp); unsigned long long n=np;
-    int ok=fwrite("MUM1",1,4,f)==4&&fwrite(&it,4,1,f)==1&&fwrite(&n,8,1,f)==1&&d2h_write(f,gMuM,np*4);
+    int ok=fwrite("MUB1",1,4,f)==4&&fwrite(&it,4,1,f)==1&&fwrite(&n,8,1,f)==1&&d2h_write_bf16(f,gMuM,np);
     if(!ok){ save_abort(f,tmp); fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); return; }
     if(!save_commit(f,tmp,path)) fprintf(stderr,"[muon] momentum save FAILED for %s (previous kept)\n",path); }
 static void mu_load(const char*optpath,size_t np,int start_iter){
@@ -6387,11 +6399,14 @@ static void mu_load(const char*optpath,size_t np,int start_iter){
     char path[1200]; snprintf(path,sizeof path,"%s.mu",optpath);
     FILE*f=fopen(path,"rb"); if(!f){ printf("[muon] no %s - momentum starts at zero\n",path); return; }
     char m[4]; int it=0; unsigned long long n=0;
-    if(fread(m,1,4,f)!=4||memcmp(m,"MUM1",4)||fread(&it,4,1,f)!=1||fread(&n,8,1,f)!=1||n>(unsigned long long)np){
+    int bf=0;
+    if(fread(m,1,4,f)!=4||(memcmp(m,"MUM1",4)&&!(bf=!memcmp(m,"MUB1",4)))||fread(&it,4,1,f)!=1||fread(&n,8,1,f)!=1||n>(unsigned long long)np){
         fclose(f); fprintf(stderr,"[muon] %s: bad header or size - momentum starts at zero\n",path); return; }
     if(it!=start_iter){ fclose(f);   /* e.g. a stretch trained without Muon, or a failed save */
         fprintf(stderr,"[muon] %s is from iter %d but the optimizer state is from %d - momentum starts at zero\n",path,it,start_iter); return; }
-    float*h=(float*)calloc(np,4); int ok=h&&fread(h,4,(size_t)n,f)==(size_t)n; fclose(f);   /* n < np: looped model's extra norms */
+    float*h=(float*)calloc(np,4); int ok=h&&fread(h,bf?2:4,(size_t)n,f)==(size_t)n; fclose(f);   /* n < np: looped model's extra norms */
+    if(ok&&bf){ uint16_t*s=(uint16_t*)h; uint32_t*d=(uint32_t*)h;   /* widen in place, back to front */
+        for(size_t i=(size_t)n;i-->0;) d[i]=(uint32_t)s[i]<<16; }
     if(ok){ if(!gMuM) muon_alloc(np); ck(cudaMemcpy(gMuM,h,np*4,cudaMemcpyHostToDevice),"mu h2d");
             printf("[muon] loaded momentum %s (iter %d)\n",path,it); }
     else fprintf(stderr,"[muon] truncated %s - momentum starts at zero\n",path);
@@ -6804,7 +6819,8 @@ static const EnvReg g_envreg[]={
  {"CUDALM_QLM_NOALIAS","","qlm","disable grad aliasing",0},
  {"CUDALM_QLM_NOREUSE","","qlm","disable buffer reuse",0},
  {"CUDALM_BATCH","auto","train","batch size",0},
- {"CUDALM_SAVE_EVERY","auto","train","checkpoint interval (>=10)",0},
+ {"CUDALM_SAVE_MIN","30","train","checkpoint every N minutes (+ at keep/bench steps); 0 = step cadence",1},
+ {"CUDALM_SAVE_EVERY","","train","checkpoint every N steps (>=10) instead of by time",1},
  {"CUDALM_BENCH_EVERY","10000","train","lmeval the checkpoint every N steps (0 = off) -> <model>.bench.tsv",0},
  {"CUDALM_BENCH_TASKS","all","train","bench tasks (default all: hellaswag,arc_easy,arc_challenge,piqa,lambada,arithmark)",0},
  {"CUDALM_BENCH_N","0","train","items per bench task (0 = full sets)",0},
@@ -7276,6 +7292,189 @@ static int cmd_tokcheck(int argc,char**argv){
             toks+=j-i; docs++; free(ids); free(s); }
         i=j+1; }
     printf("[tokcheck] %d docs, %zu tokens, %d mismatched docs\n",docs,toks,bad); free(b); return bad?2:0; }
+
+/* ===================== Hugging Face export =====================
+ * hf_open loads a model for inference exactly as run/chat do (sidecars, .env) and refuses the features the
+ * transformers port (export/hf/modeling_cudalm.py) does not implement. */
+typedef struct { Cfg c; Off o; Tok*tk; float*Ph; const float*P; char path[1024]; } HfM;
+static const char* hf_unsupported(const Cfg*c){
+    if(c->lp) return "looped layers (CUDALM_LOOP)";
+    for(int l=0;l<c->L;l++) if(lyT(c,l)==2) return "UniPool layers";
+    if(g_eg_on) return "sparse engram (NGR2)";
+    if(g_canA||g_canC) return "canon layers (CUDALM_CANON)";
+    if(g_shF) return "shared expert (CUDALM_SHARED_F)";
+    if(g_rpre) return "CUDALM_ROUTER_PRE";
+    if(g_route_mode) return "CUDALM_ROUTE_MODE";
+    if(fe_dim(c->D)) return "factorized embedding (CUDALM_EMB_E)";
+    return NULL; }
+static void hf_open(const char*name,HfM*m){
+    model_resolve(name,m->path,sizeof m->path);
+    m->Ph=model_load_full(m->path,&m->c,&m->tk); if(!m->tk){ fprintf(stderr,"%s: no tokenizer (untrained?)\n",m->path); exit(1); }
+    gC=m->c; cuda_init(); calc_offsets(&m->c,&m->o); ngram_infer(m->path);
+    const char*u=hf_unsupported(&m->c); if(u){ fprintf(stderr,"[hf] %s: %s is not in the transformers port yet\n",m->path,u); exit(1); }
+    if(g_ngram_on){ char p[1100]; snprintf(p,sizeof p,"%s.opt.ng",m->path); FILE*f=fopen(p,"rb");
+        if(!f){ fprintf(stderr,"[hf] n-gram is on but %s is missing\n",p); exit(1); } fclose(f); }
+    size_t np=param_count(&m->c); float*P=(float*)dmalloc(np*4); ck(cudaMemcpy(P,m->Ph,np*4,cudaMemcpyHostToDevice),"P h2d"); m->P=P;
+    rope_tables(&m->c); }
+static int hf_topk(const Cfg*c,int l){   /* = moe_forward's K */
+    if(!lyT(c,l)) return 0; int Km=g_topk<1?1:g_topk; if(Km>c->n_exp) Km=c->n_exp;
+    int K=(g_topkL[l]>0&&g_topkL[l]<Km)?g_topkL[l]:Km; return K>lyE(c,l)?lyE(c,l):K; }
+
+/* logits <model> <ids.txt> <out.f32>: full-vocab logits of one forward per line of token ids (CPU build = exact fp32
+ * reference). out = "LGT1", nseq, V, then per sequence n and n*V floats (row i predicts token i+1). */
+static int cmd_logits(int argc,char**argv){
+    if(argc<5){ fprintf(stderr,"usage: cudalm logits <model> <ids.txt> <out.f32>   (one sequence of token ids per line, <= T)\n"); return 1; }
+    size_t len; uint8_t*raw=read_file(argv[3],&len); if(!raw){ fprintf(stderr,"cannot read %s\n",argv[3]); return 1; }
+    char*txt=(char*)malloc(len+1); memcpy(txt,raw,len); txt[len]=0; free(raw);
+    HfM m; hf_open(argv[2],&m); const Cfg c=m.c; int T=c.T,D=c.D,V=c.V,RB=64;
+    GA*a=ga_new(T,0); int*tokG=(int*)dmalloc((size_t)T*4),*tok=(int*)malloc((size_t)T*4);
+    float*lg=(float*)dmalloc((size_t)RB*V*4),*lh=(float*)malloc((size_t)RB*V*4);
+    FILE*f=fopen(argv[4],"wb"); if(!f){ perror(argv[4]); return 1; }
+    int hv[2]={0,V}; fwrite("LGT1",1,4,f); fwrite(hv,4,2,f);
+    for(char*p=txt;*p;){
+        char*e=p; while(*e&&*e!='\n') e++; int n=0,end=!*e; char*q=p; *e=0;   /* strtol must not skip past the line end */
+        while(q<e){ char*z; long v=strtol(q,&z,10); if(z==q){ q++; continue; } q=z;
+            if(n>=T){ fprintf(stderr,"[logits] sequence %d is longer than T=%d\n",hv[0],T); return 1; }
+            if(v<0||v>=V){ fprintf(stderr,"[logits] token %ld out of range\n",v); return 1; } tok[n++]=(int)v; }
+        p=end?e:e+1; if(!n) continue;
+        for(int j=n;j<T;j++) tok[j]=0;
+        ck(cudaMemcpy(tokG,tok,(size_t)T*4,cudaMemcpyHostToDevice),"tok h2d");
+#ifdef CUDALM_CPU
+        { int Tr=(n+15)&~15; if(Tr>T) Tr=T; a->N=Tr; gC.T=Tr; }   /* causal: later rows cannot reach the first n */
+#endif
+        gpu_forward(m.P,&m.o,a,tokG); a->N=T; gC.T=T;
+        fwrite(&n,4,1,f);
+        for(int r0=0;r0<n;r0+=RB){ int r=n-r0<RB?n-r0:RB;
+            g_abt(a->fn+(size_t)r0*D,m.P+m.o.emb,lg,r,D,V);
+            ck(cudaMemcpy(lh,lg,(size_t)r*V*4,cudaMemcpyDeviceToHost),"logits d2h"); fwrite(lh,4,(size_t)r*V,f); }
+        hv[0]++; }
+    fseek(f,4,SEEK_SET); fwrite(hv,4,1,f); fclose(f);
+    printf("[logits] %d sequences -> %s\n",hv[0],argv[4]); return 0; }
+
+/* hf <model> <dir> [fp32|bf16]: <dir>/model.safetensors (rendered inference tensors; Linear weights [out,in]) and
+ * <dir>/config.json for the custom "cudalm" transformers architecture (export/hf/, trust_remote_code). */
+static int run_cmd(const char*cmd); static const char* py_cmd(void);
+typedef struct { char nm[96]; int nd; long long sh[3]; const float*src; int dev,r,c,nb; } HfT;   /* r,c: [nb][r][c] source, written transposed when r */
+static int hf_add(HfT*t,int k,const char*nm,int nd,long long a,long long b,long long c3,const float*src,int dev,int r,int c,int nb){
+    HfT*x=&t[k]; snprintf(x->nm,sizeof x->nm,"%s",nm); x->nd=nd; x->sh[0]=a; x->sh[1]=b; x->sh[2]=c3;
+    x->src=src; x->dev=dev; x->r=r; x->c=c; x->nb=nb; return k+1; }
+static size_t hf_numel(const HfT*x){ size_t n=1; for(int i=0;i<x->nd;i++) n*=(size_t)x->sh[i]; return n; }
+static int cmd_hf(int argc,char**argv){
+    if(argc<4){ fprintf(stderr,"usage: cudalm hf <model> <dir> [fp32|bf16]\n"); return 1; }
+    int bf=argc>4&&!strcmp(argv[4],"bf16"), es=bf?2:4;
+    HfM m; hf_open(argv[2],&m); const Cfg*c=&m.c; const Off*o=&m.o; const float*P=m.Ph;
+    int D=c->D,KD=c->KD,L=c->L,ng=g_ngram_on,mb=g_mbias_ld&&g_mbiasH, S=mb_S();
+    HfT*t=(HfT*)calloc((size_t)L*16+16,sizeof(HfT)); int k=0; char nm[96];
+    k=hf_add(t,k,"model.embed_tokens.weight",2,c->V,D,0,P+o->emb,0,0,0,1);
+    for(int l=0;l<L;l++){ int E=lyE(c,l),F=lyT(c,l)?c->F:lyF(c,l);
+#define HN(s) (snprintf(nm,sizeof nm,"model.layers.%d.%s",l,s),nm)
+        k=hf_add(t,k,HN("input_layernorm.weight"),1,D,0,0,P+o->an1[l],0,0,0,1);
+        k=hf_add(t,k,HN("self_attn.q_proj.weight"),2,D,D,0,P+o->wq[l],0,D,D,1);
+        k=hf_add(t,k,HN("self_attn.k_proj.weight"),2,KD,D,0,P+o->wk[l],0,D,KD,1);
+        k=hf_add(t,k,HN("self_attn.v_proj.weight"),2,KD,D,0,P+o->wv[l],0,D,KD,1);
+        k=hf_add(t,k,HN("self_attn.o_proj.weight"),2,D,D,0,P+o->wo[l],0,D,D,1);
+        if(g_attg) k=hf_add(t,k,HN("self_attn.gate_proj.weight"),2,D,D,0,g_Wg+(size_t)l*D*D,1,D,D,1);
+        k=hf_add(t,k,HN("post_attention_layernorm.weight"),1,D,0,0,P+o->an2[l],0,0,0,1);
+        if(!lyT(c,l)){
+            k=hf_add(t,k,HN("mlp.gate_proj.weight"),2,F,D,0,P+o->w1[l],0,D,F,1);
+            k=hf_add(t,k,HN("mlp.up_proj.weight"),2,F,D,0,P+o->w3[l],0,D,F,1);
+            k=hf_add(t,k,HN("mlp.down_proj.weight"),2,D,F,0,P+o->w2[l],0,F,D,1);
+        } else {
+            k=hf_add(t,k,HN("mlp.router.weight"),2,E,D,0,P+o->wr[l],0,D,E,1);
+            k=hf_add(t,k,HN("mlp.experts_gate"),3,E,F,D,P+o->w1[l],0,D,F,E);
+            k=hf_add(t,k,HN("mlp.experts_up"),3,E,F,D,P+o->w3[l],0,D,F,E);
+            k=hf_add(t,k,HN("mlp.experts_down"),3,E,D,F,P+o->w2[l],0,F,D,E);
+            if(mb) k=hf_add(t,k,HN("mlp.router_bias"),2,S,E,0,g_mbiasH+(size_t)l*S*c->n_exp,0,0,0,1);   /* row k*E+e, as k_router_topk */
+        }
+#undef HN
+    }
+    k=hf_add(t,k,"model.norm.weight",1,D,0,0,P+o->nf,0,0,0,1);
+    if(ng){ k=hf_add(t,k,"model.ngram.table.weight",2,g_ng_R,g_ng_De,0,g_ng,1,0,0,1);
+        k=hf_add(t,k,"model.ngram.proj.weight",2,D,g_ng_De,0,g_ngW,1,g_ng_De,D,1);
+        if(g_ng_gate) k=hf_add(t,k,"model.ngram.key_proj.weight",2,D,g_ng_De,0,g_ngWk,1,g_ng_De,D,1); }
+    /* safetensors: u64 header length, JSON header (8-byte padded), raw little-endian data */
+    size_t hc=4096+(size_t)k*200,hn=0,off=0; char*h=(char*)malloc(hc);
+    hn+=snprintf(h+hn,hc-hn,"{\"__metadata__\":{\"format\":\"pt\"}");
+    for(int i=0;i<k;i++){ size_t b=hf_numel(&t[i])*es;
+        hn+=snprintf(h+hn,hc-hn,",\"%s\":{\"dtype\":\"%s\",\"shape\":[",t[i].nm,bf?"BF16":"F32");
+        for(int d=0;d<t[i].nd;d++) hn+=snprintf(h+hn,hc-hn,"%s%lld",d?",":"",t[i].sh[d]);
+        hn+=snprintf(h+hn,hc-hn,"],\"data_offsets\":[%zu,%zu]}",off,off+b); off+=b; }
+    hn+=snprintf(h+hn,hc-hn,"}"); while(hn%8) h[hn++]=' ';
+    char p[1200]; lm_mkdir(argv[3]); snprintf(p,sizeof p,"%s" PSEP "model.safetensors",argv[3]);
+    FILE*f=fopen(p,"wb"); if(!f){ perror(p); return 1; }
+    unsigned long long hl=hn; fwrite(&hl,8,1,f); fwrite(h,1,hn,f);
+    size_t cap=0; float*buf=NULL,*tb=NULL; uint16_t*hb=NULL;
+    for(int i=0;i<k;i++){ const HfT*x=&t[i]; size_t per=hf_numel(x)/x->nb;
+        if(per>cap){ cap=per; buf=(float*)realloc(buf,cap*4); tb=(float*)realloc(tb,cap*4); hb=(uint16_t*)realloc(hb,cap*2); }
+        for(int b=0;b<x->nb;b++){ const float*s=x->src+(size_t)b*per; float*v=buf;
+            if(x->dev) ck(cudaMemcpy(buf,s,per*4,cudaMemcpyDeviceToHost),"hf d2h"); else memcpy(buf,s,per*4);
+            if(x->r){ for(int r=0;r<x->r;r++) for(int q=0;q<x->c;q++) tb[(size_t)q*x->r+r]=buf[(size_t)r*x->c+q]; v=tb; }
+            if(bf){ for(size_t j=0;j<per;j++){ uint32_t u; memcpy(&u,&v[j],4); hb[j]=(uint16_t)((u+0x7FFFu+((u>>16)&1u))>>16); } fwrite(hb,2,per,f); }
+            else fwrite(v,4,per,f); } }
+    fclose(f); free(buf); free(tb); free(hb); free(h);
+    /* config.json */
+    snprintf(p,sizeof p,"%s" PSEP "config.json",argv[3]); f=fopen(p,"wb"); if(!f){ perror(p); return 1; }
+    const char*sl=strrchr(m.path,PSEP[0]); sl=sl?sl+1:m.path;
+    fprintf(f,"{\n  \"architectures\": [\"CudalmForCausalLM\"],\n  \"model_type\": \"cudalm\",\n"
+              "  \"auto_map\": {\"AutoConfig\": \"configuration_cudalm.CudalmConfig\", \"AutoModelForCausalLM\": \"modeling_cudalm.CudalmForCausalLM\"},\n"
+              "  \"vocab_size\": %d,\n  \"hidden_size\": %d,\n  \"num_hidden_layers\": %d,\n  \"num_attention_heads\": %d,\n"
+              "  \"num_key_value_heads\": %d,\n  \"head_dim\": %d,\n  \"intermediate_size\": %d,\n  \"max_position_embeddings\": %d,\n"
+              "  \"rope_theta\": %.1f,\n  \"rms_norm_eps\": 1e-05,\n",c->V,D,L,c->H,c->KV,c->hd,c->F,c->T,c->rope_base);
+#define HL(key,expr) { fprintf(f,"  \"%s\": [",key); for(int l=0;l<L;l++) fprintf(f,"%s%d",l?", ":"",(expr)); fprintf(f,"],\n"); }
+    fprintf(f,"  \"layer_ffn\": ["); for(int l=0;l<L;l++) fprintf(f,"%s\"%s\"",l?", ":"",lyT(c,l)?"moe":"dense"); fprintf(f,"],\n");
+    HL("layer_num_experts",lyT(c,l)?lyE(c,l):0) HL("layer_intermediate_size",lyT(c,l)?c->F:lyF(c,l))
+    HL("layer_top_k",hf_topk(c,l)) HL("layer_window",lwin(l))
+#undef HL
+    fprintf(f,"  \"attn_gate\": %s,\n  \"value_residual\": %s,\n  \"router_bias\": %d,\n",g_attg?"true":"false",vres_on()?"true":"false",mb?S:0);   /* rows: 1 shared or one per slot */
+    if(ng) fprintf(f,"  \"ngram\": {\"rows\": %d, \"dim\": %d, \"order\": %d, \"layer\": %d, \"gate\": %s, \"tri\": %s},\n",
+                   g_ng_R,g_ng_De,g_ng_order,g_ng_layer,g_ng_gate?"true":"false",g_ng_tri?"true":"false");   /* tri: rows split in two halves */
+    else fprintf(f,"  \"ngram\": null,\n");
+    fprintf(f,"  \"tie_word_embeddings\": true,\n  \"bos_token_id\": null,\n  \"eos_token_id\": %d,\n  \"pad_token_id\": %d,\n"
+              "  \"dtype\": \"%s\",\n  \"transformers_version\": \"5.20.1\",\n"
+              "  \"cudalm\": {\"source\": \"%s\", \"template\": \"%s\"}\n}\n",
+            c->eot,c->eot,bf?"bfloat16":"float32",sl,c->tmpl==2?"chatml":c->tmpl==1?"alpaca":"raw");
+    fclose(f);
+    snprintf(p,sizeof p,"%s" PSEP "generation_config.json",argv[3]); if((f=fopen(p,"wb"))){
+        fprintf(f,"{\n  \"bos_token_id\": null,\n  \"eos_token_id\": %d,\n  \"pad_token_id\": %d,\n"
+                  "  \"transformers_version\": \"5.20.1\"\n}\n",c->eot,c->eot); fclose(f); }
+    /* README.md model card; active = without the n-gram table and the unrouted experts */
+    size_t tot=0,act; for(int i=0;i<k;i++) tot+=hf_numel(&t[i]); act=tot-(ng?(size_t)g_ng_R*g_ng_De:0);
+    for(int l=0;l<L;l++) if(lyT(c,l)) act-=(size_t)(lyE(c,l)-hf_topk(c,l))*3*D*c->F;
+    snprintf(p,sizeof p,"%s" PSEP "README.md",argv[3]); if((f=fopen(p,"wb"))){ char nmb[256]; snprintf(nmb,sizeof nmb,"%s",sl);
+        char*dot=strrchr(nmb,'.'); if(dot&&!strcmp(dot,".bin")) *dot=0;
+        fprintf(f,"---\nlibrary_name: transformers\npipeline_tag: text-generation\ntags:\n- cudalm\n- custom_code\n---\n\n# %s\n\n"
+                  "A cudalm model (custom `cudalm` architecture). %s parameters total, %s per token without the n-gram table "
+                  "and the unrouted experts.\n\n| | |\n|---|---|\n| layers / width / heads (KV) | %d / %d / %d (%d) |\n"
+                  "| FFN | ",nmb,pcomma(tot),pcomma(act),L,D,c->H,c->KV);
+        if(c->n_exp>0) fprintf(f,"MoE, %d experts of width %d, top-%d%s |\n",c->n_exp,c->F,hf_topk(c,0)?hf_topk(c,0):hf_topk(c,L-1),mb?", router bias (selection only)":"");
+        else fprintf(f,"dense SwiGLU, width %d |\n",c->F);
+        fprintf(f,"| attention | RoPE (base %.0f), %s%s |\n",c->rope_base,c->win>0?"sliding window":"full causal",g_attg?", output gate 2*sigmoid(x Wg)":"");
+        if(c->win>0) fprintf(f,"| window | %d tokens%s |\n",c->win,c->full_every>0?", every full_every-th layer full":"");
+        if(ng) fprintf(f,"| n-gram memory | %s rows x %d, order %d%s, injected before layer %d%s |\n",pcomma(g_ng_R),g_ng_De,g_ng_order,
+                       g_ng_tri?" + order+1 half":"",g_ng_layer,g_ng_gate?", gated":"");
+        fprintf(f,"| context | %d tokens |\n| vocabulary | %d (byte-level BPE) |\n\n"
+                  "```python\nfrom transformers import AutoModelForCausalLM, AutoTokenizer\n"
+                  "tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)\n"
+                  "model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)\n```\n\n"
+                  "The fp32 forward matches the cudalm CPU reference (`cudalm logits`) to about 1e-4 in the logits; "
+                  "bf16 is supported for speed. The n-gram memory hashes token ids, so `input_ids` are required "
+                  "(no `inputs_embeds`), and left padding needs an `attention_mask`.%s\n\n"
+                  "Exported with `cudalm hf` from `%s` (%s).\n",c->T,c->V,
+                c->tmpl==2?" Chat template: `<|user|>` / `<|assistant|>` turns (`apply_chat_template`); the markers are plain "
+                           "text, so stop generation on `<|endoftext|>` or the string `\\n<|user|>` (`stop_strings`, pass the tokenizer).":"",
+                sl,bf?"bf16":"fp32");
+        fclose(f); }
+    /* tokenizer (export/tltk2hf.py, python stdlib only) + the modeling code, both from <exe dir>/export */
+    char ex[1100],cl[4096]; snprintf(ex,sizeof ex,"%s" PSEP "export",exe_dir()); snprintf(p,sizeof p,"%s" PSEP "tltk2hf.py",ex);
+    if((f=fopen(p,"rb"))){ fclose(f);
+        snprintf(cl,sizeof cl,"%s -u \"%s\" \"%s\" \"%s\" --max-len %d",py_cmd(),p,m.path,argv[3],c->T);
+        if(run_cmd(cl)) fprintf(stderr,"[hf] tokenizer export failed: %s\n",cl);
+        const char*fn[2]={"configuration_cudalm.py","modeling_cudalm.py"};
+        for(int i=0;i<2;i++){ char s[1300],d[1300]; size_t n; snprintf(s,sizeof s,"%s" PSEP "hf" PSEP "%s",ex,fn[i]); uint8_t*b=read_file(s,&n);
+            snprintf(d,sizeof d,"%s" PSEP "%s",argv[3],fn[i]); FILE*o=b?fopen(d,"wb"):NULL;
+            if(!o){ fprintf(stderr,"[hf] cannot copy %s\n",s); free(b); continue; } fwrite(b,1,n,o); fclose(o); free(b); } }
+    else fprintf(stderr,"[hf] %s not found: tokenizer and modeling files not written\n",p);
+    printf("[hf] %s -> %s: %d tensors, %.1f MB %s, %s params\n",m.path,argv[3],k,off/1048576.0,bf?"bf16":"fp32",pcomma(tot)); return 0; }
 static int cmd_info(int argc,char**argv){
     if(argc<3){ fprintf(stderr,"usage: cudalm info <name|model.bin>  (config, saved settings, total/memory/active params)\n"); return 1; }
     char p[1100]; model_resolve(argv[2],p,sizeof p); FILE*f=fopen(p,"rb"); if(!f){ fprintf(stderr,"cannot open %s\n",p); return 1; }
@@ -7465,48 +7664,8 @@ static void cmd_run(int argc,char**argv){
  * POST /completion {"prompt","n_predict","temperature","top_k","top_p","seed","stop":[..],"num_first"} -> {"content",
  * "tokens_predicted","stop_type":"eos|word|limit","stopped_eos","nll"}; POST /logprob (scoring, see sv_logprob); GET /health; POST /shutdown (clean exit, never kill a CUDA process). Raw prompt (no template),
  * concurrent clients: continuous batching on the KV-cache decoder (CUDALM_SERVE_SLOTS, default 64), else one request at a
- * time with a full-context forward per token like `run`. Winsock is loaded at run time. */
-#ifdef _WIN32
-typedef uintptr_t SK;
-static struct { int (WINAPI*startup)(WORD,void*); SK (WINAPI*sock)(int,int,int); int (WINAPI*bind_)(SK,const void*,int);
-    int (WINAPI*listen_)(SK,int); SK (WINAPI*accept_)(SK,void*,int*); int (WINAPI*recv_)(SK,char*,int,int);
-    int (WINAPI*send_)(SK,const char*,int,int); int (WINAPI*close_)(SK); } W;
-static void ws_load(void){
-    HMODULE h=LoadLibraryA("ws2_32.dll"); if(!h){ fprintf(stderr,"no ws2_32.dll\n"); exit(1); }
-    *(FARPROC*)&W.startup=GetProcAddress(h,"WSAStartup"); *(FARPROC*)&W.sock=GetProcAddress(h,"socket");
-    *(FARPROC*)&W.bind_=GetProcAddress(h,"bind"); *(FARPROC*)&W.listen_=GetProcAddress(h,"listen");
-    *(FARPROC*)&W.accept_=GetProcAddress(h,"accept"); *(FARPROC*)&W.recv_=GetProcAddress(h,"recv");
-    *(FARPROC*)&W.send_=GetProcAddress(h,"send"); *(FARPROC*)&W.close_=GetProcAddress(h,"closesocket");
-    char wd[512]; W.startup(0x0202,wd);
-}
-typedef struct { char*p; size_t n,cap; } SBuf;
-static void sb_put(SBuf*b,const char*s,size_t n){ if(b->n+n+1>b->cap){ b->cap=(b->n+n+1)*2; b->p=(char*)realloc(b->p,b->cap); }
-    memcpy(b->p+b->n,s,n); b->n+=n; b->p[b->n]=0; }
-static void sb_str(SBuf*b,const char*s){ sb_put(b,s,strlen(s)); }
-static void sb_esc(SBuf*b,const char*s,size_t n){
-    for(size_t i=0;i<n;i++){ unsigned char c=(unsigned char)s[i]; char t[8];
-        if(c=='"'||c=='\\'){ t[0]='\\'; t[1]=(char)c; sb_put(b,t,2); }
-        else if(c=='\n') sb_put(b,"\\n",2); else if(c=='\r') sb_put(b,"\\r",2); else if(c=='\t') sb_put(b,"\\t",2);
-        else if(c<0x20) sb_put(b,t,(size_t)sprintf(t,"\\u%04x",c)); else sb_put(b,(const char*)&c,1); } }
-/* JSON string at p (just past the opening quote) -> malloc'd UTF-8; *end = past the closing quote */
-static char* js_str(const char*p,const char**end){
-    SBuf b={0}; sb_put(&b,"",0);
-    for(;*p&&*p!='"';p++){
-        if(*p!='\\'){ sb_put(&b,p,1); continue; }
-        char c=*++p;
-        if(c=='u'){ char h[5]={p[1],p[2],p[3],p[4],0}; unsigned v=(unsigned)strtoul(h,0,16); p+=4;
-            if(v>=0xD800&&v<0xDC00&&p[1]=='\\'&&p[2]=='u'){ char l[5]={p[3],p[4],p[5],p[6],0}; v=0x10000+((v-0xD800)<<10)+((unsigned)strtoul(l,0,16)-0xDC00); p+=6; }
-            char t[4]; int k=0;
-            if(v<0x80) t[k++]=(char)v; else if(v<0x800){ t[k++]=(char)(0xC0|v>>6); t[k++]=(char)(0x80|(v&63)); }
-            else if(v<0x10000){ t[k++]=(char)(0xE0|v>>12); t[k++]=(char)(0x80|((v>>6)&63)); t[k++]=(char)(0x80|(v&63)); }
-            else { t[k++]=(char)(0xF0|v>>18); t[k++]=(char)(0x80|((v>>12)&63)); t[k++]=(char)(0x80|((v>>6)&63)); t[k++]=(char)(0x80|(v&63)); }
-            sb_put(&b,t,(size_t)k); continue; }
-        c= c=='n'?'\n':c=='t'?'\t':c=='r'?'\r':c=='b'?'\b':c=='f'?'\f':c; sb_put(&b,&c,1); }
-    if(end) *end=*p?p+1:p; return b.p; }
-static const char* js_key(const char*j,const char*k){
-    char q[80]; snprintf(q,sizeof q,"\"%s\"",k); const char*p=strstr(j,q); if(!p) return NULL;
-    p+=strlen(q); while(*p==' '||*p==':'||*p=='\n'||*p=='\r'||*p=='\t') p++; return p; }
-static double js_num(const char*j,const char*k,double d){ const char*p=js_key(j,k); return p&&(*p=='-'||(*p>='0'&&*p<='9'))?atof(p):d; }
+ * time with a full-context forward per token like `run`. Sockets, threads and JSON helpers: net.cuh. */
+#include "net.cuh"
 typedef struct { char*prompt,*stops[16]; int npred,n,topk,ns,greedy,numf; float temp,topp; double sd; } SReq;
 static void sreq_parse(const char*body,SReq*r,int T,int nmax){
     memset(r,0,sizeof *r); const char*pp=js_key(body,"prompt"); r->prompt=pp&&*pp=='"'?js_str(pp+1,NULL):strdup("");
@@ -7541,28 +7700,21 @@ static void sv_results(SBuf*out,int B,SBuf*gen,const int*prod,const int*st,const
             prod[b],pn,st[b]==0?"eos":st[b]==1?"word":"limit",st[b]==0?"true":"false",prod[b]?nll[b]/(prod[b]+(st[b]==0)):0.0);
         sb_str(out,t); }
     if(B>1) sb_str(out,"]}"); }
-static void sv_reply(SK cs,const char*code,const SBuf*out){
-    char h[200]; int hl=snprintf(h,sizeof h,"HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",code,out->n);
-    W.send_(cs,h,hl,0); for(size_t q=0;q<out->n;){ int s=W.send_(cs,out->p+q,(int)(out->n-q),0); if(s<=0) break; q+=(size_t)s; }
-    W.close_(cs); }
+static void sv_reply(SK cs,const char*code,const SBuf*out){ net_reply(cs,code,"application/json",out->p,out->n); }
 static void sv_replys(SK cs,const char*code,const char*s){ SBuf o={0}; sb_str(&o,s); sv_reply(cs,code,&o); free(o.p); }
 /* accept thread: reads whole requests, answers /health itself, queues the rest for the GPU loop */
 typedef struct SQ { SK cs; char*rq; const char*body; struct SQ*next; } SQ;
-static CRITICAL_SECTION g_sqc; static SQ*g_sqh,*g_sqt; static HANDLE g_sqe; static SK g_sqls;
-static DWORD WINAPI sv_accept(void*u){ (void)u;
+static SQ*g_sqh,*g_sqt; static SK g_sqls;
+static void sv_accept(void*u){ (void)u;
     for(;;){
-        SK cs=W.accept_(g_sqls,NULL,NULL); if(cs==(SK)~(uintptr_t)0){ Sleep(1); continue; }
-        SBuf rq={0}; char buf[65536]; int k; size_t need=0; const char*body=NULL;
-        while((k=W.recv_(cs,buf,sizeof buf,0))>0){ sb_put(&rq,buf,(size_t)k);
-            char*h=strstr(rq.p,"\r\n\r\n");
-            if(h){ const char*cl=strstr(rq.p,"Content-Length:"); if(!cl) cl=strstr(rq.p,"content-length:");
-                need=(size_t)(h-rq.p)+4+(cl&&cl<h?(size_t)atol(cl+15):0); if(rq.n>=need){ body=h+4; break; } } }
-        if(!body){ W.close_(cs); free(rq.p); continue; }
+        SK cs=net_accept(g_sqls); if(cs==NET_BAD){ lm_sleep_ms(1); continue; }
+        SBuf rq={0}; const char*body=net_read_req(cs,&rq,0);
+        if(!body){ net_close(cs); free(rq.p); continue; }
         if(!strncmp(rq.p,"GET /health",11)){ sv_replys(cs,"200 OK","{\"status\":\"ok\"}"); free(rq.p); continue; }
         SQ*q=(SQ*)calloc(1,sizeof(SQ)); q->cs=cs; q->rq=rq.p; q->body=body;
-        EnterCriticalSection(&g_sqc); if(g_sqt) g_sqt->next=q; else g_sqh=q; g_sqt=q; LeaveCriticalSection(&g_sqc);
-        SetEvent(g_sqe); } }
-static SQ* sq_pop(void){ EnterCriticalSection(&g_sqc); SQ*q=g_sqh; if(q){ g_sqh=q->next; if(!g_sqh) g_sqt=NULL; } LeaveCriticalSection(&g_sqc); return q; }
+        nt_lock(); if(g_sqt) g_sqt->next=q; else g_sqh=q; g_sqt=q; nt_unlock();
+        nt_signal(); } }
+static SQ* sq_pop(void){ nt_lock(); SQ*q=g_sqh; if(q){ g_sqh=q->next; if(!g_sqh) g_sqt=NULL; } nt_unlock(); return q; }
 static void sq_free(SQ*q){ free(q->rq); free(q); }
 /* recompute path (CPU build, legacy ngram, CUDALM_SERVE_RECOMPUTE): full-context forward per token, "n" samples in lockstep */
 static void sv_lockstep(const SReq*r,const float*P,const Off*o,GA*a,int*tokG,const Cfg*cp,const Tok*tk,int nmax,int*pad,float*lgs,int*ord,SBuf*out){
@@ -7690,7 +7842,7 @@ static void sv_batched(Dec*dc,const float*P,const Off*o,GA*a,int*tokG,const Cfg*
             for(int b=0;b<R->r.n;b++){ DSP q={R->r.greedy?0.f:R->r.temp,R->r.topp,R->r.topk,base+(unsigned long long)b*7919ULL,0};
                 dc->hsp[N+b]=q; Slot s={R,b,0,0}; sl[N+b]=s; }
             dec_prefill(dc,P,o,a,tokG,ids,pn,N,R->r.n); if(R->r.numf) num_mask(a,tk); dec_sample_rows(dc,a,N,R->r.n); N+=R->r.n; free(ids); }
-        if(!N){ if(quit) break; WaitForSingleObject(g_sqe,50); continue; }
+        if(!N){ if(quit) break; nt_wait(50); continue; }
         for(int b=0;b<N;b++){                             /* consume the sampled tokens */
             Slot*s=&sl[b]; BReq*R=s->r; int k=s->k, nxt=dc->hotok[b], fin=0; R->nll[k]-=dc->holp[b]; s->cnt++; ntok++;
             if(nxt==tk->eot){ R->st[k]=0; fin=1; }
@@ -7726,32 +7878,27 @@ static void cmd_serve(int argc,char**argv){
     GA*a=ga_new(rows,0); int*tokG=(int*)dmalloc((size_t)rows*4);
     int*pad=(int*)calloc(rows,sizeof(int)); ck(cudaMemcpy(tokG,pad,(size_t)rows*4,cudaMemcpyHostToDevice),"tok0");
     gpu_forward(P,&o,a,tokG);                 /* warm-up at full size: lazily sized buffers get their max */
-    ws_load();
-    SK ls=W.sock(2,1,6); struct { short f; unsigned short p; unsigned a; char z[8]; } sa={2,(unsigned short)((port>>8)|((port&255)<<8)),0x0100007f,{0}};
-    if(W.bind_(ls,&sa,16)||W.listen_(ls,256)){ fprintf(stderr,"[serve] cannot bind 127.0.0.1:%d\n",port); exit(1); }
-    InitializeCriticalSection(&g_sqc); g_sqe=CreateEventA(NULL,FALSE,FALSE,NULL); g_sqls=ls;
-    CreateThread(NULL,0,sv_accept,NULL,0,NULL);
+    SK ls=net_listen("127.0.0.1",port);
+    if(ls==NET_BAD){ fprintf(stderr,"[serve] cannot bind 127.0.0.1:%d\n",port); exit(1); }
+    nt_init(); g_sqls=ls; nt_thread(sv_accept,NULL);
 #ifndef CUDALM_CPU
     if(dec){ if(ns>c.T) ns=c.T; Dec*dc=dec_new(ns,c.T);
         printf("[serve] %s on http://127.0.0.1:%d  (V=%d T=%d), KV-cache decoder, %d slots, continuous batching\n",path,port,c.V,c.T,ns); fflush(stdout);
-        sv_batched(dc,P,&o,a,tokG,&c,tk,ns); printf("[serve] shutdown\n"); fflush(stdout); W.close_(ls); return; }
+        sv_batched(dc,P,&o,a,tokG,&c,tk,ns); printf("[serve] shutdown\n"); fflush(stdout); net_close(ls); return; }
 #endif
     printf("[serve] %s on http://127.0.0.1:%d  (V=%d T=%d), recompute, one request at a time\n",path,port,c.V,c.T); fflush(stdout);
     float*lgs=(float*)malloc((size_t)nmax*c.V*4); int*ord=(int*)malloc(sizeof(int)*c.V);
     for(;;){
-        SQ*q=sq_pop(); if(!q){ WaitForSingleObject(g_sqe,50); continue; }
+        SQ*q=sq_pop(); if(!q){ nt_wait(50); continue; }
         if(!strncmp(q->rq,"POST /completion",16)){ SReq r; sreq_parse(q->body,&r,c.T,nmax); SBuf out={0};
             sv_lockstep(&r,P,&o,a,tokG,&c,tk,nmax,pad,lgs,ord,&out); sv_reply(q->cs,"200 OK",&out); free(out.p); sreq_free(&r); }
         else if(!strncmp(q->rq,"POST /logprob",13)){ SBuf out={0}; sv_logprob(q->body,P,&o,a,tokG,&c,tk,rows,&out);
             sv_reply(q->cs,"200 OK",&out); free(out.p); }
         else if(!strncmp(q->rq,"POST /shutdown",14)){ sv_replys(q->cs,"200 OK","{\"status\":\"bye\"}"); sq_free(q);
-            printf("[serve] shutdown\n"); fflush(stdout); W.close_(ls); return; }
+            printf("[serve] shutdown\n"); fflush(stdout); net_close(ls); return; }
         else sv_replys(q->cs,"404 Not Found","{\"error\":\"unknown endpoint\"}");
         sq_free(q); }
 }
-#else
-static void cmd_serve(int argc,char**argv){ (void)argc;(void)argv; fprintf(stderr,"serve: Windows only\n"); exit(1); }
-#endif
 
 /* ===================== train ============================================ */
 /* ---- prompt-loss masking (CUDALM_MASK_PROMPT=1) --------------------------
@@ -8086,9 +8233,74 @@ static void le_pick(const char*ln,char*res,size_t rs,int*lo){ char tn[64]; const
  * in-process on the training weights and buffers (bit-identical to `cudalm lmeval`; CUDALM_BENCH_CHILD=1: a child process),
  * training waits (the time is left out of tok/s), and append a row to <model>.bench.tsv.
  * CUDALM_BENCH_TASKS (default all tasks), CUDALM_BENCH_N items per task (default 0 = full sets). */
+/* <model>.bin.status.json: a heartbeat for `cudalm monitor`, rewritten (tmp + rename) at every log line and at every
+ * state change. CUDALM_STATUS=0 turns it off. A failed rename skips one beat: the monitor may hold the file open. */
+static struct { int on,iters,stage0,N,ck,bit,pid; double ema,bii,bmi,it,ep,loss,lr,gn,tps,trf;
+    char path[1100],tmp[1110],name[256],corpus[1100],sched[8],exe[128],started[24],ckat[24],bat[24]; } g_st;
+static void st_now(char*b,size_t n){ time_t t=time(0); struct tm m;
+#ifdef _WIN32
+    localtime_s(&m,&t);
+#else
+    localtime_r(&t,&m);
+#endif
+    strftime(b,n,"%Y-%m-%dT%H:%M:%S",&m); }
+static void st_js(FILE*f,const char*k,const char*s){ fprintf(f,"\"%s\":\"",k);
+    for(;*s;s++){ if(*s=='"'||*s=='\\') fputc('\\',f); if((unsigned char)*s>=32) fputc(*s,f); } fputs("\",",f); }
+static void st_jn(FILE*f,const char*k,double v,const char*fmt){ fprintf(f,"\"%s\":",k); if(isfinite(v)) fprintf(f,fmt,v); else fputs("null",f); fputc(',',f); }
+static void st_write(const char*state){
+    if(!g_st.on) return;
+    FILE*f=fopen(g_st.tmp,"wb"); if(!f) return;
+    char now[24]; st_now(now,sizeof now);   /* no VRAM here: cudaMemGetInfo under WDDM is not the device total (monitor uses NVML) */
+    double left=(g_st.iters-g_st.it)*(double)g_st.N;
+    fputc('{',f); st_js(f,"model",g_st.name); st_js(f,"state",state); st_js(f,"exe",g_st.exe);
+#ifdef _WIN32
+    st_js(f,"os","windows");
+#else
+    st_js(f,"os","linux");
+#endif
+    fprintf(f,"\"pid\":%d,",g_st.pid); st_js(f,"started",g_st.started); st_js(f,"updated",now);
+    fprintf(f,"\"iter\":%.0f,\"iters\":%d,\"stage0\":%d,\"tokens_per_iter\":%d,",g_st.it,g_st.iters,g_st.stage0,g_st.N);
+    st_jn(f,"ep",g_st.ep,"%.4f"); st_jn(f,"loss",g_st.loss,"%.4f"); st_jn(f,"loss_ema",g_st.ema,"%.4f");
+    st_jn(f,"lr",g_st.lr,"%.3e"); st_jn(f,"gn",g_st.gn,"%.3f"); st_jn(f,"tok_s",g_st.tps,"%.0f");
+    st_jn(f,"train_frac",g_st.trf,"%.4f"); st_jn(f,"eta_s",g_st.tps>0&&left>0?left/g_st.tps:NAN,"%.0f");
+    st_js(f,"corpus",g_st.corpus); st_js(f,"schedule",g_st.sched);
+    if(g_st.ck>0) fprintf(f,"\"last_ckpt\":{\"iter\":%d,\"at\":\"%s\"},",g_st.ck,g_st.ckat);
+    if(g_st.bit>0){ fprintf(f,"\"last_bench\":{\"iter\":%d,",g_st.bit); st_jn(f,"ii",g_st.bii,"%.2f"); st_jn(f,"margin",g_st.bmi,"%.3f");
+        fprintf(f,"\"at\":\"%s\"},",g_st.bat); }
+    fputs("\"v\":1}\n",f);
+    if(fclose(f)) { remove(g_st.tmp); return; }
+#ifdef _WIN32
+    if(!MoveFileExA(g_st.tmp,g_st.path,MOVEFILE_REPLACE_EXISTING)) remove(g_st.tmp);
+#else
+    if(rename(g_st.tmp,g_st.path)) remove(g_st.tmp);
+#endif
+}
+static void st_init(const char*mpath,const char*name,const char*corpus,int it,int iters,int N,const char*sched){
+    memset(&g_st,0,sizeof g_st); g_st.on=env_i("CUDALM_STATUS",1); if(!g_st.on) return;
+    snprintf(g_st.path,sizeof g_st.path,"%s.status.json",mpath); snprintf(g_st.tmp,sizeof g_st.tmp,"%s.tmp",g_st.path);
+    snprintf(g_st.name,sizeof g_st.name,"%s",name); snprintf(g_st.corpus,sizeof g_st.corpus,"%s",corpus);
+    snprintf(g_st.sched,sizeof g_st.sched,"%s",sched); st_now(g_st.started,sizeof g_st.started);
+    char e[1024]="";
+#ifdef _WIN32
+    GetModuleFileNameA(0,e,sizeof e); g_st.pid=(int)GetCurrentProcessId();
+#else
+    { ssize_t n=readlink("/proc/self/exe",e,sizeof e-1); if(n>0) e[n]=0; } g_st.pid=(int)getpid();
+#endif
+    const char*b=e; for(const char*q=e;*q;q++) if(*q=='/'||*q=='\\') b=q+1;
+    snprintf(g_st.exe,sizeof g_st.exe,"%s",b);
+    g_st.it=it; g_st.iters=iters; g_st.stage0=g_stage0; g_st.N=N; g_st.ep=g_st.loss=g_st.lr=g_st.gn=g_st.tps=g_st.trf=g_st.ema=NAN;
+    g_st.bii=g_st.bmi=NAN;
+    char p[1200],ln[1024],last[1024]=""; snprintf(p,sizeof p,"%s.bench.tsv",mpath);   /* a resumed run starts with its last bench */
+    FILE*f=fopen(p,"r"); if(f){ while(fgets(ln,sizeof ln,f)) if(ln[0]>='0'&&ln[0]<='9') snprintf(last,sizeof last,"%s",ln); fclose(f); }
+    if(*last){ double ep; const char*t=strrchr(last,'\t');
+        if(sscanf(last,"%d\t%lf\t%lf",&g_st.bit,&ep,&g_st.bii)==3&&t){ char*q; double v=strtod(t+1,&q); g_st.bmi=q>t+1?v:NAN; }   /* old files: no margin column */
+        else g_st.bit=0; }
+    st_write("starting");
+}
 static double train_bench(const char*mpath,int it,double ep){
     const char*ts=getenv("CUDALM_BENCH_TASKS"),*nn=getenv("CUDALM_BENCH_N"); double t=wall(),ix=NAN;
     char cmd[3200],ln[600],res[800]="",tsv[1200],exe[1024],idir[1100],ipath[1200]; int lo=0,sum=0; double mi=NAN;
+    st_write("bench");
     static char prev[1200];      /* previous bench's per-item dump: each bench is compared against it */
     snprintf(idir,sizeof idir,"%s.items",mpath); lm_mkdir(idir);
     snprintf(ipath,sizeof ipath,"%s" PSEP "it%d.tsv",idir,it); lm_setenv("CUDALM_LMEVAL_ITEMS",ipath);
@@ -8130,6 +8342,7 @@ static double train_bench(const char*mpath,int it,double ep){
 done:
     if(!lo){ printf("[bench] lmeval produced no scores (out of memory? missing bench files?) - skipped\n"); fflush(stdout); return wall()-t; }
     printf("[bench] iter %d (ep %.2f): index %.2f  margin index %.3f | %s  (%.0fs)\n",it,ep,ix,mi,res,wall()-t);
+    g_st.bit=it; g_st.bii=ix; g_st.bmi=mi; st_now(g_st.bat,sizeof g_st.bat);
     if(!*prev){ /* resumed run: the newest older dump in <model>.items */
         int bi=-1; for(int k=it-1;k>0&&bi<0;k--){ char q[1200]; snprintf(q,sizeof q,"%s" PSEP "it%d.tsv",idir,k); if(lm_exists(q)){ bi=k; snprintf(prev,sizeof prev,"%s",q); } } }
     if(*prev&&lm_exists(ipath)){ printf("[bench] vs %s:\n",prev); le_vs(prev,ipath,"[bench]   ",NULL); }
@@ -8373,11 +8586,14 @@ static void cmd_train(int argc,char**argv){
     }
     if(iters<1)iters=1; if(iters<start_iter)iters=start_iter;
     if(!pin_iters){ FILE*rf=fopen(runp,"w"); if(rf){ fprintf(rf,"start=%d end=%d tokens=%lld corpus=%s\n",g_stage0,iters,(long long)ntr,ddir); fclose(rf); } }
+    /* Checkpoint cadence = how much work a hang costs vs disk wear (a 200M-total model writes
+     * ~1.6 GB per save). Since 22d: by wall clock, CUDALM_SAVE_MIN (default 30) minutes, plus a
+     * save at every keep snapshot and bench. CUDALM_SAVE_EVERY=N (steps) or SAVE_MIN=0 = old step cadence. */
     int save_every=spe<400?spe:200; if(save_every<50)save_every=50;
-    /* On a flaky box, checkpoint interval is how much work a hang costs.
-     * Saves are atomic+fsynced so a frequent cadence is safe, it just costs
-     * ~1.5 s of I/O each time. CUDALM_SAVE_EVERY overrides. */
-    { const char*e=getenv("CUDALM_SAVE_EVERY"); if(e){ int v=atoi(e); if(v>=10) save_every=v; } }
+    double save_min=30; { const char*e=getenv("CUDALM_SAVE_MIN"); if(e) save_min=atof(e); }
+    { const char*e=getenv("CUDALM_SAVE_EVERY"); if(e){ int v=atoi(e); if(v>=10){ save_every=v; save_min=0; } } }
+    if(save_min>0){ save_every=0; printf("[cudalm train] checkpoint every %g min\n",save_min); }
+    else printf("[cudalm train] checkpoint every %d steps\n",save_every);
     float lr=default_lr_for(&c)*(g_stage0>0&&!(g_wsd&&g_stage_kind==2)?LR_STAGE_MUL:1.0f), warmup=100.0f;   /* a decay stage continues the peak */
     /* CUDALM_LR overrides the peak. Needed after `grow`: a grown checkpoint has
      * no optimizer state, so training restarts at iter 0 and would otherwise ramp
@@ -8618,13 +8834,14 @@ static void cmd_train(int argc,char**argv){
     double dvw[50]; int dvn=0,nanw[50]={0},nanc=0; double dv_best=1e30;
     int keep_every=20000; { const char*e=getenv("CUDALM_KEEP_EVERY"); if(e) keep_every=atoi(e); }
     char stopp[1100]; snprintf(stopp,sizeof stopp,"%s.stop",mpath);
-    int lrs_first=1, nskip=0, save_due=0;
+    int lrs_first=1, nskip=0, save_due=0, sv_hold=0; double t_save=wall();
     int lrand=c.lp&&env_i("CUDALM_LOOP_RAND",0)?loop_kmax(&c):0;
     if(lrand) printf("[loop] random depth: 1..%d passes per step (seeded per iter)\n",lrand);
     if(lrand&&lrs_on){ printf("[lrs] off with CUDALM_LOOP_RAND\n"); lrs_on=0; }
+    st_init(mpath,name,ddir,start_iter,iters,N,g_wsd?(g_stage_kind==1?"stable":g_stage_kind==2?"decay":"wsd"):"cosine");
     for(int it=start_iter; it<iters; it++){
         if(lrs_on&&it>=(int)warmup&&(lrs_first||it%lrs_every==0)){ lrs_first=0; int sk=lrs_probe(it);
-            if(sk){ if((it+sk-1)/save_every>(it-1)/save_every) save_due=1; it+=sk-1; continue; } }
+            if(sk){ if(save_every&&(it+sk-1)/save_every>(it-1)/save_every) save_due=1; it+=sk-1; continue; } }
         float cur=lr_at(it,iters,lr,warmup,g_wsd,g_wsd_decay)*g_lrmul;
         tok=tokb+(size_t)(it&1)*N; tgt=tgtb+(size_t)(it&1)*N; ck(cudaEventSynchronize(upev[it&1]),"upev");
         int ntrain=build(it,tok,tgt);
@@ -8652,7 +8869,7 @@ static void cmd_train(int argc,char**argv){
             printf("[nan] iter %d grad norm %g - %s (%d in a row)\n",it,g_gn,
                    g_fused?"side-parameter updates skipped (fused layers already stepped)":"step skipped",++nskip); fflush(stdout);
             if(!g_fused) nan_where(P,G,&o,np);
-            if(nskip>=20){ printf("[nan] %d non-finite steps in a row - aborting, last ckpt is intact\n",nskip); fflush(stdout); exit(3); }
+            if(nskip>=20){ printf("[nan] %d non-finite steps in a row - aborting, last ckpt is intact\n",nskip); fflush(stdout); st_write("nan-abort"); exit(3); }
         }
         if(it%20==0){ ck(cudaDeviceSynchronize(),"sync");
             ck(cudaMemcpy(lossh,a->lossb,(size_t)N*4,cudaMemcpyDeviceToHost),"loss d2h");
@@ -8672,21 +8889,28 @@ static void cmd_train(int argc,char**argv){
                     if(g_opdauto) g_opdb=g_opdb?0.8f*g_opdb-0.2f*raw:-raw; } }
 #endif
             printf("\n"); fflush(stdout);
+            g_st.it=it; g_st.ep=(double)(it-g_stage0)/spe; g_st.loss=L; g_st.lr=cur; g_st.gn=g_gn; g_st.trf=(double)ntrain/N;
+            g_st.tps=it>start_iter?(double)N*(it-start_iter)/dt:NAN; if(isfinite(L)) g_st.ema=isfinite(g_st.ema)?0.98*g_st.ema+0.02*L:L;
+            st_write("running");
             if(dv_thr>0&&it>=(int)warmup+2000){
                 int nf=!isfinite(L); nanc+=nf-nanw[dvn%50]; nanw[dvn%50]=nf; dvw[dvn%50]=nf?0:L; dvn++;
                 if(dvn>=50){ double w=0; for(int i=0;i<50;i++) w+=dvw[i]; w/=(50-nanc>0?50-nanc:1);
                     if(nanc<5&&w<dv_best) dv_best=w;
                     if(nanc>=10||w>dv_best+dv_thr){
                         printf("[divstop] iter %d: 1000-iter avg loss %.4f vs best %.4f (+%.2f), %d NaN - stopping, ckpt not overwritten (see *_it<N> snapshots)\n",it,w,dv_best,dv_thr,nanc);
-                        fflush(stdout); exit(5); } } } }
-        if(it>start_iter && (it%save_every==0||save_due) && !nskip && disk_low(mpath)){ save_due=0;
+                        fflush(stdout); st_write("divstop"); exit(5); } } } }
+        int sv=0;   /* timed mode: a skipped/failed save holds the keep/bench-forced ones until the next timed one */
+        if(it>start_iter&&!nskip) sv=save_every?(it%save_every==0||save_due)
+            :(wall()-t_save>=save_min*60||(!sv_hold&&((keep_every>0&&it%keep_every==0)||(bench_every>0&&it-g_stage0>=next_bench))));
+        if(sv && disk_low(mpath)){ save_due=0; sv_hold=1; t_save=wall();
             printf("[ckpt] SKIPPED @ iter %d: under 3 GB free\n",it); fflush(stdout); }
-        else if(it>start_iter && (it%save_every==0||save_due) && !nskip){ save_due=0;
+        else if(sv){ save_due=0; sv_hold=1;
             /* step `it` is already applied: record it+1 as "done up to", exactly as the
              * post-loop save records stop_it, or a resume would train iteration `it` twice */
             int done=it+1;
-            if(save_all(done)){
+            if(save_all(done)){ sv_hold=0;
             printf("[ckpt] saved %s @ iter %d (resumes at %d)\n",mpath,it,done); fflush(stdout);
+            g_st.ck=done; st_now(g_st.ckat,sizeof g_st.ckat);
             if(bench_every>0 && it-g_stage0>=next_bench){ t0+=train_bench(mpath,it,(double)(it-g_stage0)/spe);
                 next_bench=((it-g_stage0)/bench_every+1)*bench_every; }
             if(keep_every>0&&it%keep_every==0){
@@ -8696,14 +8920,15 @@ static void cmd_train(int argc,char**argv){
                     const char*dot=strrchr(mpath,'.'); int bl=dot?(int)(dot-mpath):(int)strlen(mpath);
                     snprintf(d,sizeof d,"%.*s_it%d%s%s",bl,mpath,it,dot?dot:"",sfx[i]);
                     if(lm_copyfile(s,d)) nk++; }
-                printf("[keep] %d files copied as *_it%d\n",nk,it); fflush(stdout); } } }
+                printf("[keep] %d files copied as *_it%d\n",nk,it); fflush(stdout); } }
+            t_save=wall(); }
         if(tmax>0 && (wall()-tstart)>=tmax){          /* checked after the save */
             stop_it=it+1;
             printf("[cudalm train] CUDALM_MAX_SECONDS (%.0fs) reached at iter %d - stopping cleanly\n",tmax,it);
             fflush(stdout); break; }
         if(it%20==0&&lm_exists(stopp)){
             stop_it=it+1; remove(stopp);
-            printf("[cudalm train] %s found at iter %d - stopping cleanly\n",stopp,it); fflush(stdout); break; }
+            printf("[cudalm train] %s found at iter %d - stopping cleanly\n",stopp,it); fflush(stdout); st_write("stopping"); break; }
     }
     /* wait for space; a .stop file or CUDALM_MAX_SECONDS ends the wait. The checkpoint set is
      * committed all-or-nothing, so trying it on a nearly full disk keeps the previous set if it fails */
@@ -8711,15 +8936,17 @@ static void cmd_train(int argc,char**argv){
       for(int s=0;disk_low(mpath);s++){
           if(lm_exists(stopp)){ why=1; remove(stopp); break; }
           if(tmax>0&&(wall()-tstart)>=tmax){ why=2; break; }
-          if(s%600==0){ printf("[ckpt] under 3 GB free - waiting to save %s (create %s to try anyway)\n",mpath,stopp); fflush(stdout); }
+          if(s%600==0){ st_write("disk-wait"); printf("[ckpt] under 3 GB free - waiting to save %s (create %s to try anyway)\n",mpath,stopp); fflush(stdout); }
           lm_sleep_ms(1000); }
       if(why){ printf("[ckpt] under 3 GB free - trying the save anyway (%s)\n",why==1?"stop file":"CUDALM_MAX_SECONDS"); fflush(stdout); } }
     /* fused QLM applies each layer's update inside the backward, so a non-finite step is already in
      * the weights: never let it overwrite the last good checkpoint */
     if(g_fused&&nskip) printf("[ckpt] NOT saved: the last %d step(s) were non-finite and fused QLM had already applied them - previous checkpoint kept\n",nskip);
-    else if(save_all(stop_it) && bench_every>0) train_bench(mpath,stop_it,(double)(stop_it-g_stage0)/spe);
+    else if(save_all(stop_it)){ g_st.ck=stop_it; st_now(g_st.ckat,sizeof g_st.ckat); g_st.it=stop_it;
+        if(bench_every>0) train_bench(mpath,stop_it,(double)(stop_it-g_stage0)/spe); }
     if(stop_it<iters) printf("[cudalm train] paused at iter %d of %d -> %s (resume by re-running)\n",stop_it,iters,mpath);
     else              printf("[cudalm train] done -> %s\n", mpath);
+    st_write(stop_it<iters?"paused":"finished");
     if(g_sb_n) printf("[cudalm] MoE load max/avg per pass: mean %.2f recent %.2f max %.2f (%ld passes, %ld SB fallbacks)\n",g_sb_r/g_sb_n,g_sb_ema,g_sb_rmax,g_sb_n,g_sb_fb);
     if(g_sk_n[0]&&g_sk_n[1]) printf("[cudalm] MoE load max/avg by slot: slot0 %.2f  slot1+ %.2f\n",g_sk_r[0]/g_sk_n[0],g_sk_r[1]/g_sk_n[1]);
     if(g_rb_tot) printf("[cudalm] MoE rebalance moved %.2f%% of routed slots\n",100.0*g_rb_mv/g_rb_tot);
@@ -10746,12 +10973,14 @@ static void cmd_selftest(void){
 }
 
 #include "tui.cuh"
+#include "monitor.cuh"
 
 /* the folders cudalm looks in beside the exe (models, data root, bench tasks, TUI logs); mkdir is a no-op if present */
 static void ensure_dirs(void){ static const char*sub[]={"models","data","bench","logs"}; char p[800];
     for(int i=0;i<4;i++){ snprintf(p,sizeof p,"%.700s" PSEP "%s",exe_dir(),sub[i]); lm_mkdir(p); } }
 int main(int argc,char**argv){
     ensure_dirs();
+    if(argc>1 && !strcmp(argv[1],"monitor")){ cmd_monitor(argc,argv); return 0; }   /* before side_apply: argv[2] is a flag */
     if(getenv("LMTUI_CHILD")) setvbuf(stdout,NULL,_IONBF,0);     /* the TUI pipes our output: keep it live */
     if(argc>2 && strcmp(argv[1],"new") && strcmp(argv[1],"bench") && strcmp(argv[1],"data")) side_apply(argv[2]);   /* before any env is read */
     if(argc>1 && !strcmp(argv[1],"data")) return cmd_data(argc,argv);
@@ -10840,6 +11069,7 @@ int main(int argc,char**argv){
         "  cudalm new      <name> <preset>\n"
         "  cudalm run      <name|model.bin> [\"prompt\"] [n] [temp] [topk]\n"
         "  cudalm serve    <name|model.bin> [port=8090]   (HTTP /completion, /logprob for external benches)\n"
+        "  cudalm monitor  [--port 8091] [--bind ip] [--token-file f]   (read-only HTTP view of training runs; no GPU)\n"
         "  cudalm train    <name> <data_dir> [epochs]\n"
         "  cudalm eval     <name> <data_dir> [batches] [batch_size]\n"
         "  cudalm probe    <name> <prompts.txt> [ntok] [temp] [topk]\n"
@@ -10858,6 +11088,8 @@ int main(int argc,char**argv){
         "  cudalm qlmcheck <name> [group]\n"
         "  cudalm decheck  <name> [n=200] [k=40]   (decoder vs full forward)\n"
         "  cudalm tokcheck <name> <tokens.u16> [maxdocs] [old]\n"
+        "  cudalm logits   <name> <ids.txt> <out.f32>  (full-vocab logits per line of token ids; CPU build = fp32 reference)\n"
+        "  cudalm hf       <name> <dir> [fp32|bf16]    (transformers export: model.safetensors + config.json, export/hf)\n"
         "  cudalm info     <name>   (config + total / ngram-engram / active params)\n"
         "  cudalm selftest\n"
         "  cudalm data     <fetch|tokenizer|encode|mix|info|canon> ...  (tokenizer + corpus tools)\n"
@@ -10885,6 +11117,8 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"qlmcheck")) { return cmd_qlmcheck(argc,argv); }
     if(!strcmp(argv[1],"info"))     { return cmd_info(argc,argv); }
     if(!strcmp(argv[1],"tokcheck")) { return cmd_tokcheck(argc,argv); }
+    if(!strcmp(argv[1],"logits"))   { return cmd_logits(argc,argv); }
+    if(!strcmp(argv[1],"hf"))       { return cmd_hf(argc,argv); }
     if(!strcmp(argv[1],"tuicheck")) { return tui_check(argc,argv); }
 #ifndef CUDALM_CPU
     if(!strcmp(argv[1],"decheck"))  { return cmd_decheck(argc,argv); }

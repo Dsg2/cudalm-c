@@ -1,0 +1,22 @@
+# ArithMark-3.0 (AxiomicLabs/Arithmark-3.0, 1000 arithmetic word problems) for lm-evaluation-harness, scored as
+# `cudalm lmeval` scores it: ctx + ending, the endings carry their leading space. Use with --include_path export/lmeval
+task: arithmark3
+dataset_path: AxiomicLabs/Arithmark-3.0
+dataset_kwargs:
+  data_files:
+    test: arithmark-3.jsonl
+test_split: test
+output_type: multiple_choice
+doc_to_text: "{{ctx}}"
+doc_to_choice: "{{endings}}"
+doc_to_target: "{{label}}"
+target_delimiter: ""
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
