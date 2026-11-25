@@ -101,6 +101,14 @@ jobs:
         run: |
           cd dist
           for d in */; do (cd "$d" && zip -qr "../${d%/}.zip" .); done
-          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          R="$GITHUB_REPOSITORY"; T="$GITHUB_REF_NAME"
+          sha=$(gh api "repos/$R/git/ref/tags/$T" --jq .object.sha)
+          gh api "repos/$R/git/tags/$sha" --jq .message > ../notes.md 2>/dev/null || : > ../notes.md
+          if gh release view "$T" -R "$R" >/dev/null 2>&1; then
+            [ -s ../notes.md ] && gh release edit "$T" -R "$R" --notes-file ../notes.md
+          elif [ -s ../notes.md ]; then
+            gh release create "$T" -R "$R" --title "$T" --notes-file ../notes.md
+          else
+            gh release create "$T" -R "$R" --title "$T" --generate-notes
+          fi
           gh release upload "$GITHUB_REF_NAME" *.zip -R "$GITHUB_REPOSITORY" --clobber
