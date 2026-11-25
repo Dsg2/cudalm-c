@@ -2,7 +2,7 @@
 
 ## Unreleased - 2026-11-25
 
-- Faster no-stash MoE training (merged top-K, fused SwiGLU fwd/bwd), FA2 for head dim 32, bf16 Muon NS, gradient accumulation, looped attention gates
+- CHANGELOG: drop duplicated Unreleased entry
 
 ## Unreleased - 2026-11-25
 
