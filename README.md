@@ -61,6 +61,12 @@ The result is `cudalm.exe`, with the two cuBLAS DLLs copied next to it. Other op
 | `--cuda-version X.Y.Z` | Picks a different redist version. |
 | `--accept-msvc-license` | Downloads the portable MSVC without asking (for scripted builds). |
 
+**Prebuilt binaries:** the `build` GitHub Action (`.github/workflows/build.yml`) builds every push on Ubuntu 24.04 and
+Windows: the GPU build for sm_75 / 86 / 89 / 120 and the CPU build (`--cpu-arch haswell`, selftest run). The binaries
+are in each run's artifacts, and tags `v*` attach them to the release. The Windows GPU exes need the cuBLAS DLLs
+(`cublas-dlls-Windows`) next to them; the Linux ones need cuBLAS 12 (`libcublas.so.12`) on the library path. The
+runners have no GPU, so only the CPU build is tested there.
+
 ### CPU build
 
 ```

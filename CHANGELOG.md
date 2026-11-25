@@ -10,6 +10,8 @@
   - head dim 32 uses the FA2 attention kernels (`CUDALM_FA32`);
   - Muon's Newton-Schulz runs in bf16 with the polynomial folded into one small matrix (`CUDALM_MUON_BF16`).
   Each `=0` restores the old path. The selftest checks the new kernels against the old paths.
+- **GitHub Actions build** (`.github/workflows/build.yml`): CPU (with selftest) and GPU sm_75/86/89/120 builds on
+  Ubuntu and Windows for every push; tags `v*` attach the binaries to the release.
 - `CUDALM_CB_B` (default 16): chatbench sequences per batch. Lower it for deep or looped models.
 - **Looped layers with attention gates.** `CUDALM_LOOP` now combines with `CUDALM_ATTN_GATE`. Each repeat pass has
   its own gate, copied (with its Adam moments) from the shared layer the first time a plain checkpoint loads looped.
