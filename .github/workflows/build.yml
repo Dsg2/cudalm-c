@@ -32,7 +32,7 @@ jobs:
       - if: runner.os == 'Windows'
         id: msys
         uses: msys2/setup-msys2@v2
-        with: { msystem: MINGW64, install: mingw-w64-x86_64-gcc, update: false, suppress-deprecation-warnings: msystem-mingw64 }
+        with: { msystem: MINGW64, install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp, update: false, suppress-deprecation-warnings: msystem-mingw64 }
       - if: runner.os == 'Windows'
         shell: pwsh
         run: '"${{ steps.msys.outputs.msys2-location }}\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'

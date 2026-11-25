@@ -304,7 +304,7 @@ def main():
 
 def build_cpu(a, dry):
     gxx = shutil.which("g++")
-    if not gxx: die("--cpu needs g++ with OpenMP (Windows: MSYS2, pacman -S mingw-w64-x86_64-gcc; Linux: build-essential)")
+    if not gxx: die("--cpu needs g++ with OpenMP (Windows: MSYS2, pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp; Linux: build-essential)")
     exe = os.path.join(HERE, (a.out if a.out != "cudalm" else "cudalm_cpu") + (".exe" if WIN else ""))
     cmd = [gxx, "-O3", f"-march={a.cpu_arch}", "-fopenmp", "-DCUDALM_CPU", "-x", "c++", os.path.join(HERE, "cudalm.cu"), "-o", exe]
     cmd += ["-static", "-ladvapi32"] if WIN else ["-lm"]
