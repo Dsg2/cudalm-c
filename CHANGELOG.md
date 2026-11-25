@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - 2026-11-25
+## v0.1.0 - 2026-11-25
 
 - **Faster MoE training without the stash.** On LS4 (top-3, head dim 32) training went from 33.0k to 45.6k tok/s on a
   5060 Ti, and looped LS4 with gradient accumulation from 14.8k to 21.6k, with losses unchanged:
