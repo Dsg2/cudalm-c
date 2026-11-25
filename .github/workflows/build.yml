@@ -26,17 +26,21 @@ jobs:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
       - if: runner.os == 'Windows'
         id: msys
         uses: msys2/setup-msys2@v2
-        with: { msystem: MINGW64, install: mingw-w64-x86_64-gcc, update: false }
+        with: { msystem: MINGW64, install: mingw-w64-x86_64-gcc, update: false, suppress-deprecation-warnings: msystem-mingw64 }
       - if: runner.os == 'Windows'
         shell: pwsh
         run: '"${{ steps.msys.outputs.msys2-location }}\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
-      - run: python build.py --cpu --cpu-arch haswell
+      - name: build
+        shell: bash
+        run: |
+          set -o pipefail
+          python build.py --cpu --cpu-arch haswell 2>&1 | tee build.txt || { grep -m 20 -iE "error|warning: no" build.txt | sed 's/^/::error::/'; exit 1; }
       - name: selftest
         shell: bash
         run: |
@@ -56,14 +60,18 @@ jobs:
         arch: ['75', '86', '89', '120']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
       - uses: actions/cache@v4
         with:
           path: .deps/cuda-${{ env.CUDA_VER }}
           key: cuda-${{ runner.os }}-${{ env.CUDA_VER }}
-      - run: python build.py --download-cuda --cuda-version ${{ env.CUDA_VER }} --arch ${{ matrix.arch }} --out cudalm_sm${{ matrix.arch }}
+      - name: build
+        shell: bash
+        run: |
+          set -o pipefail
+          python build.py --download-cuda --cuda-version ${{ env.CUDA_VER }} --arch ${{ matrix.arch }} --out cudalm_sm${{ matrix.arch }} 2>&1 | tee build.txt || { grep -m 20 -iE "error|warning: no" build.txt | sed 's/^/::error::/'; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: cudalm-gpu-${{ runner.os }}-sm${{ matrix.arch }}

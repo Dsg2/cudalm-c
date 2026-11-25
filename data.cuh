@@ -10,6 +10,7 @@
 /* GPT-2 pre-tokenizer split: portable, needed by every build (tok_encode in cudalm.cu uses it for
  * prompts and the SFT loss-mask markers); the rest of this file is the Windows-only data toolchain. */
 #include "uniclass.h"
+#include <ctype.h>
 static int d_inr(const unsigned (*r)[2],int n,unsigned c){ int lo=0,hi=n-1;
     while(lo<=hi){ int m=(lo+hi)/2; if(c<r[m][0]) hi=m-1; else if(c>r[m][1]) lo=m+1; else return 1; } return 0; }
 static int d_isW(unsigned c){ return (c>=9&&c<=13)||c==32||c==0x85||c==0xA0||c==0x1680||(c>=0x2000&&c<=0x200A)||c==0x2028||c==0x2029||c==0x202F||c==0x205F||c==0x3000; }
