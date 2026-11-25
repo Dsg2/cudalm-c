@@ -400,6 +400,9 @@ out = m.generate(ids, max_new_tokens=64, stop_strings=["<|user|>"], tokenizer=to
   with Muon and 24x with plain AdamW (`CUDALM_MUON=0`); widths other than 192 use the same factor untested. Muon
   turns itself off (AdamW) for QLM, per-layer-layout and looped models unless `CUDALM_MUON=1` is set explicitly.
   Both choices are pinned in `<model>.bin.env`, so older QLM models keep training as QLM.
+- **Gradient accumulation:** `CUDALM_ACCUM=k` runs k micro-batches of `CUDALM_BATCH` per optimizer step: the same
+  update as one batch of k×B, for models whose batch doesn't fit (e.g. looped ones). It is pinned in
+  `<model>.bin.env`; keep it fixed within a stage, since steps per epoch depend on it.
 - **Optimizer knobs:** `CUDALM_B1` (0.9), `CUDALM_B2` (0.99; 0.95 with QLM), `CUDALM_WD` (0.1, AdamW, Muon and QLM),
   `CUDALM_LR_MIN` (0.1: end of the WSD/cosine decay as a fraction of peak). In the sweep, B2 0.98/0.99, WD 0.05/0.2
   and LR_MIN 0 all landed within 0.011 of the defaults.
@@ -407,16 +410,24 @@ out = m.generate(ids, max_new_tokens=64, stop_strings=["<|user|>"], tokenizer=to
   model runs at depth 10 with the same matrices. Each repeat pass gets its own norm gains (2·D floats per repeated
   layer, stored after all other weights). Put it in `<model>.bin.env` of an existing fp32 checkpoint: the first load
   copies the repeat norms from the shared layers and its QLM state resumes. The header keeps the physical depth, so
-  a looped checkpoint needs `CUDALM_LOOP` to load. Not combinable with QLM_FUSED, Muon, LR_BOOST_LAYERS, ATTN_GATE,
-  SHARED_F, CANON or quantize. `CUDALM_LOOP_RAND=1` trains with a random pass count 1..k per step (recurrent-depth
+  a looped checkpoint needs `CUDALM_LOOP` to load. With `CUDALM_ATTN_GATE`, each repeat pass gets its own gate,
+  copied from its shared layer on that first load. Not combinable with QLM_FUSED, LR_BOOST_LAYERS, SHARED_F, CANON or
+  quantize (Muon works since 20k). A looped model needs more lmeval memory: lower `CUDALM_LMEVAL_N` (default 16384). `CUDALM_LOOP_RAND=1` trains with a random pass count 1..k per step (recurrent-depth
   training); `CUDALM_LOOP_K=n` runs only the first n passes, e.g. to eval one checkpoint at several depths.
 - **Measuring SFT:** use `bench\chatbench.bat` (accuracy) and `bench\judgerun.bat` (coherence). Validation loss alone
   is a poor guide.
 - **Speed switches:** each of these is on by default and has an off switch for A/B runs. On a 5060 Ti, LS-Micro (top-1) went from
-  254k to 294k tok/s and s8w (top-2) from 108k to about 120k.
+  254k to 294k tok/s and s8w (top-2) from 108k to about 120k. LS4 (top-3, head dim 32, no stash) went from 33.0k to
+  45.6k tok/s.
   - `CUDALM_TOP1_OLD=1`: runs top-1 on its old fp32 path. By default top-1 runs as top-K with K=1, which uses bf16 fused experts.
   - `CUDALM_MOE_GPERM=0`: builds the expert permutation on the host. By default the GPU builds it with the same stable order.
-  - `CUDALM_MOE_MERGE=0`: runs the top-2 passes separately. By default they run as one grouped pass.
+  - `CUDALM_MOE_MERGE=0`: runs the top-K passes separately. By default they run as one grouped pass of K×N rows, for any
+    K and with or without `CUDALM_MOE_STASH` (about 0.5 GB more VRAM on LS4).
+  - `CUDALM_SWF=0`: computes the expert W13 GEMM with cuBLAS and SwiGLU as a separate pass, instead of one fused kernel.
+  - `CUDALM_SWB=0`: without the stash, recomputes the expert forward in the backward instead of the fused expert backward
+    kernel (W13 and W2ᵀ products, SwiGLU backward and the gate gradient in one pass).
+  - `CUDALM_FA32=0`: runs head dim 32 on the older wmma attention kernels instead of the FA2 ones.
+  - `CUDALM_MUON_BF16=0`: runs Muon's Newton-Schulz iterations in fp32 instead of bf16 (fp32 accumulate).
   - `CUDALM_FA_CP=0`: turns off the cp.async tile prefetch in the FA2 attention kernels.
   - `CUDALM_LRS_KEEP=0`: makes the LR scaler retrain the steps of the ×1.0 arm instead of keeping it.
   - `CUDALM_CH_ROWS`: sets the head row chunk. It defaults to 2048; 8192 was slower.

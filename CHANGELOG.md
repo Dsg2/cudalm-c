@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased - 2026-11-25
+
+- Faster no-stash MoE training (merged top-K, fused SwiGLU fwd/bwd), FA2 for head dim 32, bf16 Muon NS, gradient accumulation, looped attention gates
+
+## Unreleased - 2026-11-25
+
+- **Faster MoE training without the stash.** On LS4 (top-3, head dim 32) training went from 33.0k to 45.6k tok/s on a
+  5060 Ti, and looped LS4 with gradient accumulation from 14.8k to 21.6k, with losses unchanged:
+  - top-K passes merge into one grouped pass for any K, stash on or off (`CUDALM_MOE_MERGE`);
+  - the expert W13 GEMM has SwiGLU in its epilogue (`CUDALM_SWF`);
+  - without the stash, a fused expert backward replaces the forward recompute (`CUDALM_SWB`);
+  - head dim 32 uses the FA2 attention kernels (`CUDALM_FA32`);
+  - Muon's Newton-Schulz runs in bf16 with the polynomial folded into one small matrix (`CUDALM_MUON_BF16`).
+  Each `=0` restores the old path. The selftest checks the new kernels against the old paths.
+- `CUDALM_CB_B` (default 16): chatbench sequences per batch. Lower it for deep or looped models.
+- **Looped layers with attention gates.** `CUDALM_LOOP` now combines with `CUDALM_ATTN_GATE`. Each repeat pass has
+  its own gate, copied (with its Adam moments) from the shared layer the first time a plain checkpoint loads looped.
+- **Gradient accumulation.** `CUDALM_ACCUM=k` runs k micro-batches of `CUDALM_BATCH` per optimizer step. They see
+  the same windows in the same order as one batch of k×B, share one loss denominator (all trainable tokens of the step)
+  and add into the same gradients, so the step equals the big-batch step. The Q4_FOLD n-gram table collects every
+  micro-batch's keys and row gradients and scatters them once. MoE balance terms (aux loss, aux-free bias step) are
+  per micro-batch and scaled by 1/k. Steps per epoch shrink k-fold. Not with QLM_FUSED, KD, TOKW, LRS, engram,
+  canon/shared or NGRAM_TRI. On a nano MoE with gated attention and a folded n-gram table, B4, B2×2 and B1×4 (and
+  looped B4 vs B2×2) give identical losses over 41 steps.
+- `CUDALM_LMEVAL_N`: tokens per lmeval batch (default 16384). Lower it for deep or looped models that would otherwise
+  spill out of VRAM.
+
 ## Unreleased - 2026-11-22
 
 - **Hugging Face export.** `cudalm hf <name> <dir> [fp32|bf16]` writes a transformers folder with a custom `cudalm`
