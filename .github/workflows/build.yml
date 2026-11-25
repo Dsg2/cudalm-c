@@ -37,10 +37,13 @@ jobs:
         shell: pwsh
         run: '"${{ steps.msys.outputs.msys2-location }}\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
       - name: build
-        shell: bash
+        shell: pwsh
         run: |
-          set -o pipefail
-          python build.py --cpu --cpu-arch haswell 2>&1 | tee build.txt || { grep -m 20 -iE "error|warning: no" build.txt | sed 's/^/::error::/'; exit 1; }
+          python build.py --cpu --cpu-arch haswell 2>&1 | Tee-Object build.txt
+          if ($LASTEXITCODE) {
+            Get-Content build.txt | ? { $_ -notmatch '^\s+\d*\s*\||note:|warning:|In function|In member' } | Select-Object -Last 25 | % { "::error::$_" }
+            exit 1
+          }
       - name: selftest
         shell: bash
         run: |
@@ -71,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python build.py --download-cuda --cuda-version ${{ env.CUDA_VER }} --arch ${{ matrix.arch }} --out cudalm_sm${{ matrix.arch }} 2>&1 | tee build.txt || { grep -m 20 -iE "error|warning: no" build.txt | sed 's/^/::error::/'; exit 1; }
+          python build.py --download-cuda --cuda-version ${{ env.CUDA_VER }} --arch ${{ matrix.arch }} --out cudalm_sm${{ matrix.arch }} 2>&1 | tee build.txt || { grep -vE "^ +[0-9]* *[|]|note:|warning:|In function|In member" build.txt | tail -n 25 | sed 's/^/::error::/'; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: cudalm-gpu-${{ runner.os }}-sm${{ matrix.arch }}
